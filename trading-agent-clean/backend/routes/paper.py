@@ -1,7 +1,11 @@
+import hashlib
+import json
+from collections import Counter
 from datetime import datetime
 from math import floor
+from uuid import uuid4
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from pymongo.errors import DuplicateKeyError
 
 from database import get_database
@@ -48,6 +52,98 @@ PAPER_UPDATE_PROGRESS = {
     "started_at": None,
     "finished_at": None,
 }
+
+
+def default_paper_update_progress() -> dict:
+    return {
+        **PAPER_UPDATE_PROGRESS,
+        "paper_only": True,
+        "live_trading": False,
+        "broker_orders": False,
+    }
+
+
+def paper_update_runs_collection(db):
+    return getattr(db, "paper_update_runs", None)
+
+
+def serialize_run_doc(doc: dict | None) -> dict | None:
+    if doc is None:
+        return None
+    serialized = dict(doc)
+    if "_id" in serialized:
+        serialized["_id"] = str(serialized["_id"])
+    return serialized
+
+
+async def capture_paper_update_snapshot(db) -> dict:
+    cursor = db.paper_trades.find(
+        {"paper_only": True},
+        {
+            "_id": 0,
+            "status": 1,
+            "outcome_status": 1,
+            "pnl": 1,
+            "paper_pnl": 1,
+            "realized_pnl": 1,
+            "updated_at": 1,
+        },
+    )
+    rows = [row async for row in cursor]
+    updated_at_values = [str(row.get("updated_at")) for row in rows]
+    status_distribution = Counter(str(row.get("status") or "UNKNOWN") for row in rows)
+    outcome_status_distribution = Counter(str(row.get("outcome_status") or "UNKNOWN") for row in rows)
+    return {
+        "paper_trades_count": len(rows),
+        "status_distribution": dict(status_distribution),
+        "outcome_status_distribution": dict(outcome_status_distribution),
+        "pnl_sum": sum(float(row.get("pnl") or 0) for row in rows),
+        "paper_pnl_sum": sum(float(row.get("paper_pnl") or 0) for row in rows),
+        "realized_pnl_sum": sum(float(row.get("realized_pnl") or 0) for row in rows),
+        "updated_at_hash": hashlib.sha256(json.dumps(updated_at_values, sort_keys=True).encode()).hexdigest(),
+    }
+
+
+def paper_run_log_status(*, blocked: bool, errors_count: int, processed: int, successful_updates_count: int) -> str:
+    if blocked:
+        return "BLOCKED"
+    if errors_count:
+        return "PARTIAL_FAILED" if successful_updates_count or errors_count < processed else "FAILED"
+    return "COMPLETED"
+
+
+async def upsert_paper_update_run_log(db, run_id: str, update: dict, *, set_on_insert: dict | None = None) -> None:
+    collection = paper_update_runs_collection(db)
+    if collection is None:
+        return
+    document = {"$set": update}
+    if set_on_insert:
+        document["$setOnInsert"] = set_on_insert
+    await collection.update_one({"run_id": run_id}, document, upsert=True)
+
+
+async def latest_paper_update_run(db) -> dict | None:
+    collection = paper_update_runs_collection(db)
+    if collection is None:
+        return None
+    doc = await collection.find_one({}, {"_id": 0}, sort=[("started_at", -1)])
+    return serialize_run_doc(doc)
+
+
+async def list_paper_update_runs_from_db(db, limit: int) -> list[dict]:
+    collection = paper_update_runs_collection(db)
+    if collection is None:
+        return []
+    cursor = collection.find({}, {"_id": 0, "per_trade_results": 0}).sort("started_at", -1).limit(limit)
+    return [serialize_run_doc(row) async for row in cursor]
+
+
+async def get_paper_update_run_from_db(db, run_id: str) -> dict | None:
+    collection = paper_update_runs_collection(db)
+    if collection is None:
+        return None
+    doc = await collection.find_one({"run_id": run_id}, {"_id": 0})
+    return serialize_run_doc(doc)
 
 
 def normalize_status(value) -> str:
@@ -336,19 +432,60 @@ async def run_paper_trade_update(
     max_writes: int = 1,
 ) -> dict:
     db = get_database()
+    run_id = uuid4().hex
     started = datetime.utcnow()
+    started_at = started.isoformat()
+    run_mode = "DRY_RUN" if dry_run else "REAL"
+    pre_snapshot = await capture_paper_update_snapshot(db)
     PAPER_UPDATE_PROGRESS.update(
         {
             "running": True,
+            "run_id": run_id,
             "mode": mode,
             "dry_run": dry_run,
+            "status": "RUNNING",
             "processed": 0,
             "updated_count": 0,
             "would_update_count": 0,
             "errors": [],
-            "started_at": started.isoformat(),
+            "started_at": started_at,
             "finished_at": None,
         }
+    )
+    await upsert_paper_update_run_log(
+        db,
+        run_id,
+        {
+            "run_id": run_id,
+            "started_at": started_at,
+            "finished_at": None,
+            "mode": run_mode,
+            "endpoint_mode": mode,
+            "dry_run": dry_run,
+            "dry_run_first": dry_run,
+            "status": "RUNNING",
+            "processed": 0,
+            "proposed_write_count": 0,
+            "would_update_count": 0,
+            "updated_count": 0,
+            "successful_updates_count": 0,
+            "errors_count": 0,
+            "blocked": False,
+            "block_reason": None,
+            "max_trades": limit,
+            "max_writes": max_writes,
+            "pre_snapshot": pre_snapshot,
+            "post_snapshot": None,
+            "changed_trade_ids": [],
+            "details": {"timeframe": timeframe, "operation": mode},
+            "per_trade_results": [],
+            "owner": "MANUAL_ENDPOINT",
+            "source": "MANUAL_ENDPOINT",
+            "paper_only": True,
+            "live_trading": False,
+            "broker_orders": False,
+        },
+        set_on_insert={"created_at": started_at},
     )
     cursor = db.paper_trades.find(
         {"paper_only": True, "status": {"$in": TRACKABLE_STATUSES}, "timeframe": timeframe},
@@ -522,6 +659,7 @@ async def run_paper_trade_update(
         PAPER_UPDATE_PROGRESS.update(
             {
                 "running": False,
+                "run_id": run_id,
                 "processed": processed,
                 "updated_count": updated_count,
                 "would_update_count": would_update_count,
@@ -530,7 +668,7 @@ async def run_paper_trade_update(
             }
         )
 
-    return {
+    response = {
         "mode": mode,
         "paper_only": True,
         "live_trading": False,
@@ -551,9 +689,48 @@ async def run_paper_trade_update(
         "block_reason": block_reason,
         "errors": errors,
         "results": results,
-        "started_at": started.isoformat(),
+        "started_at": started_at,
         "finished_at": PAPER_UPDATE_PROGRESS["finished_at"],
     }
+    post_snapshot = await capture_paper_update_snapshot(db)
+    changed_trade_ids = [
+        result["trade_id"]
+        for result in results
+        if result.get("updated") and result.get("trade_id")
+    ]
+    run_status = paper_run_log_status(
+        blocked=blocked,
+        errors_count=len(errors),
+        processed=processed,
+        successful_updates_count=successful_updates_count,
+    )
+    PAPER_UPDATE_PROGRESS["status"] = run_status
+    await upsert_paper_update_run_log(
+        db,
+        run_id,
+        {
+            "finished_at": PAPER_UPDATE_PROGRESS["finished_at"],
+            "status": run_status,
+            "processed": processed,
+            "proposed_write_count": would_update_count,
+            "would_update_count": would_update_count,
+            "updated_count": updated_count,
+            "successful_updates_count": successful_updates_count,
+            "errors_count": len(errors),
+            "blocked": blocked,
+            "block_reason": block_reason,
+            "post_snapshot": post_snapshot,
+            "changed_trade_ids": changed_trade_ids,
+            "details": {
+                "timeframe": timeframe,
+                "operation": mode,
+                "errors": errors,
+            },
+            "per_trade_results": results,
+            "mongo_writes_enabled": not dry_run and not blocked,
+        },
+    )
+    return response
 
 
 @router.post("/update-plans")
@@ -582,12 +759,47 @@ async def update_paper_trades(
 
 @router.get("/update-progress")
 async def get_paper_update_progress() -> dict:
+    latest = await latest_paper_update_run(get_database())
+    if latest is None:
+        return default_paper_update_progress()
     return {
-        **PAPER_UPDATE_PROGRESS,
+        "running": latest.get("status") == "RUNNING",
+        "run_id": latest.get("run_id"),
+        "mode": latest.get("endpoint_mode") or latest.get("mode"),
+        "run_mode": latest.get("mode"),
+        "dry_run": latest.get("dry_run", True),
+        "status": latest.get("status"),
+        "processed": latest.get("processed", 0),
+        "proposed_write_count": latest.get("proposed_write_count", 0),
+        "updated_count": latest.get("updated_count", 0),
+        "would_update_count": latest.get("would_update_count", 0),
+        "successful_updates_count": latest.get("successful_updates_count", 0),
+        "errors_count": latest.get("errors_count", 0),
+        "blocked": latest.get("blocked", False),
+        "block_reason": latest.get("block_reason"),
+        "max_trades": latest.get("max_trades"),
+        "max_writes": latest.get("max_writes"),
+        "started_at": latest.get("started_at"),
+        "finished_at": latest.get("finished_at"),
+        "changed_trade_ids": latest.get("changed_trade_ids", []),
         "paper_only": True,
         "live_trading": False,
         "broker_orders": False,
     }
+
+
+@router.get("/update-runs")
+async def get_paper_update_runs(limit: int = Query(default=20, ge=1, le=100)) -> dict:
+    runs = await list_paper_update_runs_from_db(get_database(), limit)
+    return {"count": len(runs), "runs": runs}
+
+
+@router.get("/update-runs/{run_id}")
+async def get_paper_update_run(run_id: str) -> dict:
+    run = await get_paper_update_run_from_db(get_database(), run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="paper update run not found")
+    return run
 
 
 @router.get("/trades")

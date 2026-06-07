@@ -85,6 +85,29 @@ def tv_symbol_for_trade(trade: dict) -> str | None:
     return trade.get("tradingview_symbol") or trade.get("symbol")
 
 
+def paper_trade_proposal_context(trade: dict) -> dict:
+    return {
+        "trade_id": str(trade.get("_id")) if trade.get("_id") is not None else None,
+        "symbol": trade.get("symbol"),
+        "tradingview_symbol": tv_symbol_for_trade(trade),
+        "current_status": trade.get("status"),
+        "current_outcome_status": trade.get("outcome_status"),
+    }
+
+
+def candle_timestamp(candle: dict) -> str | int | float | None:
+    value = candle.get("time") or candle.get("timestamp") or candle.get("datetime") or candle.get("date")
+    return value.isoformat() if hasattr(value, "isoformat") else value
+
+
+def proposed_update_reason(plan: dict, update: dict) -> str:
+    if update.get("exit_reason"):
+        return update["exit_reason"]
+    current_status = normalize_status(plan.get("status"))
+    proposed_status = normalize_status(update.get("status", plan.get("status")))
+    return f"STATUS_CHANGE_{current_status}_TO_{proposed_status}" if proposed_status != current_status else "NO_STATUS_CHANGE"
+
+
 def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: float, risk_percent: float) -> dict | None:
     if len(candles) < 10:
         return None
@@ -332,9 +355,14 @@ async def run_paper_trade_update(limit: int, timeframe: str, dry_run: bool, mode
             if is_terminal_trade(plan):
                 results.append(
                     {
-                        "symbol": symbol,
+                        **paper_trade_proposal_context(plan),
                         "previous_status": plan.get("status"),
                         "previous_outcome_status": plan.get("outcome_status"),
+                        "latest_candle_timestamp": None,
+                        "proposed_new_status": plan.get("status"),
+                        "proposed_new_outcome_status": plan.get("outcome_status"),
+                        "proposed_pnl": plan.get("paper_pnl"),
+                        "proposed_reason": "TERMINAL_STATUS",
                         "updated": False,
                         "would_write": False,
                         "reason": "TERMINAL_STATUS",
@@ -351,9 +379,14 @@ async def run_paper_trade_update(limit: int, timeframe: str, dry_run: bool, mode
                 if not candles:
                     results.append(
                         {
-                            "symbol": symbol,
+                            **paper_trade_proposal_context(plan),
                             "status": plan.get("status"),
                             "outcome_status": plan.get("outcome_status"),
+                            "latest_candle_timestamp": None,
+                            "proposed_new_status": None,
+                            "proposed_new_outcome_status": None,
+                            "proposed_pnl": None,
+                            "proposed_reason": "NO_CANDLES",
                             "updated": False,
                             "would_write": False,
                             "reason": "NO_CANDLES",
@@ -385,11 +418,16 @@ async def run_paper_trade_update(limit: int, timeframe: str, dry_run: bool, mode
                 PAPER_UPDATE_PROGRESS["would_update_count"] = would_update_count
                 results.append(
                     {
-                        "symbol": symbol,
+                        **paper_trade_proposal_context(plan),
                         "previous_status": plan.get("status"),
                         "status": update.get("status", plan.get("status")),
                         "previous_outcome_status": plan.get("outcome_status"),
                         "outcome_status": update.get("outcome_status", plan.get("outcome_status")),
+                        "latest_candle_timestamp": candle_timestamp(candles[-1]),
+                        "proposed_new_status": update.get("status", plan.get("status")),
+                        "proposed_new_outcome_status": update.get("outcome_status", plan.get("outcome_status")),
+                        "proposed_pnl": update.get("paper_pnl"),
+                        "proposed_reason": proposed_update_reason(plan, update),
                         "updated": modified > 0,
                         "would_write": would_write,
                         "dry_run": dry_run,
@@ -407,10 +445,14 @@ async def run_paper_trade_update(limit: int, timeframe: str, dry_run: bool, mode
                 PAPER_UPDATE_PROGRESS["errors"] = errors
                 results.append(
                     {
-                        "symbol": symbol,
-                        "tradingview_symbol": tradingview_symbol,
+                        **paper_trade_proposal_context(plan),
                         "previous_status": plan.get("status"),
                         "previous_outcome_status": plan.get("outcome_status"),
+                        "latest_candle_timestamp": None,
+                        "proposed_new_status": None,
+                        "proposed_new_outcome_status": None,
+                        "proposed_pnl": None,
+                        "proposed_reason": "EVALUATION_ERROR",
                         "updated": False,
                         "would_write": False,
                         "dry_run": dry_run,

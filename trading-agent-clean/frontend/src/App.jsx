@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   API_BASE, buildMomentumSignals, buildPaperPlans, buildSwingSignals, getActiveTrades,
   getAllTrades, getHealth, getMarketDataSymbol, getMarketLoadProgress, getMomentumCandidates, getMomentumPrecheck, getPaperPlans, getPaperSignals,
-  getMomentumSummary, getMomentumTvConfirmed, getPaperSummary, getScanRows, getScoreSummary, getSettings, getSwingCandidates,
+  getMomentumSummary, getMomentumTvConfirmed, getPaperSummary, getPaperUpdateLock, getPaperUpdateProgress, getPaperUpdateRuns, getPaperUpdateSchedulerStatus, getScanRows, getScoreSummary, getSettings, getSwingCandidates,
   getSwingPrecheck, getSwingSummary, getSwingTvConfirmed, momentumTvConfirm, loadAllMarketData, runPaperPipeline, runScan, runScoring,
   swingTvConfirm, testTvSymbol, updatePaperPlans,
 } from "./api";
@@ -224,7 +224,60 @@ function SetupGrid({ items }) {
   return <div className="setupGrid">{items.map((item) => <div className={`setupCard accent-${item.tone}`} key={item.label}><span>{item.label}</span><strong>{item.value}</strong><Badge tone={item.tone}>{item.status}</Badge></div>)}</div>;
 }
 
-function Dashboard({ summary, scoreSummary, swingSummary, momentumSummary, onSummary, onDryRun, onSaveRun, loading }) {
+const boolLabel = (value) => value === true ? "true" : value === false ? "false" : "-";
+const boolTone = (value, safeWhenFalse = false) => {
+  if (value === true) return safeWhenFalse ? "yellow" : "green";
+  if (value === false) return safeWhenFalse ? "green" : "yellow";
+  return "gray";
+};
+function SafetyMetric({ label, value, tone = "green" }) {
+  return <div><span>{label}</span><strong>{val(value)}</strong>{tone && <Badge tone={tone}>{val(value)}</Badge>}</div>;
+}
+function PaperUpdateSafety({ progress, schedulerStatus, lockStatus }) {
+  const lock = lockStatus || schedulerStatus?.lock || {};
+  const schedulerEnabled = schedulerStatus?.enabled;
+  const schedulerRunning = schedulerStatus?.scheduler_running;
+  const autoEnabled = schedulerStatus?.automatic_updates_enabled;
+  return <Card title="Paper Update Safety / Automation Status" eyebrow="read-only">
+    <div className="safetyGrid">
+      <SafetyMetric label="scheduler enabled" value={boolLabel(schedulerEnabled)} tone={boolTone(schedulerEnabled, true)} />
+      <SafetyMetric label="scheduler_running" value={boolLabel(schedulerRunning)} tone={boolTone(schedulerRunning, true)} />
+      <SafetyMetric label="automatic_updates_enabled" value={boolLabel(autoEnabled)} tone={boolTone(autoEnabled, true)} />
+      <SafetyMetric label="mode" value={schedulerStatus?.mode} tone="gray" />
+      <SafetyMetric label="dry_run_first" value={boolLabel(schedulerStatus?.dry_run_first)} tone={boolTone(schedulerStatus?.dry_run_first)} />
+      <SafetyMetric label="max_trades" value={schedulerStatus?.max_trades} tone="yellow" />
+      <SafetyMetric label="max_writes" value={schedulerStatus?.max_writes} tone={Number(schedulerStatus?.max_writes) <= 1 ? "green" : "yellow"} />
+      <SafetyMetric label="next_run_at" value={schedulerStatus?.next_run_at || "disabled"} tone={schedulerStatus?.next_run_at ? "yellow" : "green"} />
+      <SafetyMetric label="latest run ID" value={schedulerStatus?.last_run_id || progress?.run_id || "-"} tone="gray" />
+      <SafetyMetric label="latest run status" value={schedulerStatus?.last_run_status || progress?.status || "-"} tone={statusTone(schedulerStatus?.last_run_status || progress?.status)} />
+      <SafetyMetric label="proposed_write_count" value={progress?.proposed_write_count ?? 0} tone={Number(progress?.proposed_write_count || 0) <= 1 ? "green" : "yellow"} />
+      <SafetyMetric label="updated_count" value={progress?.updated_count ?? 0} tone={Number(progress?.updated_count || 0) === 0 ? "green" : "yellow"} />
+      <SafetyMetric label="errors_count" value={progress?.errors_count ?? 0} tone={Number(progress?.errors_count || 0) === 0 ? "green" : "red"} />
+      <SafetyMetric label="blocked / reason" value={`${boolLabel(progress?.blocked)} ${progress?.block_reason || ""}`.trim()} tone={progress?.blocked ? "yellow" : "green"} />
+      <SafetyMetric label="lock status" value={lock?.status || "-"} tone={lock?.held ? "yellow" : "green"} />
+      <SafetyMetric label="lock held" value={boolLabel(lock?.held)} tone={boolTone(lock?.held, true)} />
+      <SafetyMetric label="paper_only" value={boolLabel(schedulerStatus?.paper_only ?? progress?.paper_only)} tone="green" />
+      <SafetyMetric label="live_trading" value={boolLabel(schedulerStatus?.live_trading ?? progress?.live_trading)} tone={boolTone(schedulerStatus?.live_trading ?? progress?.live_trading, true)} />
+      <SafetyMetric label="broker_orders" value={boolLabel(schedulerStatus?.broker_orders ?? progress?.broker_orders)} tone={boolTone(schedulerStatus?.broker_orders ?? progress?.broker_orders, true)} />
+    </div>
+  </Card>;
+}
+function PaperUpdateRunHistory({ runs = [] }) {
+  const safeRuns = Array.isArray(runs) ? runs.slice(0, 10) : [];
+  const columns = ["run_id", "started_at", "finished_at", "mode", "status", "processed", "proposed_write_count", "updated_count", "errors_count", "blocked", "block_reason"];
+  return <Card title="Recent Paper Update Runs" eyebrow="read-only history">
+    <div className="tableShell results-table-wrap"><table><thead><tr>{columns.map((column) => <th key={column}>{column}</th>)}</tr></thead><tbody>
+      {safeRuns.length ? safeRuns.map((run, index) => <tr key={`${run?.run_id || index}-${index}`}>{columns.map((column) => {
+        const value = column === "blocked" ? boolLabel(run?.[column]) : run?.[column];
+        if (column === "status") return <td key={column}><Badge tone={statusTone(value)}>{val(value)}</Badge></td>;
+        if (column === "blocked") return <td key={column}><Badge tone={run?.blocked ? "yellow" : "green"}>{value}</Badge></td>;
+        return <td key={column}>{val(value)}</td>;
+      })}</tr>) : <tr><td colSpan={columns.length}>No paper update runs logged yet.</td></tr>}
+    </tbody></table></div>
+  </Card>;
+}
+
+function Dashboard({ summary, scoreSummary, swingSummary, momentumSummary, paperUpdateProgress, paperUpdateRuns, paperUpdateLock, paperUpdateScheduler, onSummary, onDryRun, onSaveRun, loading }) {
   return <div className="pageStack">
     <section className="heroCard">
       <div><span>Paper control room</span><h1>Indian Stock Trading Assistant</h1><p>Swing and momentum workflows powered by TradingView candles. Paper records only.</p></div>
@@ -244,6 +297,8 @@ function Dashboard({ summary, scoreSummary, swingSummary, momentumSummary, onSum
       <StatCard label="Swing Candidates" value={swingSummary?.swing_candidates_count ?? scoreSummary?.swing_candidates_count ?? "--"} tone="yellow" />
       <StatCard label="Momentum Candidates" value={momentumSummary?.momentum_candidates_count ?? scoreSummary?.momentum_candidates_count ?? "--"} />
     </div>
+    <PaperUpdateSafety progress={paperUpdateProgress} schedulerStatus={paperUpdateScheduler} lockStatus={paperUpdateLock} />
+    <PaperUpdateRunHistory runs={paperUpdateRuns} />
     <div className="threeGrid">
       <Card title="Recent Activity" eyebrow="paper log"><div className="activityList"><p>Summary ready</p><p>TradingView candles available</p><p>Pipeline dry-run enabled</p></div></Card>
       <Card title="Swing Strategy" eyebrow="score > 80"><div className="strategyCard"><strong>Confirmation-first swing flow</strong><Badge tone="green">Paper plans</Badge></div></Card>
@@ -1300,6 +1355,10 @@ export default function App() {
   const [scoreSummary, setScoreSummary] = useState(null);
   const [swingSummary, setSwingSummary] = useState(null);
   const [momentumSummary, setMomentumSummary] = useState(null);
+  const [paperUpdateProgress, setPaperUpdateProgress] = useState(null);
+  const [paperUpdateRuns, setPaperUpdateRuns] = useState([]);
+  const [paperUpdateLock, setPaperUpdateLock] = useState(null);
+  const [paperUpdateScheduler, setPaperUpdateScheduler] = useState(null);
   const [signals, setSignals] = useState([]);
   const [plans, setPlans] = useState([]);
   const [activeTrades, setActiveTrades] = useState([]);
@@ -1387,6 +1446,27 @@ export default function App() {
       setSettings(settingsData);
       return { health: healthData, settings: settingsData };
     }).catch(() => setHealth({ online: false, status: "offline" }));
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([
+      getPaperUpdateProgress(),
+      getPaperUpdateRuns(10),
+      getPaperUpdateLock(),
+      getPaperUpdateSchedulerStatus(),
+    ])
+      .then(([progress, runs, lock, scheduler]) => {
+        if (cancelled) return;
+        setPaperUpdateProgress(progress);
+        setPaperUpdateRuns(arr(runs, ["runs"]));
+        setPaperUpdateLock(lock);
+        setPaperUpdateScheduler(scheduler);
+      })
+      .catch((err) => console.error("paper update safety load failed", err));
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -1679,8 +1759,8 @@ export default function App() {
     if (activePage === "Stock Detail") return <StockDetailPage search={search} stockMarketData={stockMarketData} stockSwingPrecheck={stockSwingPrecheck} stockMomentumPrecheck={stockMomentumPrecheck} stockSwingTvResult={stockSwingTvResult} stockMomentumTvResult={stockMomentumTvResult} stockSavedSwingResult={stockSavedSwingResult} stockSavedMomentumResult={stockSavedMomentumResult} latestSwingTvRows={latestSwingTvRows} latestMomentumTvRows={latestMomentumTvRows} stockSwingTimeframes={stockSwingTimeframes} setStockSwingTimeframes={setStockSwingTimeframes} stockMomentumTimeframes={stockMomentumTimeframes} setStockMomentumTimeframes={setStockMomentumTimeframes} onLoadStockMarket={handlers.stockMarketData} onSwingPrecheck={handlers.stockSwingPrecheck} onMomentumPrecheck={handlers.stockMomentumPrecheck} onStockSwingTvConfirm={handlers.stockSwingTvConfirm} onStockMomentumTvConfirm={handlers.stockMomentumTvConfirm} loading={!!loading} />;
     if (activePage === "Paper Trades") return <PaperTrades signals={signals} plans={plans} activeTrades={activeTrades} allTrades={allTrades} onSignals={handlers.paperSignals} onPlans={handlers.paperPlans} onActive={handlers.active} onAll={handlers.all} onUpdate={handlers.update} loading={!!loading} />;
     if (activePage === "Settings") return <Settings settings={settings} health={health} />;
-    return <Dashboard summary={summary} scoreSummary={scoreSummary} swingSummary={swingSummary} momentumSummary={momentumSummary} onSummary={handlers.loadSummary} onDryRun={handlers.dryRun} onSaveRun={handlers.saveRun} loading={!!loading} />;
-  }, [activePage, settings, health, summary, scoreSummary, swingSummary, momentumSummary, swingRows, latestSwingTvRows, swingTvRowsLoaded, swingBatchResults, swingBatchProgress, swingBatchError, swingBatchStopRequested, swingBatchStopMessage, swingCandidatesStale, momentumRows, momentumCandidatesStale, latestMomentumTvRows, momentumTvRowsLoaded, momentumBatchResults, momentumBatchProgress, momentumBatchError, momentumBatchStopRequested, momentumBatchStopMessage, stockMarketData, stockSwingPrecheck, stockMomentumPrecheck, stockSwingTvResult, stockMomentumTvResult, stockSavedSwingResult, stockSavedMomentumResult, stockSwingTimeframes, stockMomentumTimeframes, search, tv, tvResult, marketLoadResult, marketProgress, scoreRunResult, marketDataNeedsScore, signals, plans, activeTrades, allTrades, loading, lastResponse]);
+    return <Dashboard summary={summary} scoreSummary={scoreSummary} swingSummary={swingSummary} momentumSummary={momentumSummary} paperUpdateProgress={paperUpdateProgress} paperUpdateRuns={paperUpdateRuns} paperUpdateLock={paperUpdateLock} paperUpdateScheduler={paperUpdateScheduler} onSummary={handlers.loadSummary} onDryRun={handlers.dryRun} onSaveRun={handlers.saveRun} loading={!!loading} />;
+  }, [activePage, settings, health, summary, scoreSummary, swingSummary, momentumSummary, paperUpdateProgress, paperUpdateRuns, paperUpdateLock, paperUpdateScheduler, swingRows, latestSwingTvRows, swingTvRowsLoaded, swingBatchResults, swingBatchProgress, swingBatchError, swingBatchStopRequested, swingBatchStopMessage, swingCandidatesStale, momentumRows, momentumCandidatesStale, latestMomentumTvRows, momentumTvRowsLoaded, momentumBatchResults, momentumBatchProgress, momentumBatchError, momentumBatchStopRequested, momentumBatchStopMessage, stockMarketData, stockSwingPrecheck, stockMomentumPrecheck, stockSwingTvResult, stockMomentumTvResult, stockSavedSwingResult, stockSavedMomentumResult, stockSwingTimeframes, stockMomentumTimeframes, search, tv, tvResult, marketLoadResult, marketProgress, scoreRunResult, marketDataNeedsScore, signals, plans, activeTrades, allTrades, loading, lastResponse]);
 
   return <div className="appShell">
     <aside className="sidebar"><div className="brand"><div className="brandMark">TA</div><div><h1>Trading Agent</h1><p>Paper Terminal</p></div></div><div className="navSeparator">Workspace</div><nav>{NAV_WITH_STOCK_DETAIL.map((item) => <button className={activePage === item.label ? "navItem active" : "navItem"} key={item.label} onClick={() => setActivePage(item.label)}><span>{item.icon}</span>{item.label}</button>)}</nav><div className="sidebarFooter"><Badge tone="yellow">PAPER ONLY</Badge><p>No live trading. No broker orders.</p></div></aside>

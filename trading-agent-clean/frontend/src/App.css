@@ -401,6 +401,22 @@ td { color: #defce8; }
 .technicalErrorDetails .chartMeta { color: #ffd36b; margin: 10px 0 0; }
 .muted { color: #8eb69f; margin: 0; }
 .settingsGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.safetyGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+.safetyGrid > div {
+  border: 1px solid rgba(71, 214, 130, 0.16);
+  border-radius: 8px;
+  background: rgba(2, 8, 5, 0.45);
+  padding: 12px;
+  min-width: 0;
+}
+.safetyGrid span { display: block; color: #87ad97; font-size: 12px; }
+.safetyGrid strong {
+  display: block;
+  color: #eafff1;
+  font-size: 16px;
+  margin: 7px 0;
+  overflow-wrap: anywhere;
+}
 .detailGrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
 .settingsGrid div {
   border: 1px solid rgba(71, 214, 130, 0.18); border-radius: 8px; background: rgba(2, 8, 5, 0.55); padding: 14px;

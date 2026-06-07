@@ -201,9 +201,38 @@ def test_dry_run_creates_completed_paper_update_run_log(monkeypatch) -> None:
     assert run["pre_snapshot"]["paper_trades_count"] == 1
     assert run["post_snapshot"]["paper_trades_count"] == 1
     assert len(run["per_trade_results"]) == 1
+    assert run["approval_status"] == "AVAILABLE"
+    assert run["approval_expires_at"]
+    assert run["approval_used_at"] is None
+    assert run["approval_used_by_run_id"] is None
+    assert run["approved_real_run_id"] is None
+    assert run["pre_snapshot_hash"] == run["pre_snapshot"]["snapshot_hash"]
+    assert run["proposed_trade_ids"] == []
+    assert run["proposed_transition_hash"]
+    assert run["approved_max_trades"] == 6
+    assert run["approved_max_writes"] == 1
+    assert run["target_trade_precondition_hashes"] == {}
 
 
-def test_blocked_real_update_creates_blocked_run_log_without_writes(monkeypatch) -> None:
+def test_dry_run_stores_exact_approvable_transition_metadata(monkeypatch) -> None:
+    db = patch_fake_db(monkeypatch, [make_trade("WAIT1")])
+    monkeypatch.setattr(paper, "TradingViewClient", FakeTradingViewEntryClient)
+    client = TestClient(app)
+
+    response = client.post("/api/paper/update-trades?dry_run=true&max_trades=6&max_writes=1")
+
+    assert response.status_code == 200
+    run = db.paper_update_runs.rows[0]
+    proposal = run["per_trade_results"][0]
+    assert run["approval_status"] == "AVAILABLE"
+    assert run["proposed_trade_ids"] == ["wait1-id"]
+    assert run["target_trade_precondition_hashes"]["wait1-id"]
+    assert proposal["proposed_update"]["status"] == "ACTIVE"
+    assert proposal["target_trade_precondition_hash"] == run["target_trade_precondition_hashes"]["wait1-id"]
+    assert run["proposed_transition_hash"] == paper.proposed_transition_hash(run["per_trade_results"])
+
+
+def test_unbound_real_update_creates_approval_required_run_log_without_writes(monkeypatch) -> None:
     db = patch_fake_db(monkeypatch, [make_trade("WAIT1"), make_trade("WAIT2")])
     monkeypatch.setattr(paper, "TradingViewClient", FakeTradingViewEntryClient)
     client = TestClient(app)
@@ -213,13 +242,13 @@ def test_blocked_real_update_creates_blocked_run_log_without_writes(monkeypatch)
     assert response.status_code == 200
     payload = response.json()
     assert payload["blocked"] is True
-    assert payload["block_reason"] == "MAX_WRITES_EXCEEDED"
+    assert payload["block_reason"] == "APPROVAL_REQUIRED"
     run = db.paper_update_runs.rows[0]
     assert run["status"] == "BLOCKED"
     assert run["mode"] == "REAL"
     assert run["blocked"] is True
-    assert run["block_reason"] == "MAX_WRITES_EXCEEDED"
-    assert run["proposed_write_count"] == 2
+    assert run["block_reason"] == "APPROVAL_REQUIRED"
+    assert run["proposed_write_count"] == 0
     assert run["updated_count"] == 0
     assert db.paper_trades.update_calls == []
     assert db.paper_trades.delete_calls == []
@@ -239,6 +268,8 @@ def test_evaluation_failure_creates_failed_run_log(monkeypatch) -> None:
     assert run["status"] == "FAILED"
     assert run["errors_count"] == 1
     assert run["details"]["errors"][0]["error_message"] == "simulated TradingView failure"
+    assert run["approval_status"] == "INVALIDATED"
+    assert run["approval_expires_at"] is None
     assert db.paper_trades.update_calls == []
 
 

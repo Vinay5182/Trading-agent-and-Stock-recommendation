@@ -216,7 +216,7 @@ def test_dry_run_blocks_when_proposed_writes_exceed_limit(monkeypatch) -> None:
     assert collection.delete_calls == []
 
 
-def test_real_mode_blocks_when_proposed_writes_exceed_limit(monkeypatch) -> None:
+def test_real_mode_requires_approval_before_evaluation(monkeypatch) -> None:
     collection = patch_paper_database(
         monkeypatch,
         [
@@ -233,12 +233,26 @@ def test_real_mode_blocks_when_proposed_writes_exceed_limit(monkeypatch) -> None
     payload = response.json()
     assert payload["dry_run"] is False
     assert payload["blocked"] is True
-    assert payload["block_reason"] == "MAX_WRITES_EXCEEDED"
+    assert payload["block_reason"] == "APPROVAL_REQUIRED"
     assert payload["mongo_writes_enabled"] is False
-    assert payload["proposed_write_count"] == 2
+    assert payload["proposed_write_count"] == 0
     assert payload["updated_count"] == 0
-    assert len(payload["results"]) == 2
-    assert all(result["write_attempted"] is False for result in payload["results"])
-    assert all(result["write_blocked"] is True for result in payload["results"])
+    assert payload["results"] == []
+    assert collection.update_calls == []
+    assert collection.delete_calls == []
+
+
+def test_update_plans_real_mode_requires_approval(monkeypatch) -> None:
+    collection = patch_paper_database(monkeypatch, [make_trade("WAIT1", "NOT_TRIGGERED", entry_triggered=False)])
+    monkeypatch.setattr(paper, "TradingViewClient", FakeTradingViewEntryClient)
+    client = TestClient(app)
+
+    response = client.post("/api/paper/update-plans?dry_run=false&max_trades=6&max_writes=1")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["blocked"] is True
+    assert payload["block_reason"] == "APPROVAL_REQUIRED"
+    assert payload["updated_count"] == 0
     assert collection.update_calls == []
     assert collection.delete_calls == []

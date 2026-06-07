@@ -358,7 +358,7 @@ def test_update_lock_endpoint_returns_current_lock_status(monkeypatch) -> None:
     assert payload["broker_orders"] is False
 
 
-def test_lock_does_not_change_allowed_paper_trade_update_logic(monkeypatch) -> None:
+def test_unbound_real_update_is_blocked_before_lock_or_trade_write(monkeypatch) -> None:
     db = patch_fake_db(monkeypatch, [make_trade("WAIT1")])
     monkeypatch.setattr(paper, "TradingViewClient", FakeTradingViewEntryClient)
     client = TestClient(app)
@@ -367,9 +367,10 @@ def test_lock_does_not_change_allowed_paper_trade_update_logic(monkeypatch) -> N
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["blocked"] is False
-    assert payload["updated_count"] == 1
-    assert payload["proposed_write_count"] == 1
-    assert len(db.paper_trades.update_calls) == 1
-    assert db.paper_trades.rows[0]["status"] == "ACTIVE"
-    assert db.paper_update_locks.rows[0]["status"] == "RELEASED"
+    assert payload["blocked"] is True
+    assert payload["block_reason"] == "APPROVAL_REQUIRED"
+    assert payload["updated_count"] == 0
+    assert payload["proposed_write_count"] == 0
+    assert db.paper_trades.update_calls == []
+    assert db.paper_trades.rows[0]["status"] == "NOT_TRIGGERED"
+    assert db.paper_update_locks.rows == []

@@ -5,7 +5,9 @@ from datetime import datetime, timedelta
 from math import floor
 from uuid import uuid4
 
+from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, StrictInt, StrictStr
 from pymongo.errors import DuplicateKeyError
 
 from config import settings
@@ -44,6 +46,27 @@ NON_TERMINAL_STATUSES = sorted(WAITING_STATUSES | ACTIVE_STATUSES)
 CLOSED_STATUSES = sorted(TERMINAL_STATUSES)
 PAPER_UPDATE_LOCK_NAME = "paper_trade_outcome_update"
 PAPER_UPDATE_LOCK_TTL_SECONDS = 15 * 60
+PAPER_UPDATE_APPROVAL_TTL_SECONDS = 3 * 60
+PAPER_UPDATE_APPROVAL_CONFIRMATION_TEXT = (
+    "I understand this will write to paper_trades only and will not place broker orders"
+)
+PAPER_UPDATE_APPROVED_FIELDS = {
+    "latest_close",
+    "latest_high",
+    "latest_low",
+    "last_checked_at",
+    "updated_at",
+    "exit_price",
+    "exit_reason",
+    "paper_pnl",
+    "paper_pnl_percent",
+    "status",
+    "outcome_status",
+    "status_updated_at",
+    "entry_triggered",
+    "entry_triggered_at",
+    "t1_hit",
+}
 PAPER_UPDATE_PROGRESS = {
     "running": False,
     "mode": "idle",
@@ -55,6 +78,13 @@ PAPER_UPDATE_PROGRESS = {
     "started_at": None,
     "finished_at": None,
 }
+
+
+class PaperUpdateApprovalRequest(BaseModel):
+    approved_dry_run_id: StrictStr | None = None
+    confirmation_text: StrictStr | None = None
+    max_trades: StrictInt | None = None
+    max_writes: StrictInt | None = None
 
 
 def default_paper_update_progress() -> dict:
@@ -90,6 +120,39 @@ def serialize_lock_doc(doc: dict | None) -> dict | None:
     if "_id" in serialized:
         serialized["_id"] = str(serialized["_id"])
     return serialized
+
+
+def canonical_json(value) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def stable_hash(value) -> str:
+    return hashlib.sha256(canonical_json(value).encode()).hexdigest()
+
+
+def paper_trade_precondition_hash(trade: dict) -> str:
+    return stable_hash(trade)
+
+
+def paper_trade_id_for_query(trade_id: str):
+    return ObjectId(trade_id) if ObjectId.is_valid(trade_id) else trade_id
+
+
+def proposed_transition_rows(results: list[dict]) -> list[dict]:
+    rows = [
+        {
+            "trade_id": result.get("trade_id"),
+            "target_trade_precondition_hash": result.get("target_trade_precondition_hash"),
+            "proposed_update": result.get("proposed_update"),
+        }
+        for result in results
+        if result.get("would_write")
+    ]
+    return sorted(rows, key=lambda row: str(row.get("trade_id") or ""))
+
+
+def proposed_transition_hash(results: list[dict]) -> str:
+    return stable_hash(proposed_transition_rows(results))
 
 
 def lock_is_expired(lock_doc: dict | None, now: str | None = None) -> bool:
@@ -235,20 +298,10 @@ async def get_paper_update_lock_status(db) -> dict:
 
 
 async def capture_paper_update_snapshot(db) -> dict:
-    cursor = db.paper_trades.find(
-        {"paper_only": True},
-        {
-            "_id": 0,
-            "status": 1,
-            "outcome_status": 1,
-            "pnl": 1,
-            "paper_pnl": 1,
-            "realized_pnl": 1,
-            "updated_at": 1,
-        },
-    )
+    cursor = db.paper_trades.find({"paper_only": True})
     rows = [row async for row in cursor]
-    updated_at_values = [str(row.get("updated_at")) for row in rows]
+    sorted_rows = sorted(rows, key=canonical_json)
+    updated_at_values = sorted(str(row.get("updated_at")) for row in rows)
     status_distribution = Counter(str(row.get("status") or "UNKNOWN") for row in rows)
     outcome_status_distribution = Counter(str(row.get("outcome_status") or "UNKNOWN") for row in rows)
     return {
@@ -259,6 +312,7 @@ async def capture_paper_update_snapshot(db) -> dict:
         "paper_pnl_sum": sum(float(row.get("paper_pnl") or 0) for row in rows),
         "realized_pnl_sum": sum(float(row.get("realized_pnl") or 0) for row in rows),
         "updated_at_hash": hashlib.sha256(json.dumps(updated_at_values, sort_keys=True).encode()).hexdigest(),
+        "snapshot_hash": stable_hash(sorted_rows),
     }
 
 
@@ -302,6 +356,155 @@ async def get_paper_update_run_from_db(db, run_id: str) -> dict | None:
         return None
     doc = await collection.find_one({"run_id": run_id}, {"_id": 0})
     return serialize_run_doc(doc)
+
+
+async def reject_paper_update_attempt(
+    db,
+    *,
+    run_id: str,
+    reason: str,
+    started_at: str,
+    approved_dry_run_id: str | None = None,
+    max_trades: int | None = None,
+    max_writes: int | None = None,
+    details: dict | None = None,
+    endpoint_mode: str = "update-trades-approve",
+) -> dict:
+    finished_at = datetime.utcnow().isoformat()
+    response = {
+        "run_id": run_id,
+        "approved_dry_run_id": approved_dry_run_id,
+        "mode": endpoint_mode,
+        "paper_only": True,
+        "live_trading": False,
+        "broker_orders": False,
+        "max_trades": max_trades,
+        "max_writes": max_writes,
+        "dry_run": False,
+        "mongo_writes_enabled": False,
+        "processed": 0,
+        "proposed_write_count": 0,
+        "updated_count": 0,
+        "would_update_count": 0,
+        "successful_updates_count": 0,
+        "errors_count": 0,
+        "blocked": True,
+        "block_reason": reason,
+        "errors": [],
+        "results": [],
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "details": details or {},
+    }
+    await upsert_paper_update_run_log(
+        db,
+        run_id,
+        {
+            **response,
+            "status": "BLOCKED",
+            "endpoint_mode": endpoint_mode,
+            "mode": "REAL",
+            "owner": "MANUAL_APPROVAL_ENDPOINT",
+            "source": "MANUAL_APPROVAL_ENDPOINT",
+            "changed_trade_ids": [],
+            "per_trade_results": [],
+        },
+        set_on_insert={"created_at": started_at},
+    )
+    return response
+
+
+def dry_run_approval_rejection_reason(dry_run: dict, now: str) -> str | None:
+    approval_status = dry_run.get("approval_status")
+    if approval_status == "USED":
+        return "APPROVAL_ALREADY_USED"
+    if approval_status == "CLAIMED":
+        return "APPROVAL_ALREADY_CLAIMED"
+    if not dry_run.get("approval_expires_at") or str(dry_run["approval_expires_at"]) < now:
+        return "DRY_RUN_EXPIRED"
+    if dry_run.get("dry_run") is not True or dry_run.get("status") != "COMPLETED":
+        return "DRY_RUN_NOT_COMPLETED"
+    if dry_run.get("errors_count") != 0:
+        return "DRY_RUN_HAS_ERRORS"
+    proposed_write_count = dry_run.get("proposed_write_count")
+    max_writes = dry_run.get("max_writes")
+    if (
+        not isinstance(proposed_write_count, int)
+        or proposed_write_count < 0
+        or not isinstance(max_writes, int)
+        or proposed_write_count > max_writes
+    ):
+        return "TOO_MANY_PROPOSED_WRITES"
+    if dry_run.get("blocked") is not False:
+        return "DRY_RUN_BLOCKED"
+    if max_writes != 1:
+        return "REQUEST_LIMITS_MISMATCH"
+    if any(
+        (
+            dry_run.get("mongo_writes_enabled") is not False,
+            dry_run.get("paper_only") is not True,
+            dry_run.get("live_trading") is not False,
+            dry_run.get("broker_orders") is not False,
+            not dry_run.get("pre_snapshot_hash"),
+            not dry_run.get("proposed_transition_hash"),
+            not isinstance(dry_run.get("proposed_trade_ids"), list),
+            not isinstance(dry_run.get("target_trade_precondition_hashes"), dict),
+            dry_run.get("endpoint_mode") != "update-trades",
+        )
+    ):
+        return "SAFETY_FLAGS_INVALID"
+    if approval_status != "AVAILABLE":
+        return "SAFETY_FLAGS_INVALID"
+    return None
+
+
+async def claim_dry_run_approval(db, dry_run_id: str, real_run_id: str, now: str) -> bool:
+    collection = paper_update_runs_collection(db)
+    if collection is None:
+        return False
+    result = await collection.update_one(
+        {
+            "run_id": dry_run_id,
+            "approval_status": "AVAILABLE",
+            "approval_expires_at": {"$gte": now},
+        },
+        {
+            "$set": {
+                "approval_status": "CLAIMED",
+                "approval_claimed_at": now,
+                "approval_claimed_by_run_id": real_run_id,
+            }
+        },
+        upsert=False,
+    )
+    return bool(getattr(result, "modified_count", 0) or getattr(result, "matched_count", 0))
+
+
+async def update_dry_run_approval_status(
+    db,
+    dry_run_id: str,
+    *,
+    status: str,
+    real_run_id: str,
+    reason: str | None = None,
+) -> None:
+    collection = paper_update_runs_collection(db)
+    if collection is None:
+        return
+    now = datetime.utcnow().isoformat()
+    update = {
+        "approval_status": status,
+        "approval_invalidated_reason": reason,
+    }
+    if status == "USED":
+        update.update(
+            {
+                "approval_used_at": now,
+                "approval_used_by_run_id": real_run_id,
+                "approved_real_run_id": real_run_id,
+            }
+        )
+    await collection.update_one({"run_id": dry_run_id}, {"$set": update}, upsert=False)
 
 
 async def get_paper_update_scheduler_status(db) -> dict:
@@ -617,6 +820,17 @@ async def run_paper_trade_update(
     run_id = uuid4().hex
     started = datetime.utcnow()
     started_at = started.isoformat()
+    if not dry_run:
+        return await reject_paper_update_attempt(
+            db,
+            run_id=run_id,
+            reason="APPROVAL_REQUIRED",
+            started_at=started_at,
+            max_trades=limit,
+            max_writes=max_writes,
+            endpoint_mode=mode,
+            details={"message": "Real paper updates require the dedicated approval endpoint."},
+        )
     run_mode = "DRY_RUN" if dry_run else "REAL"
     lock_result = await acquire_paper_update_lock(db, run_id)
     pre_snapshot = await capture_paper_update_snapshot(db)
@@ -700,6 +914,19 @@ async def run_paper_trade_update(
                 "live_trading": False,
                 "broker_orders": False,
                 "mongo_writes_enabled": False,
+                "approval_status": "INVALIDATED",
+                "approval_expires_at": None,
+                "approval_used_at": None,
+                "approval_used_by_run_id": None,
+                "approval_claimed_at": None,
+                "approval_claimed_by_run_id": None,
+                "approved_real_run_id": None,
+                "pre_snapshot_hash": pre_snapshot.get("snapshot_hash"),
+                "proposed_trade_ids": [],
+                "proposed_transition_hash": proposed_transition_hash([]),
+                "approved_max_trades": limit,
+                "approved_max_writes": max_writes,
+                "target_trade_precondition_hashes": {},
             },
             set_on_insert={"created_at": started_at},
         )
@@ -821,6 +1048,7 @@ async def run_paper_trade_update(
                 PAPER_UPDATE_PROGRESS["would_update_count"] = would_update_count
                 proposal_result = {
                     **paper_trade_proposal_context(plan),
+                    "target_trade_precondition_hash": paper_trade_precondition_hash(plan),
                     "previous_status": plan.get("status"),
                     "status": update.get("status", plan.get("status")),
                     "previous_outcome_status": plan.get("outcome_status"),
@@ -840,6 +1068,7 @@ async def run_paper_trade_update(
                     "exit_reason": update.get("exit_reason"),
                     "paper_pnl": update.get("paper_pnl", plan.get("paper_pnl", 0)),
                     "paper_pnl_percent": update.get("paper_pnl_percent", plan.get("paper_pnl_percent", 0)),
+                    "proposed_update": update if would_write else None,
                 }
                 results.append(proposal_result)
                 if would_write:
@@ -982,6 +1211,44 @@ async def run_paper_trade_update(
         processed=processed,
         successful_updates_count=successful_updates_count,
     )
+    proposed_trade_ids = [
+        result["trade_id"]
+        for result in results
+        if result.get("would_write") and result.get("trade_id")
+    ]
+    target_trade_precondition_hashes = {
+        result["trade_id"]: result["target_trade_precondition_hash"]
+        for result in results
+        if result.get("would_write")
+        and result.get("trade_id")
+        and result.get("target_trade_precondition_hash")
+    }
+    transition_hash = proposed_transition_hash(results)
+    approval_available = bool(
+        dry_run
+        and mode == "update-trades"
+        and run_status == "COMPLETED"
+        and not errors
+        and not blocked
+        and would_update_count <= max_writes
+        and max_writes == 1
+        and post_snapshot.get("snapshot_hash") == pre_snapshot.get("snapshot_hash")
+    )
+    approval_status = "AVAILABLE" if approval_available else "INVALIDATED"
+    approval_expires_at = (
+        (datetime.utcnow() + timedelta(seconds=PAPER_UPDATE_APPROVAL_TTL_SECONDS)).isoformat()
+        if approval_available
+        else None
+    )
+    response.update(
+        {
+            "approval_status": approval_status,
+            "approval_expires_at": approval_expires_at,
+            "pre_snapshot_hash": pre_snapshot.get("snapshot_hash"),
+            "proposed_trade_ids": proposed_trade_ids,
+            "proposed_transition_hash": transition_hash,
+        }
+    )
     PAPER_UPDATE_PROGRESS["status"] = run_status
     await upsert_paper_update_run_log(
         db,
@@ -1008,6 +1275,19 @@ async def run_paper_trade_update(
             },
             "per_trade_results": results,
             "mongo_writes_enabled": not dry_run and not blocked,
+            "approval_status": approval_status,
+            "approval_expires_at": approval_expires_at,
+            "approval_used_at": None,
+            "approval_used_by_run_id": None,
+            "approval_claimed_at": None,
+            "approval_claimed_by_run_id": None,
+            "approved_real_run_id": None,
+            "pre_snapshot_hash": pre_snapshot.get("snapshot_hash"),
+            "proposed_trade_ids": proposed_trade_ids,
+            "proposed_transition_hash": transition_hash,
+            "approved_max_trades": limit,
+            "approved_max_writes": max_writes,
+            "target_trade_precondition_hashes": target_trade_precondition_hashes,
         },
     )
     return response
@@ -1035,6 +1315,285 @@ async def update_paper_trades(
 ) -> dict:
     effective_limit = max_trades or limit or 10
     return await run_paper_trade_update(effective_limit, timeframe, dry_run, "update-trades", max_writes)
+
+
+@router.post("/update-trades/approve")
+async def approve_paper_trade_update(request: PaperUpdateApprovalRequest) -> dict:
+    db = get_database()
+    run_id = uuid4().hex
+    started_at = datetime.utcnow().isoformat()
+    dry_run_id = request.approved_dry_run_id
+
+    async def reject(reason: str, details: dict | None = None) -> dict:
+        return await reject_paper_update_attempt(
+            db,
+            run_id=run_id,
+            reason=reason,
+            started_at=started_at,
+            approved_dry_run_id=dry_run_id,
+            max_trades=request.max_trades,
+            max_writes=request.max_writes,
+            details=details,
+        )
+
+    if request.confirmation_text != PAPER_UPDATE_APPROVAL_CONFIRMATION_TEXT:
+        return await reject("CONFIRMATION_TEXT_INVALID")
+    if request.max_trades != 6 or request.max_writes != 1:
+        return await reject("REQUEST_LIMITS_MISMATCH")
+    if not dry_run_id:
+        return await reject("DRY_RUN_NOT_FOUND")
+
+    dry_run = await get_paper_update_run_from_db(db, dry_run_id)
+    if dry_run is None:
+        return await reject("DRY_RUN_NOT_FOUND")
+
+    now = datetime.utcnow().isoformat()
+    rejection_reason = dry_run_approval_rejection_reason(dry_run, now)
+    if rejection_reason:
+        if rejection_reason == "DRY_RUN_EXPIRED" and dry_run.get("approval_status") == "AVAILABLE":
+            await update_dry_run_approval_status(
+                db,
+                dry_run_id,
+                status="EXPIRED",
+                real_run_id=run_id,
+                reason=rejection_reason,
+            )
+        return await reject(rejection_reason)
+    if (
+        dry_run.get("approved_max_trades") != request.max_trades
+        or dry_run.get("approved_max_writes") != request.max_writes
+    ):
+        return await reject("REQUEST_LIMITS_MISMATCH")
+
+    scheduler_status = await get_paper_update_scheduler_status(db)
+    if (
+        scheduler_status.get("enabled") is not False
+        or scheduler_status.get("scheduler_running") is not False
+        or scheduler_status.get("automatic_updates_enabled") is not False
+    ):
+        return await reject("SCHEDULER_NOT_DISABLED", {"scheduler_status": scheduler_status})
+
+    lock_result = await acquire_paper_update_lock(db, run_id, owner="MANUAL_APPROVAL_ENDPOINT")
+    if not lock_result.get("acquired"):
+        return await reject("LOCK_ALREADY_HELD", {"lock": lock_result.get("lock")})
+
+    lock_release_result = {"released": False, "lock": None, "lock_required": lock_result.get("lock_required", False)}
+    claimed = False
+    try:
+        claimed = await claim_dry_run_approval(db, dry_run_id, run_id, datetime.utcnow().isoformat())
+        if not claimed:
+            current_dry_run = await get_paper_update_run_from_db(db, dry_run_id)
+            claim_reason = (
+                dry_run_approval_rejection_reason(current_dry_run, datetime.utcnow().isoformat())
+                if current_dry_run
+                else "DRY_RUN_NOT_FOUND"
+            )
+            return await reject(claim_reason or "APPROVAL_ALREADY_CLAIMED")
+
+        claimed_dry_run = await get_paper_update_run_from_db(db, dry_run_id)
+        if claimed_dry_run is None:
+            await update_dry_run_approval_status(
+                db,
+                dry_run_id,
+                status="INVALIDATED",
+                real_run_id=run_id,
+                reason="DRY_RUN_NOT_FOUND",
+            )
+            return await reject("DRY_RUN_NOT_FOUND")
+
+        stored_results = claimed_dry_run.get("per_trade_results")
+        if not isinstance(stored_results, list) or (
+            proposed_transition_hash(stored_results) != claimed_dry_run.get("proposed_transition_hash")
+        ):
+            await update_dry_run_approval_status(
+                db,
+                dry_run_id,
+                status="INVALIDATED",
+                real_run_id=run_id,
+                reason="TRANSITION_HASH_CHANGED",
+            )
+            return await reject("TRANSITION_HASH_CHANGED")
+
+        approved_transitions = proposed_transition_rows(stored_results)
+        transition_trade_ids = [row.get("trade_id") for row in approved_transitions]
+        transition_precondition_hashes = {
+            row["trade_id"]: row.get("target_trade_precondition_hash")
+            for row in approved_transitions
+            if row.get("trade_id")
+        }
+        if (
+            transition_trade_ids != claimed_dry_run.get("proposed_trade_ids")
+            or transition_precondition_hashes != claimed_dry_run.get("target_trade_precondition_hashes")
+        ):
+            await update_dry_run_approval_status(
+                db,
+                dry_run_id,
+                status="INVALIDATED",
+                real_run_id=run_id,
+                reason="TRANSITION_HASH_CHANGED",
+            )
+            return await reject("TRANSITION_HASH_CHANGED")
+        if len(approved_transitions) > request.max_writes:
+            await update_dry_run_approval_status(
+                db,
+                dry_run_id,
+                status="INVALIDATED",
+                real_run_id=run_id,
+                reason="TOO_MANY_PROPOSED_WRITES",
+            )
+            return await reject("TOO_MANY_PROPOSED_WRITES")
+
+        current_snapshot = await capture_paper_update_snapshot(db)
+        if current_snapshot.get("snapshot_hash") != claimed_dry_run.get("pre_snapshot_hash"):
+            await update_dry_run_approval_status(
+                db,
+                dry_run_id,
+                status="INVALIDATED",
+                real_run_id=run_id,
+                reason="SNAPSHOT_CHANGED",
+            )
+            return await reject(
+                "SNAPSHOT_CHANGED",
+                {
+                    "expected_snapshot_hash": claimed_dry_run.get("pre_snapshot_hash"),
+                    "current_snapshot_hash": current_snapshot.get("snapshot_hash"),
+                },
+            )
+
+        current_trades = {}
+        for transition in approved_transitions:
+            trade_id = transition.get("trade_id")
+            trade = await db.paper_trades.find_one(
+                {"_id": paper_trade_id_for_query(trade_id), "paper_only": True}
+            )
+            expected_hash = claimed_dry_run.get("target_trade_precondition_hashes", {}).get(trade_id)
+            if trade is None or paper_trade_precondition_hash(trade) != expected_hash:
+                await update_dry_run_approval_status(
+                    db,
+                    dry_run_id,
+                    status="INVALIDATED",
+                    real_run_id=run_id,
+                    reason="TARGET_TRADE_CHANGED",
+                )
+                return await reject("TARGET_TRADE_CHANGED", {"trade_id": trade_id})
+            current_trades[trade_id] = trade
+
+        results = []
+        updated_count = 0
+        for transition in approved_transitions:
+            trade_id = transition["trade_id"]
+            proposed_update = transition.get("proposed_update")
+            if (
+                not isinstance(proposed_update, dict)
+                or not proposed_update
+                or not set(proposed_update).issubset(PAPER_UPDATE_APPROVED_FIELDS)
+            ):
+                await update_dry_run_approval_status(
+                    db,
+                    dry_run_id,
+                    status="INVALIDATED",
+                    real_run_id=run_id,
+                    reason="TRANSITION_HASH_CHANGED",
+                )
+                return await reject("TRANSITION_HASH_CHANGED", {"trade_id": trade_id})
+            try:
+                result = await db.paper_trades.update_one(
+                    {"_id": paper_trade_id_for_query(trade_id), "paper_only": True},
+                    {"$set": proposed_update},
+                    upsert=False,
+                )
+            except Exception as exc:
+                await update_dry_run_approval_status(
+                    db,
+                    dry_run_id,
+                    status="INVALIDATED",
+                    real_run_id=run_id,
+                    reason="TARGET_TRADE_CHANGED",
+                )
+                return await reject(
+                    "TARGET_TRADE_CHANGED",
+                    {"trade_id": trade_id, "write_error": str(exc)},
+                )
+            modified_count = int(getattr(result, "modified_count", 0))
+            if modified_count != 1:
+                await update_dry_run_approval_status(
+                    db,
+                    dry_run_id,
+                    status="INVALIDATED",
+                    real_run_id=run_id,
+                    reason="TARGET_TRADE_CHANGED",
+                )
+                return await reject("TARGET_TRADE_CHANGED", {"trade_id": trade_id})
+            updated_count += modified_count
+            results.append(
+                {
+                    "trade_id": trade_id,
+                    "symbol": current_trades[trade_id].get("symbol"),
+                    "updated": True,
+                    "write_attempted": True,
+                    "applied_update": proposed_update,
+                }
+            )
+
+        await update_dry_run_approval_status(
+            db,
+            dry_run_id,
+            status="USED",
+            real_run_id=run_id,
+        )
+        finished_at = datetime.utcnow().isoformat()
+        post_snapshot = await capture_paper_update_snapshot(db)
+        response = {
+            "run_id": run_id,
+            "approved_dry_run_id": dry_run_id,
+            "mode": "update-trades-approve",
+            "paper_only": True,
+            "live_trading": False,
+            "broker_orders": False,
+            "max_trades": request.max_trades,
+            "max_writes": request.max_writes,
+            "dry_run": False,
+            "mongo_writes_enabled": True,
+            "processed": len(approved_transitions),
+            "proposed_write_count": len(approved_transitions),
+            "updated_count": updated_count,
+            "would_update_count": len(approved_transitions),
+            "successful_updates_count": updated_count,
+            "errors_count": 0,
+            "blocked": False,
+            "block_reason": None,
+            "errors": [],
+            "results": results,
+            "changed_trade_ids": [result["trade_id"] for result in results],
+            "started_at": started_at,
+            "finished_at": finished_at,
+        }
+        await upsert_paper_update_run_log(
+            db,
+            run_id,
+            {
+                **response,
+                "status": "COMPLETED",
+                "mode": "REAL_APPROVAL",
+                "endpoint_mode": "update-trades-approve",
+                "owner": "MANUAL_APPROVAL_ENDPOINT",
+                "source": "MANUAL_APPROVAL_ENDPOINT",
+                "pre_snapshot": current_snapshot,
+                "post_snapshot": post_snapshot,
+                "per_trade_results": results,
+            },
+            set_on_insert={"created_at": started_at},
+        )
+        return response
+    finally:
+        try:
+            lock_release_result = await release_paper_update_lock(db, run_id)
+        except Exception as exc:
+            lock_release_result = {
+                "released": False,
+                "error": str(exc),
+                "lock_required": lock_result.get("lock_required", False),
+            }
 
 
 @router.get("/update-progress")

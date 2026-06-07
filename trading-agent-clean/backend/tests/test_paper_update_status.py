@@ -249,7 +249,7 @@ def test_dry_run_proposes_transition_without_mongo_write(monkeypatch: pytest.Mon
     assert collection.delete_calls == []
 
 
-def test_real_mode_blocks_all_writes_when_max_writes_exceeded(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_real_mode_requires_approval_before_evaluation(monkeypatch: pytest.MonkeyPatch) -> None:
     collection = FakePaperTrades(make_plans(2))
     fake_db = SimpleNamespace(paper_trades=collection)
     monkeypatch.setattr(paper, "get_database", lambda: fake_db)
@@ -257,14 +257,14 @@ def test_real_mode_blocks_all_writes_when_max_writes_exceeded(monkeypatch: pytes
 
     response = asyncio.run(paper.run_paper_trade_update(2, "1D", False, "test-write-limit", max_writes=1))
 
-    assert response["processed"] == 2
-    assert response["proposed_write_count"] == 2
+    assert response["processed"] == 0
+    assert response["proposed_write_count"] == 0
     assert response["updated_count"] == 0
     assert response["successful_updates_count"] == 0
     assert response["blocked"] is True
-    assert response["block_reason"] == "MAX_WRITES_EXCEEDED"
+    assert response["block_reason"] == "APPROVAL_REQUIRED"
     assert response["mongo_writes_enabled"] is False
-    assert all(result["write_blocked"] is True for result in response["results"])
+    assert response["results"] == []
     assert collection.update_calls == []
     assert collection.delete_calls == []
 
@@ -286,7 +286,7 @@ def test_dry_run_reports_when_real_mode_would_be_blocked(monkeypatch: pytest.Mon
     assert collection.delete_calls == []
 
 
-def test_real_mode_allows_expected_writes_within_max_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_real_mode_does_not_write_without_approval(monkeypatch: pytest.MonkeyPatch) -> None:
     collection = FakePaperTrades(make_plans(1))
     fake_db = SimpleNamespace(paper_trades=collection)
     monkeypatch.setattr(paper, "get_database", lambda: fake_db)
@@ -294,19 +294,19 @@ def test_real_mode_allows_expected_writes_within_max_writes(monkeypatch: pytest.
 
     response = asyncio.run(paper.run_paper_trade_update(1, "1D", False, "test-allowed-write", max_writes=1))
 
-    assert response["proposed_write_count"] == 1
-    assert response["updated_count"] == 1
-    assert response["successful_updates_count"] == 1
+    assert response["proposed_write_count"] == 0
+    assert response["updated_count"] == 0
+    assert response["successful_updates_count"] == 0
     assert response["errors_count"] == 0
-    assert response["blocked"] is False
-    assert response["mongo_writes_enabled"] is True
-    assert response["results"][0]["write_attempted"] is True
-    assert response["results"][0]["updated"] is True
-    assert len(collection.update_calls) == 1
+    assert response["blocked"] is True
+    assert response["block_reason"] == "APPROVAL_REQUIRED"
+    assert response["mongo_writes_enabled"] is False
+    assert response["results"] == []
+    assert collection.update_calls == []
     assert collection.delete_calls == []
 
 
-def test_write_failure_is_reported_and_other_updates_continue(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_unbound_real_mode_does_not_attempt_failing_writes(monkeypatch: pytest.MonkeyPatch) -> None:
     class OneWriteFailsPaperTrades(FakePaperTrades):
         async def update_one(self, *args, **kwargs) -> SimpleNamespace:
             self.update_calls.append((args, kwargs))
@@ -321,25 +321,15 @@ def test_write_failure_is_reported_and_other_updates_continue(monkeypatch: pytes
 
     response = asyncio.run(paper.run_paper_trade_update(2, "1D", False, "test-write-failure", max_writes=2))
 
-    failed_result = next(result for result in response["results"] if result["trade_id"] == "test-trade-0")
-    successful_result = next(result for result in response["results"] if result["trade_id"] == "test-trade-1")
-    assert response["blocked"] is False
-    assert response["proposed_write_count"] == 2
-    assert response["updated_count"] == 1
-    assert response["successful_updates_count"] == 1
-    assert response["errors_count"] == 1
-    assert response["errors"][0]["trade_id"] == "test-trade-0"
-    assert response["errors"][0]["symbol"] == "TEST0"
-    assert response["errors"][0]["error_message"] == "simulated write failure"
-    assert response["errors"][0]["error_stage"] == "AFTER_WRITE_ATTEMPT"
-    assert response["errors"][0]["write_attempted"] is True
-    assert failed_result["updated"] is False
-    assert failed_result["error_stage"] == "AFTER_WRITE_ATTEMPT"
-    assert successful_result["updated"] is True
-    assert len(collection.update_calls) == 2
+    assert response["blocked"] is True
+    assert response["block_reason"] == "APPROVAL_REQUIRED"
+    assert response["updated_count"] == 0
+    assert response["errors_count"] == 0
+    assert response["results"] == []
+    assert collection.update_calls == []
 
 
-def test_evaluation_failure_is_reported_before_write_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_unbound_real_mode_does_not_attempt_evaluation(monkeypatch: pytest.MonkeyPatch) -> None:
     collection = FakePaperTrades(make_plans(1))
     fake_db = SimpleNamespace(paper_trades=collection)
 
@@ -352,17 +342,13 @@ def test_evaluation_failure_is_reported_before_write_attempt(monkeypatch: pytest
 
     response = asyncio.run(paper.run_paper_trade_update(1, "1D", False, "test-evaluation-failure", max_writes=1))
 
-    result = response["results"][0]
     assert response["proposed_write_count"] == 0
     assert response["updated_count"] == 0
     assert response["successful_updates_count"] == 0
-    assert response["errors_count"] == 1
-    assert response["errors"][0]["trade_id"] == "test-trade-0"
-    assert response["errors"][0]["error_message"] == "simulated evaluation failure"
-    assert response["errors"][0]["error_stage"] == "BEFORE_WRITE_ATTEMPT"
-    assert response["errors"][0]["write_attempted"] is False
-    assert result["error_stage"] == "BEFORE_WRITE_ATTEMPT"
-    assert result["write_attempted"] is False
+    assert response["errors_count"] == 0
+    assert response["blocked"] is True
+    assert response["block_reason"] == "APPROVAL_REQUIRED"
+    assert response["results"] == []
     assert collection.update_calls == []
     assert collection.delete_calls == []
 

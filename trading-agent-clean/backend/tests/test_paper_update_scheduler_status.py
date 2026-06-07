@@ -15,6 +15,10 @@ def matches_query(row: dict, query: dict | None) -> bool:
     if not query:
         return True
     for key, expected in query.items():
+        if key == "$or":
+            if not any(matches_query(row, option) for option in expected):
+                return False
+            continue
         actual = row.get(key)
         if actual != expected:
             return False
@@ -96,8 +100,12 @@ def test_scheduler_status_returns_disabled_defaults(monkeypatch) -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["enabled"] is False
-    assert payload["mode"] == "manual"
+    assert payload["mode"] == "dry_run_only"
+    assert payload["dry_run_only"] is True
+    assert payload["allow_real_writes"] is False
     assert payload["next_run_at"] is None
+    assert payload["last_scheduled_run_id"] is None
+    assert payload["last_block_reason"] == "SCHEDULER_DISABLED"
     assert payload["scheduler_running"] is False
     assert payload["automatic_updates_enabled"] is False
     assert payload["paper_only"] is True
@@ -144,8 +152,21 @@ def test_scheduler_status_includes_latest_run_id(monkeypatch) -> None:
     patch_fake_db(
         monkeypatch,
         runs=[
+            {
+                "run_id": "latest-manual-run",
+                "started_at": "2026-06-07T03:00:00",
+                "status": "COMPLETED",
+                "owner": "MANUAL_ENDPOINT",
+            },
+            {
+                "run_id": "latest-scheduled-run",
+                "started_at": "2026-06-07T02:00:00",
+                "status": "BLOCKED",
+                "endpoint_mode": "scheduler-dry-run-only",
+                "owner": "SCHEDULER_DRY_RUN_ONLY",
+                "block_reason": "LOCK_ALREADY_HELD",
+            },
             {"run_id": "older-run", "started_at": "2026-06-07T01:00:00", "status": "COMPLETED"},
-            {"run_id": "latest-run", "started_at": "2026-06-07T02:00:00", "status": "BLOCKED"},
         ],
     )
     client = TestClient(app)
@@ -154,8 +175,11 @@ def test_scheduler_status_includes_latest_run_id(monkeypatch) -> None:
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["last_run_id"] == "latest-run"
-    assert payload["last_run_status"] == "BLOCKED"
+    assert payload["last_run_id"] == "latest-manual-run"
+    assert payload["last_run_status"] == "COMPLETED"
+    assert payload["last_scheduled_run_id"] == "latest-scheduled-run"
+    assert payload["last_scheduled_run_status"] == "BLOCKED"
+    assert payload["last_block_reason"] == "LOCK_ALREADY_HELD"
 
 
 def test_scheduler_config_defaults_are_safe(monkeypatch) -> None:
@@ -167,6 +191,8 @@ def test_scheduler_config_defaults_are_safe(monkeypatch) -> None:
     assert response.status_code == 200
     payload = response.json()
     assert settings.PAPER_UPDATE_SCHEDULER_ENABLED is False
+    assert settings.PAPER_UPDATE_SCHEDULER_DRY_RUN_ONLY is True
+    assert settings.PAPER_UPDATE_SCHEDULER_ALLOW_REAL_WRITES is False
     assert settings.PAPER_UPDATE_SCHEDULER_DRY_RUN_FIRST is True
     assert settings.PAPER_UPDATE_SCHEDULER_MAX_WRITES == 1
     assert payload["dry_run_first"] is True

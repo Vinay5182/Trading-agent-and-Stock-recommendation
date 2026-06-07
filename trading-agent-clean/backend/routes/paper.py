@@ -13,6 +13,11 @@ from pymongo.errors import DuplicateKeyError
 from config import settings
 from database import get_database
 from routes.signals import build_tv_confirmed_signals
+from services.paper_update_scheduler import (
+    SCHEDULER_DRY_RUN_ENDPOINT_MODE,
+    SCHEDULER_DRY_RUN_OWNER,
+    build_paper_update_scheduler_status,
+)
 from tv_client import TradingViewClient
 from tv_confirmation import PAPER_PLAN_FIELDS, build_price_action_paper_plan_from_candles, confirm_from_candles, confirm_momentum_from_candles
 
@@ -342,6 +347,24 @@ async def latest_paper_update_run(db) -> dict | None:
     return serialize_run_doc(doc)
 
 
+async def latest_scheduled_paper_update_run(db) -> dict | None:
+    collection = paper_update_runs_collection(db)
+    if collection is None:
+        return None
+    doc = await collection.find_one(
+        {
+            "$or": [
+                {"owner": SCHEDULER_DRY_RUN_OWNER},
+                {"source": SCHEDULER_DRY_RUN_OWNER},
+                {"endpoint_mode": SCHEDULER_DRY_RUN_ENDPOINT_MODE},
+            ]
+        },
+        {"_id": 0},
+        sort=[("started_at", -1)],
+    )
+    return serialize_run_doc(doc)
+
+
 async def list_paper_update_runs_from_db(db, limit: int) -> list[dict]:
     collection = paper_update_runs_collection(db)
     if collection is None:
@@ -509,26 +532,14 @@ async def update_dry_run_approval_status(
 
 async def get_paper_update_scheduler_status(db) -> dict:
     latest_run = await latest_paper_update_run(db)
+    latest_scheduled_run = await latest_scheduled_paper_update_run(db)
     lock_status = await get_paper_update_lock_status(db)
-    enabled = settings.PAPER_UPDATE_SCHEDULER_ENABLED
-    return {
-        "enabled": enabled,
-        "mode": settings.PAPER_UPDATE_SCHEDULER_MODE,
-        "interval_minutes": settings.PAPER_UPDATE_SCHEDULER_INTERVAL_MINUTES,
-        "after_market_close_only": settings.PAPER_UPDATE_SCHEDULER_AFTER_MARKET_CLOSE_ONLY,
-        "dry_run_first": settings.PAPER_UPDATE_SCHEDULER_DRY_RUN_FIRST,
-        "max_trades": settings.PAPER_UPDATE_SCHEDULER_MAX_TRADES,
-        "max_writes": settings.PAPER_UPDATE_SCHEDULER_MAX_WRITES,
-        "next_run_at": None,
-        "last_run_id": latest_run.get("run_id") if latest_run else None,
-        "last_run_status": latest_run.get("status") if latest_run else None,
-        "lock": lock_status,
-        "scheduler_running": False,
-        "automatic_updates_enabled": False,
-        "paper_only": True,
-        "live_trading": False,
-        "broker_orders": False,
-    }
+    return build_paper_update_scheduler_status(
+        latest_run=latest_run,
+        latest_scheduled_run=latest_scheduled_run,
+        lock_status=lock_status,
+        scheduler_settings=settings,
+    )
 
 
 def normalize_status(value) -> str:
@@ -815,9 +826,13 @@ async def run_paper_trade_update(
     dry_run: bool,
     mode: str,
     max_writes: int = 1,
+    owner: str = "MANUAL_ENDPOINT",
+    db_override=None,
+    run_id_override: str | None = None,
+    pre_acquired_lock_result: dict | None = None,
 ) -> dict:
-    db = get_database()
-    run_id = uuid4().hex
+    db = db_override or get_database()
+    run_id = run_id_override or uuid4().hex
     started = datetime.utcnow()
     started_at = started.isoformat()
     if not dry_run:
@@ -832,13 +847,15 @@ async def run_paper_trade_update(
             details={"message": "Real paper updates require the dedicated approval endpoint."},
         )
     run_mode = "DRY_RUN" if dry_run else "REAL"
-    lock_result = await acquire_paper_update_lock(db, run_id)
+    lock_result = pre_acquired_lock_result or await acquire_paper_update_lock(db, run_id, owner=owner)
     pre_snapshot = await capture_paper_update_snapshot(db)
     if not lock_result.get("acquired"):
         finished_at = datetime.utcnow().isoformat()
         blocked_response = {
             "run_id": run_id,
             "mode": mode,
+            "owner": owner,
+            "source": owner,
             "paper_only": True,
             "live_trading": False,
             "broker_orders": False,
@@ -886,6 +903,8 @@ async def run_paper_trade_update(
                 "finished_at": finished_at,
                 "mode": run_mode,
                 "endpoint_mode": mode,
+                "owner": owner,
+                "source": owner,
                 "dry_run": dry_run,
                 "dry_run_first": dry_run,
                 "status": "BLOCKED",
@@ -908,8 +927,8 @@ async def run_paper_trade_update(
                     "lock": lock_result.get("lock"),
                 },
                 "per_trade_results": [],
-                "owner": "MANUAL_ENDPOINT",
-                "source": "MANUAL_ENDPOINT",
+                "owner": owner,
+                "source": owner,
                 "paper_only": True,
                 "live_trading": False,
                 "broker_orders": False,
@@ -973,8 +992,8 @@ async def run_paper_trade_update(
             "changed_trade_ids": [],
             "details": {"timeframe": timeframe, "operation": mode, "lock": lock_result.get("lock")},
             "per_trade_results": [],
-            "owner": "MANUAL_ENDPOINT",
-            "source": "MANUAL_ENDPOINT",
+            "owner": owner,
+            "source": owner,
             "paper_only": True,
             "live_trading": False,
             "broker_orders": False,
@@ -1176,6 +1195,8 @@ async def run_paper_trade_update(
     response = {
         "run_id": run_id,
         "mode": mode,
+        "owner": owner,
+        "source": owner,
         "paper_only": True,
         "live_trading": False,
         "broker_orders": False,
@@ -1256,6 +1277,8 @@ async def run_paper_trade_update(
         {
             "finished_at": PAPER_UPDATE_PROGRESS["finished_at"],
             "status": run_status,
+            "owner": owner,
+            "source": owner,
             "processed": processed,
             "proposed_write_count": would_update_count,
             "would_update_count": would_update_count,

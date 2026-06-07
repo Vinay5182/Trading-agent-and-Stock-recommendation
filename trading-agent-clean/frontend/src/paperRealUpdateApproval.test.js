@@ -10,6 +10,7 @@ const NOW = Date.parse("2026-06-07T12:00:00.000Z");
 
 const safeInput = () => ({
   latestDryRun: {
+    run_id: "dry-run-1",
     dry_run: true,
     status: "COMPLETED",
     mongo_writes_enabled: false,
@@ -172,6 +173,7 @@ test("denies approval when the latest dry-run is not completed successfully", ()
 test("denies approval when any required safety field is missing", async (t) => {
   const requiredFields = [
     ["latestDryRun", "dry_run"],
+    ["latestDryRun", "run_id"],
     ["latestDryRun", "status"],
     ["latestDryRun", "mongo_writes_enabled"],
     ["latestDryRun", "paper_only"],
@@ -198,6 +200,15 @@ test("denies approval when any required safety field is missing", async (t) => {
       assert.ok(result.reasons.includes(`Missing required safety field: ${scope}.${field}.`));
     });
   }
+});
+
+test("denies approval when latest dry-run ID is blank", () => {
+  const result = evaluate((input) => {
+    input.latestDryRun.run_id = " ";
+  });
+
+  assert.equal(result.allowed, false);
+  assert.ok(result.reasons.includes("latestDryRun.run_id must be a non-empty string."));
 });
 
 test("denies approval when lock is held", () => {

@@ -42,6 +42,18 @@ function requireNonNegativeInteger({ value, scope, field, reasons }) {
   return value[field];
 }
 
+function requireNonEmptyString({ value, scope, field, reasons }) {
+  if (!hasOwn(value, field)) {
+    reasons.push(missingReason(scope, field));
+    return false;
+  }
+  if (typeof value[field] !== "string" || !value[field].trim()) {
+    reasons.push(`${scope}.${field} must be a non-empty string.`);
+    return false;
+  }
+  return true;
+}
+
 export function canApprovePaperRealUpdate({
   latestDryRun,
   lockStatus,
@@ -53,6 +65,12 @@ export function canApprovePaperRealUpdate({
   if (latestDryRun === null || typeof latestDryRun !== "object") {
     reasons.push("Latest dry-run is required.");
   } else {
+    requireNonEmptyString({
+      value: latestDryRun,
+      scope: "latestDryRun",
+      field: "run_id",
+      reasons,
+    });
     requireExact({
       value: latestDryRun,
       scope: "latestDryRun",

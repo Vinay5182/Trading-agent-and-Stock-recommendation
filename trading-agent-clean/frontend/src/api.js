@@ -59,6 +59,20 @@ export const buildMomentumSignals = (save = false) => request(`/api/signals/buil
 export const buildPaperPlans = (signalType = "SWING_TV_CONFIRMED", save = false) => request(`/api/paper/build-plans?limit=5&timeframe=1D&save=${save}&signal_type=${encodeURIComponent(signalType)}`, { method: "POST" });
 export const updatePaperPlans = (maxTrades) => request(`/api/paper/update-trades${maxTrades ? `?max_trades=${encodeURIComponent(maxTrades)}` : ""}`, { method: "POST" });
 export const runPaperUpdateDryRun = ({ maxTrades = 6, maxWrites = 1 } = {}) => request(`/api/paper/update-trades?dry_run=true&max_trades=${encodeURIComponent(maxTrades)}&max_writes=${encodeURIComponent(maxWrites)}`, { method: "POST" });
+export const approvePaperUpdateFromDryRun = ({
+  approvedDryRunId,
+  confirmationText,
+  maxTrades = 6,
+  maxWrites = 1,
+}) => request("/api/paper/update-trades/approve", {
+  method: "POST",
+  body: JSON.stringify({
+    approved_dry_run_id: approvedDryRunId,
+    confirmation_text: confirmationText,
+    max_trades: maxTrades,
+    max_writes: maxWrites,
+  }),
+});
 export const getPaperUpdateProgress = () => request("/api/paper/update-progress");
 export const getPaperUpdateRuns = (limit = 10) => request(`/api/paper/update-runs?limit=${encodeURIComponent(limit)}`);
 export const getPaperUpdateLock = () => request("/api/paper/update-lock");

@@ -1,11 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
-  API_BASE, buildMomentumSignals, buildPaperPlans, buildSwingSignals, getActiveTrades,
+  API_BASE, approvePaperUpdateFromDryRun, buildMomentumSignals, buildPaperPlans, buildSwingSignals, getActiveTrades,
   getAllTrades, getHealth, getMarketDataSymbol, getMarketLoadProgress, getMomentumCandidates, getMomentumPrecheck, getPaperPlans, getPaperSignals,
   getMomentumSummary, getMomentumTvConfirmed, getPaperEquity, getPaperSummary, getPaperUpdateLock, getPaperUpdateProgress, getPaperUpdateRuns, getPaperUpdateSchedulerStatus, getScanRows, getScoreSummary, getSettings, getSwingCandidates,
   getSwingPrecheck, getSwingSummary, getSwingTvConfirmed, momentumTvConfirm, loadAllMarketData, runPaperPipeline, runScan, runScoring,
   runPaperUpdateDryRun, swingTvConfirm, testTvSymbol, updatePaperPlans,
 } from "./api";
+import { canApprovePaperRealUpdate } from "./paperRealUpdateApproval";
 
 const NAV_ITEMS = [
   { label: "Dashboard", icon: "◆" },
@@ -244,6 +245,45 @@ const paperUpdateProposalRows = (result) => {
   }
   return [];
 };
+const normalizeDryRunForApproval = (dryRunResult, progress, runs) => {
+  if (dryRunResult === null || typeof dryRunResult !== "object") return dryRunResult;
+  const runId = dryRunResult.run_id;
+  const runRows = Array.isArray(runs) ? runs : [];
+  const matchingProgress = runId && progress?.run_id === runId ? progress : null;
+  const matchingRun = runRows.find((run) => run?.run_id === runId) || null;
+  const fallback = matchingRun || matchingProgress || {};
+  return {
+    ...dryRunResult,
+    status: dryRunResult.status ?? fallback.status,
+    dry_run: dryRunResult.dry_run ?? fallback.dry_run,
+    mongo_writes_enabled: dryRunResult.mongo_writes_enabled ?? fallback.mongo_writes_enabled,
+    paper_only: dryRunResult.paper_only ?? fallback.paper_only,
+    live_trading: dryRunResult.live_trading ?? fallback.live_trading,
+    broker_orders: dryRunResult.broker_orders ?? fallback.broker_orders,
+    errors_count: dryRunResult.errors_count ?? fallback.errors_count,
+    blocked: dryRunResult.blocked ?? fallback.blocked,
+    proposed_write_count: dryRunResult.proposed_write_count ?? fallback.proposed_write_count,
+    max_trades: dryRunResult.max_trades ?? fallback.max_trades,
+    max_writes: dryRunResult.max_writes ?? fallback.max_writes,
+    finished_at: dryRunResult.finished_at ?? fallback.finished_at,
+  };
+};
+const paperUpdateChangedTradeIds = (result) => {
+  if (Array.isArray(result?.changed_trade_ids)) return result.changed_trade_ids;
+  if (Array.isArray(result?.details?.changed_trade_ids)) return result.details.changed_trade_ids;
+  return [];
+};
+const paperUpdateApprovalRejectionReason = (result) => (
+  result?.block_reason
+  || result?.rejection_code
+  || result?.code
+  || result?.details?.block_reason
+  || result?.details?.rejection_code
+  || result?.details?.reason
+  || result?.error
+  || result?.message
+  || "-"
+);
 function PaperUpdateDryRunWarnings({ result }) {
   if (!result) return null;
   const warnings = [];
@@ -302,11 +342,121 @@ function PaperUpdateDryRunResult({ result }) {
     </tbody></table></div>
   </div>;
 }
-function PaperUpdateSafety({ progress, schedulerStatus, lockStatus, dryRunResult, onRunDryRun, dryRunLoading, actionDisabled }) {
+function PaperUpdateApprovalResult({ result, error }) {
+  if (!result && !error) return null;
+  const rows = paperUpdateProposalRows(result);
+  const changedTradeIds = paperUpdateChangedTradeIds(result);
+  const rejectionReason = paperUpdateApprovalRejectionReason(result);
+  const summaryItems = [
+    ["approved_dry_run_id", result?.approved_dry_run_id],
+    ["real_run_id", result?.real_run_id ?? result?.run_id],
+    ["updated_count", result?.updated_count],
+    ["successful_updates_count", result?.successful_updates_count],
+    ["errors_count", result?.errors_count],
+    ["blocked", boolLabel(result?.blocked)],
+    ["block_reason / rejection code", rejectionReason],
+    ["paper_only", boolLabel(result?.paper_only)],
+    ["live_trading", boolLabel(result?.live_trading)],
+    ["broker_orders", boolLabel(result?.broker_orders)],
+  ];
+  const columns = ["trade_id", "symbol", "updated", "write_attempted", "status", "outcome_status", "applied_update", "error"];
+  return <div className="paperUpdateResultPanel">
+    <h3>Latest Approval Result</h3>
+    {error && <div className="safetyWarningList"><div>{error}</div></div>}
+    {result?.blocked && <div className="safetyWarningList"><div>Approval rejected: {rejectionReason}. Run a fresh dry-run before trying approval again.</div></div>}
+    {result && <div className="safetyGrid">
+      {summaryItems.map(([label, value]) => <SafetyMetric key={label} label={label} value={value ?? "-"} tone={label.includes("live") || label.includes("broker") ? boolTone(value === "true", true) : result?.blocked ? "yellow" : "gray"} />)}
+    </div>}
+    {result && <div className="approvalChangedIds">
+      <span>changed trade IDs</span>
+      <strong>{changedTradeIds.length ? changedTradeIds.join(", ") : "-"}</strong>
+    </div>}
+    {result && <div className="tableShell results-table-wrap"><table><thead><tr>{columns.map((column) => <th key={column}>{column}</th>)}</tr></thead><tbody>
+      {rows.length ? rows.map((row, index) => {
+        const values = {
+          trade_id: row?.trade_id ?? row?.id ?? "-",
+          symbol: row?.symbol || row?.tradingview_symbol || row?.canonical_symbol || "-",
+          updated: boolLabel(row?.updated),
+          write_attempted: boolLabel(row?.write_attempted),
+          status: row?.status ?? row?.applied_update?.status ?? row?.proposed_new_status ?? row?.proposed_status,
+          outcome_status: row?.outcome_status ?? row?.applied_update?.outcome_status ?? row?.proposed_new_outcome_status ?? row?.proposed_outcome_status,
+          applied_update: row?.applied_update ?? row?.proposed_update,
+          error: row?.error || row?.error_message || row?.reason || row?.proposed_reason,
+        };
+        return <tr key={`${values.trade_id}-${values.symbol}-${index}`}>{columns.map((column) => (
+          <td key={column} className={column === "applied_update" || column === "error" ? "wideText" : ""}>{fmt(values[column])}</td>
+        ))}</tr>;
+      }) : <tr><td colSpan={columns.length}>No per-trade approval results returned.</td></tr>}
+    </tbody></table></div>}
+  </div>;
+}
+function PaperUpdateApprovalPanel({
+  approvalDryRun,
+  lockStatus,
+  schedulerStatus,
+  confirmationText,
+  onConfirmationTextChange,
+  onApprove,
+  approvalLoading,
+  approvalResult,
+  approvalError,
+  actionDisabled,
+}) {
+  const gate = useMemo(() => canApprovePaperRealUpdate({
+    latestDryRun: approvalDryRun,
+    lockStatus,
+    schedulerStatus,
+  }), [approvalDryRun, lockStatus, schedulerStatus]);
+  const confirmationMatches = confirmationText === PAPER_UPDATE_APPROVAL_CONFIRMATION_TEXT;
+  const canApprove = gate.allowed && confirmationMatches;
+  const handleConfirmationKeyDown = (event) => {
+    if (event.key === "Enter") event.preventDefault();
+  };
+  return <div className="approvalPanel">
+    <div className="approvalHeader">
+      <div><span>manual bound approval</span><h3>Approve One Paper Update</h3></div>
+      <Badge tone={gate.allowed ? "green" : "yellow"}>{gate.allowed ? "gate passed" : "gate blocked"}</Badge>
+    </div>
+    <p className="muted">This button can only call the backend approval binding for the latest approved dry-run ID. It does not call unbound real update paths.</p>
+    {gate.reasons.length ? <div className="safetyWarningList">{gate.reasons.map((reason) => <div key={reason}>{reason}</div>)}</div> : <div className="safeNotice">Approval gate passed. Exact typed confirmation is still required.</div>}
+    <label className="approvalConfirmLabel">
+      <span>Type this exact confirmation before approval:</span>
+      <code>{PAPER_UPDATE_APPROVAL_CONFIRMATION_TEXT}</code>
+      <textarea
+        rows={2}
+        value={confirmationText}
+        onChange={(event) => onConfirmationTextChange(event.target.value)}
+        onKeyDown={handleConfirmationKeyDown}
+        placeholder={PAPER_UPDATE_APPROVAL_CONFIRMATION_TEXT}
+        spellCheck="false"
+      />
+    </label>
+    {!confirmationMatches && <p className="approvalHint">Approval stays disabled until the confirmation text matches exactly. Pressing Enter in this box is ignored; approval requires a click.</p>}
+    <ActionButton onClick={onApprove} disabled={actionDisabled || approvalLoading || !canApprove}>Approve One Paper Update</ActionButton>
+    <PaperUpdateApprovalResult result={approvalResult} error={approvalError} />
+  </div>;
+}
+function PaperUpdateSafety({
+  progress,
+  schedulerStatus,
+  lockStatus,
+  dryRunResult,
+  updateRuns,
+  onRunDryRun,
+  dryRunLoading,
+  onApproveDryRun,
+  approvalLoading,
+  approvalText,
+  onApprovalTextChange,
+  approvalResult,
+  approvalError,
+  actionDisabled,
+}) {
   const lock = lockStatus || schedulerStatus?.lock || {};
   const schedulerEnabled = schedulerStatus?.enabled;
   const schedulerRunning = schedulerStatus?.scheduler_running;
   const autoEnabled = schedulerStatus?.automatic_updates_enabled;
+  const approvalDryRun = normalizeDryRunForApproval(dryRunResult, progress, updateRuns);
   return <Card title="Paper Update Safety / Automation Status" eyebrow="read-only">
     <div className="safetyActions">
       <ActionButton onClick={onRunDryRun} disabled={actionDisabled || dryRunLoading}>{dryRunLoading ? "Running Paper Update Dry-Run..." : "Run Paper Update Dry-Run"}</ActionButton>
@@ -334,6 +484,18 @@ function PaperUpdateSafety({ progress, schedulerStatus, lockStatus, dryRunResult
       <SafetyMetric label="broker_orders" value={boolLabel(schedulerStatus?.broker_orders ?? progress?.broker_orders)} tone={boolTone(schedulerStatus?.broker_orders ?? progress?.broker_orders, true)} />
     </div>
     <PaperUpdateDryRunResult result={dryRunResult} />
+    <PaperUpdateApprovalPanel
+      approvalDryRun={approvalDryRun}
+      lockStatus={lockStatus}
+      schedulerStatus={schedulerStatus}
+      confirmationText={approvalText}
+      onConfirmationTextChange={onApprovalTextChange}
+      onApprove={onApproveDryRun}
+      approvalLoading={approvalLoading}
+      approvalResult={approvalResult}
+      approvalError={approvalError}
+      actionDisabled={actionDisabled}
+    />
   </Card>;
 }
 function PaperUpdateRunHistory({ runs = [] }) {
@@ -351,7 +513,29 @@ function PaperUpdateRunHistory({ runs = [] }) {
   </Card>;
 }
 
-function Dashboard({ summary, scoreSummary, swingSummary, momentumSummary, paperUpdateProgress, paperUpdateRuns, paperUpdateLock, paperUpdateScheduler, paperUpdateDryRunResult, onSummary, onDryRun, onSaveRun, onPaperUpdateDryRun, paperUpdateDryRunLoading, loading }) {
+function Dashboard({
+  summary,
+  scoreSummary,
+  swingSummary,
+  momentumSummary,
+  paperUpdateProgress,
+  paperUpdateRuns,
+  paperUpdateLock,
+  paperUpdateScheduler,
+  paperUpdateDryRunResult,
+  paperUpdateApprovalText,
+  paperUpdateApprovalResult,
+  paperUpdateApprovalError,
+  onSummary,
+  onDryRun,
+  onSaveRun,
+  onPaperUpdateDryRun,
+  onPaperUpdateApprove,
+  onPaperUpdateApprovalTextChange,
+  paperUpdateDryRunLoading,
+  paperUpdateApprovalLoading,
+  loading,
+}) {
   return <div className="pageStack">
     <section className="heroCard">
       <div><span>Paper control room</span><h1>Indian Stock Trading Assistant</h1><p>Swing and momentum workflows powered by TradingView candles. Paper records only.</p></div>
@@ -371,7 +555,22 @@ function Dashboard({ summary, scoreSummary, swingSummary, momentumSummary, paper
       <StatCard label="Swing Candidates" value={swingSummary?.swing_candidates_count ?? scoreSummary?.swing_candidates_count ?? "--"} tone="yellow" />
       <StatCard label="Momentum Candidates" value={momentumSummary?.momentum_candidates_count ?? scoreSummary?.momentum_candidates_count ?? "--"} />
     </div>
-    <PaperUpdateSafety progress={paperUpdateProgress} schedulerStatus={paperUpdateScheduler} lockStatus={paperUpdateLock} dryRunResult={paperUpdateDryRunResult} onRunDryRun={onPaperUpdateDryRun} dryRunLoading={paperUpdateDryRunLoading} actionDisabled={loading} />
+    <PaperUpdateSafety
+      progress={paperUpdateProgress}
+      schedulerStatus={paperUpdateScheduler}
+      lockStatus={paperUpdateLock}
+      dryRunResult={paperUpdateDryRunResult}
+      updateRuns={paperUpdateRuns}
+      onRunDryRun={onPaperUpdateDryRun}
+      dryRunLoading={paperUpdateDryRunLoading}
+      onApproveDryRun={onPaperUpdateApprove}
+      approvalLoading={paperUpdateApprovalLoading}
+      approvalText={paperUpdateApprovalText}
+      onApprovalTextChange={onPaperUpdateApprovalTextChange}
+      approvalResult={paperUpdateApprovalResult}
+      approvalError={paperUpdateApprovalError}
+      actionDisabled={loading}
+    />
     <PaperUpdateRunHistory runs={paperUpdateRuns} />
     <div className="threeGrid">
       <Card title="Recent Activity" eyebrow="paper log"><div className="activityList"><p>Summary ready</p><p>TradingView candles available</p><p>Pipeline dry-run enabled</p></div></Card>
@@ -399,6 +598,9 @@ const PAPER_UPDATE_DRY_RUN_CONFIRM = [
   "It will not place broker/live orders.",
   "It will not run scan, scoring, market loading, paper pipeline generation, or TradingView confirmation endpoints.",
 ].join("\n");
+const PAPER_UPDATE_APPROVAL_CONFIRMATION_TEXT = "I understand this will write to paper_trades only and will not place broker orders";
+const PAPER_UPDATE_APPROVAL_MAX_TRADES = 6;
+const PAPER_UPDATE_APPROVAL_MAX_WRITES = 1;
 
 function formatActionError(err, actionName = "request") {
   const status = err?.status ? `HTTP ${err.status}` : "HTTP status unavailable";
@@ -1442,6 +1644,9 @@ export default function App() {
   const [paperUpdateLock, setPaperUpdateLock] = useState(null);
   const [paperUpdateScheduler, setPaperUpdateScheduler] = useState(null);
   const [paperUpdateDryRunResult, setPaperUpdateDryRunResult] = useState(null);
+  const [paperUpdateApprovalText, setPaperUpdateApprovalText] = useState("");
+  const [paperUpdateApprovalResult, setPaperUpdateApprovalResult] = useState(null);
+  const [paperUpdateApprovalError, setPaperUpdateApprovalError] = useState("");
   const [signals, setSignals] = useState([]);
   const [plans, setPlans] = useState([]);
   const [activeTrades, setActiveTrades] = useState([]);
@@ -1512,6 +1717,29 @@ export default function App() {
     setPaperUpdateLock(lock);
     setPaperUpdateScheduler(scheduler);
     return { progress, runs: runRows, lock, scheduler };
+  };
+  const refreshPaperDashboardStatus = async () => {
+    const [safetyResult, summaryResult, equityResult] = await Promise.allSettled([
+      refreshPaperUpdateSafety(),
+      getPaperSummary(),
+      getPaperEquity(),
+    ]);
+    if (summaryResult.status === "fulfilled") {
+      setSummary(summaryResult.value);
+    } else {
+      console.error("paper summary refresh failed", summaryResult.reason);
+    }
+    if (safetyResult.status === "rejected") {
+      console.error("paper update safety refresh failed", safetyResult.reason);
+    }
+    if (equityResult.status === "rejected") {
+      console.error("paper equity refresh failed", equityResult.reason);
+    }
+    return {
+      safety: safetyResult.status === "fulfilled" ? safetyResult.value : null,
+      summary: summaryResult.status === "fulfilled" ? summaryResult.value : null,
+      paper_equity: equityResult.status === "fulfilled" ? equityResult.value : null,
+    };
   };
 
   useEffect(() => {
@@ -1620,14 +1848,67 @@ export default function App() {
         return null;
       }
       return act("paper update dry-run", async () => {
+        setPaperUpdateApprovalText("");
+        setPaperUpdateApprovalResult(null);
+        setPaperUpdateApprovalError("");
         const result = await runPaperUpdateDryRun({ maxTrades: 6, maxWrites: 1 });
-        setPaperUpdateDryRunResult(result);
-        const [safety, summaryData, equityData] = await Promise.all([
-          refreshPaperUpdateSafety(),
-          getPaperSummary().then((data) => { setSummary(data); return data; }),
-          getPaperEquity(),
-        ]);
-        return { dry_run_result: result, refreshed: { safety, summary: summaryData, paper_equity: equityData } };
+        const refreshed = await refreshPaperDashboardStatus();
+        const normalizedResult = normalizeDryRunForApproval(
+          result,
+          refreshed.safety?.progress,
+          refreshed.safety?.runs,
+        );
+        setPaperUpdateDryRunResult(normalizedResult);
+        return { dry_run_result: normalizedResult, refreshed };
+      });
+    },
+    paperUpdateApprove: () => {
+      const approvalDryRun = normalizeDryRunForApproval(
+        paperUpdateDryRunResult,
+        paperUpdateProgress,
+        paperUpdateRuns,
+      );
+      const gate = canApprovePaperRealUpdate({
+        latestDryRun: approvalDryRun,
+        lockStatus: paperUpdateLock,
+        schedulerStatus: paperUpdateScheduler,
+      });
+      if (!gate.allowed) {
+        const reasonText = gate.reasons.length ? gate.reasons.join("\n") : "Unknown gate failure.";
+        setPaperUpdateApprovalError(`Approval gate failed. Backend was not called.\n${reasonText}`);
+        setNotice("Paper approval blocked by the local gate. Run a fresh dry-run when ready.");
+        return null;
+      }
+      if (paperUpdateApprovalText !== PAPER_UPDATE_APPROVAL_CONFIRMATION_TEXT) {
+        setPaperUpdateApprovalError("Exact confirmation text is required. Backend was not called.");
+        setNotice("Paper approval blocked until the exact confirmation text is typed.");
+        return null;
+      }
+      return act("paper update approval", async () => {
+        let response = null;
+        try {
+          response = await approvePaperUpdateFromDryRun({
+            approvedDryRunId: approvalDryRun.run_id,
+            confirmationText: PAPER_UPDATE_APPROVAL_CONFIRMATION_TEXT,
+            maxTrades: PAPER_UPDATE_APPROVAL_MAX_TRADES,
+            maxWrites: PAPER_UPDATE_APPROVAL_MAX_WRITES,
+          });
+          setPaperUpdateApprovalResult(response);
+          if (response?.blocked) {
+            setPaperUpdateApprovalError(`Approval rejected: ${paperUpdateApprovalRejectionReason(response)}. Run a fresh dry-run before trying approval again.`);
+          } else {
+            setPaperUpdateApprovalError("");
+          }
+          return { approval_result: response };
+        } catch (err) {
+          const rejectionReason = paperUpdateApprovalRejectionReason(err?.responseBody);
+          setPaperUpdateApprovalError(`Approval request failed${rejectionReason !== "-" ? `: ${rejectionReason}` : ""}. Run a fresh dry-run before trying approval again.`);
+          throw err;
+        } finally {
+          setPaperUpdateDryRunResult(null);
+          setPaperUpdateApprovalText("");
+          await refreshPaperDashboardStatus();
+        }
       });
     },
     dryRun: () => act("pipeline dry run", () => runPaperPipeline({ limit: 1, timeframe: "1D", dryRun: true, strategy: "swing" })),
@@ -1873,8 +2154,8 @@ export default function App() {
     if (activePage === "Stock Detail") return <StockDetailPage search={search} stockMarketData={stockMarketData} stockSwingPrecheck={stockSwingPrecheck} stockMomentumPrecheck={stockMomentumPrecheck} stockSwingTvResult={stockSwingTvResult} stockMomentumTvResult={stockMomentumTvResult} stockSavedSwingResult={stockSavedSwingResult} stockSavedMomentumResult={stockSavedMomentumResult} latestSwingTvRows={latestSwingTvRows} latestMomentumTvRows={latestMomentumTvRows} stockSwingTimeframes={stockSwingTimeframes} setStockSwingTimeframes={setStockSwingTimeframes} stockMomentumTimeframes={stockMomentumTimeframes} setStockMomentumTimeframes={setStockMomentumTimeframes} onLoadStockMarket={handlers.stockMarketData} onSwingPrecheck={handlers.stockSwingPrecheck} onMomentumPrecheck={handlers.stockMomentumPrecheck} onStockSwingTvConfirm={handlers.stockSwingTvConfirm} onStockMomentumTvConfirm={handlers.stockMomentumTvConfirm} loading={!!loading} />;
     if (activePage === "Paper Trades") return <PaperTrades signals={signals} plans={plans} activeTrades={activeTrades} allTrades={allTrades} onSignals={handlers.paperSignals} onPlans={handlers.paperPlans} onActive={handlers.active} onAll={handlers.all} onUpdate={handlers.update} loading={!!loading} />;
     if (activePage === "Settings") return <Settings settings={settings} health={health} />;
-    return <Dashboard summary={summary} scoreSummary={scoreSummary} swingSummary={swingSummary} momentumSummary={momentumSummary} paperUpdateProgress={paperUpdateProgress} paperUpdateRuns={paperUpdateRuns} paperUpdateLock={paperUpdateLock} paperUpdateScheduler={paperUpdateScheduler} paperUpdateDryRunResult={paperUpdateDryRunResult} onSummary={handlers.loadSummary} onDryRun={handlers.dryRun} onSaveRun={handlers.saveRun} onPaperUpdateDryRun={handlers.paperUpdateDryRun} paperUpdateDryRunLoading={loading === "paper update dry-run"} loading={!!loading} />;
-  }, [activePage, settings, health, summary, scoreSummary, swingSummary, momentumSummary, paperUpdateProgress, paperUpdateRuns, paperUpdateLock, paperUpdateScheduler, paperUpdateDryRunResult, swingRows, latestSwingTvRows, swingTvRowsLoaded, swingBatchResults, swingBatchProgress, swingBatchError, swingBatchStopRequested, swingBatchStopMessage, swingCandidatesStale, momentumRows, momentumCandidatesStale, latestMomentumTvRows, momentumTvRowsLoaded, momentumBatchResults, momentumBatchProgress, momentumBatchError, momentumBatchStopRequested, momentumBatchStopMessage, stockMarketData, stockSwingPrecheck, stockMomentumPrecheck, stockSwingTvResult, stockMomentumTvResult, stockSavedSwingResult, stockSavedMomentumResult, stockSwingTimeframes, stockMomentumTimeframes, search, tv, tvResult, marketLoadResult, marketProgress, scoreRunResult, marketDataNeedsScore, signals, plans, activeTrades, allTrades, loading, lastResponse]);
+    return <Dashboard summary={summary} scoreSummary={scoreSummary} swingSummary={swingSummary} momentumSummary={momentumSummary} paperUpdateProgress={paperUpdateProgress} paperUpdateRuns={paperUpdateRuns} paperUpdateLock={paperUpdateLock} paperUpdateScheduler={paperUpdateScheduler} paperUpdateDryRunResult={paperUpdateDryRunResult} paperUpdateApprovalText={paperUpdateApprovalText} paperUpdateApprovalResult={paperUpdateApprovalResult} paperUpdateApprovalError={paperUpdateApprovalError} onSummary={handlers.loadSummary} onDryRun={handlers.dryRun} onSaveRun={handlers.saveRun} onPaperUpdateDryRun={handlers.paperUpdateDryRun} onPaperUpdateApprove={handlers.paperUpdateApprove} onPaperUpdateApprovalTextChange={setPaperUpdateApprovalText} paperUpdateDryRunLoading={loading === "paper update dry-run"} paperUpdateApprovalLoading={loading === "paper update approval"} loading={!!loading} />;
+  }, [activePage, settings, health, summary, scoreSummary, swingSummary, momentumSummary, paperUpdateProgress, paperUpdateRuns, paperUpdateLock, paperUpdateScheduler, paperUpdateDryRunResult, paperUpdateApprovalText, paperUpdateApprovalResult, paperUpdateApprovalError, swingRows, latestSwingTvRows, swingTvRowsLoaded, swingBatchResults, swingBatchProgress, swingBatchError, swingBatchStopRequested, swingBatchStopMessage, swingCandidatesStale, momentumRows, momentumCandidatesStale, latestMomentumTvRows, momentumTvRowsLoaded, momentumBatchResults, momentumBatchProgress, momentumBatchError, momentumBatchStopRequested, momentumBatchStopMessage, stockMarketData, stockSwingPrecheck, stockMomentumPrecheck, stockSwingTvResult, stockMomentumTvResult, stockSavedSwingResult, stockSavedMomentumResult, stockSwingTimeframes, stockMomentumTimeframes, search, tv, tvResult, marketLoadResult, marketProgress, scoreRunResult, marketDataNeedsScore, signals, plans, activeTrades, allTrades, loading, lastResponse]);
 
   return <div className="appShell">
     <aside className="sidebar"><div className="brand"><div className="brandMark">TA</div><div><h1>Trading Agent</h1><p>Paper Terminal</p></div></div><div className="navSeparator">Workspace</div><nav>{NAV_WITH_STOCK_DETAIL.map((item) => <button className={activePage === item.label ? "navItem active" : "navItem"} key={item.label} onClick={() => setActivePage(item.label)}><span>{item.icon}</span>{item.label}</button>)}</nav><div className="sidebarFooter"><Badge tone="yellow">PAPER ONLY</Badge><p>No live trading. No broker orders.</p></div></aside>

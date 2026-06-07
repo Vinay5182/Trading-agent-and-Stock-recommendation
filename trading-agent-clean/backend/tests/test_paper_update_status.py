@@ -68,6 +68,19 @@ def test_waiting_trade_entry_triggered_becomes_active() -> None:
     assert update["paper_pnl"] == pytest.approx(10.0)
 
 
+def test_waiting_trade_legacy_planned_alias_is_noop() -> None:
+    plan = make_plan("PLANNED")
+    plan["entry_triggered"] = False
+
+    update = paper.update_plan_status(plan, make_candle(high=99.0, low=95.0, close=98.0))
+
+    assert update == {}
+    assert paper.proposed_update_reason(plan, update) == "WAITING_FOR_ENTRY"
+    assert update.get("status", plan["status"]) == "PLANNED"
+    assert update.get("paper_pnl", plan["paper_pnl"]) == 0
+    assert bool(update) is False
+
+
 def test_active_trade_stop_loss_hit() -> None:
     plan = make_plan("ACTIVE")
 
@@ -92,6 +105,19 @@ def test_active_trade_target_hit() -> None:
     assert update["exit_price"] is None
     assert update["paper_pnl"] == pytest.approx(180.0)
     assert update["paper_pnl_percent"] == pytest.approx(18.0)
+
+
+def test_target_1_hit_continues_open_without_stop_or_next_target() -> None:
+    plan = make_plan("TARGET_1_HIT")
+
+    update = paper.update_plan_status(plan, make_candle(high=125.0, low=95.0, close=124.0))
+
+    assert update.get("status", plan["status"]) == "TARGET_1_HIT"
+    assert update.get("outcome_status", plan["outcome_status"]) == "TARGET_1_HIT"
+    assert update["exit_reason"] is None
+    assert update["exit_price"] is None
+    assert update["paper_pnl"] == pytest.approx(240.0)
+    assert update["paper_pnl_percent"] == pytest.approx(24.0)
 
 
 class FakeCursor:
@@ -136,6 +162,8 @@ class FakePaperTrades:
 
 
 class FakeTradingViewClient:
+    candle = make_candle(high=100.0, low=95.0, close=101.0)
+
     def connect_to_debug_port(self) -> bool:
         return True
 
@@ -144,7 +172,7 @@ class FakeTradingViewClient:
 
     def fetch_candles(self, _timeframe: str, min_candles: int = 1) -> list[dict]:
         assert min_candles == 1
-        return [make_candle(high=100.0, low=95.0, close=101.0)]
+        return [self.candle]
 
 
 def test_dry_run_proposes_transition_without_mongo_write(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -162,5 +190,59 @@ def test_dry_run_proposes_transition_without_mongo_write(monkeypatch: pytest.Mon
     assert response["updated_count"] == 0
     assert response["results"][0]["proposed_new_status"] == "ACTIVE"
     assert response["results"][0]["would_write"] is True
+    assert collection.update_calls == []
+    assert collection.delete_calls == []
+
+
+@pytest.mark.parametrize("status", ["STOPPED", "STOP_HIT", "TARGET_HIT", "CLOSED", "EXPIRED"])
+def test_terminal_status_is_skipped_without_reprocessing(monkeypatch: pytest.MonkeyPatch, status: str) -> None:
+    plan = make_plan(status)
+    plan["paper_pnl"] = 42.0
+    collection = FakePaperTrades([plan])
+    fake_db = SimpleNamespace(paper_trades=collection)
+
+    class FailIfCalledTradingViewClient:
+        def __init__(self) -> None:
+            raise AssertionError("Terminal trades must be skipped before TradingView access")
+
+    monkeypatch.setattr(paper, "get_database", lambda: fake_db)
+    monkeypatch.setattr(paper, "TradingViewClient", FailIfCalledTradingViewClient)
+
+    response = asyncio.run(paper.run_paper_trade_update(1, "1D", True, "test-terminal-skip"))
+
+    result = response["results"][0]
+    assert response["updated_count"] == 0
+    assert response["would_update_count"] == 0
+    assert result["proposed_new_status"] == status
+    assert result["proposed_new_outcome_status"] == status
+    assert result["proposed_pnl"] == 42.0
+    assert result["proposed_reason"] == "TERMINAL_STATUS"
+    assert result["would_write"] is False
+    assert collection.update_calls == []
+    assert collection.delete_calls == []
+
+
+def test_active_stop_dry_run_proposes_transition_without_mongo_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    collection = FakePaperTrades([make_plan("ACTIVE")])
+    fake_db = SimpleNamespace(paper_trades=collection)
+
+    class StopHitTradingViewClient(FakeTradingViewClient):
+        candle = make_candle(high=105.0, low=90.0, close=95.0)
+
+    monkeypatch.setattr(paper, "get_database", lambda: fake_db)
+    monkeypatch.setattr(paper, "TradingViewClient", StopHitTradingViewClient)
+
+    response = asyncio.run(paper.run_paper_trade_update(1, "1D", True, "test-active-stop-dry-run"))
+
+    result = response["results"][0]
+    assert response["dry_run"] is True
+    assert response["mongo_writes_enabled"] is False
+    assert response["would_update_count"] == 1
+    assert response["updated_count"] == 0
+    assert result["proposed_new_status"] == "STOPPED"
+    assert result["proposed_new_outcome_status"] == "STOPPED"
+    assert result["proposed_pnl"] == pytest.approx(-100.0)
+    assert result["proposed_reason"] == "STOP_LOSS_HIT"
+    assert result["would_write"] is True
     assert collection.update_calls == []
     assert collection.delete_calls == []

@@ -8,6 +8,7 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException, Query
 from pymongo.errors import DuplicateKeyError
 
+from config import settings
 from database import get_database
 from routes.signals import build_tv_confirmed_signals
 from tv_client import TradingViewClient
@@ -301,6 +302,30 @@ async def get_paper_update_run_from_db(db, run_id: str) -> dict | None:
         return None
     doc = await collection.find_one({"run_id": run_id}, {"_id": 0})
     return serialize_run_doc(doc)
+
+
+async def get_paper_update_scheduler_status(db) -> dict:
+    latest_run = await latest_paper_update_run(db)
+    lock_status = await get_paper_update_lock_status(db)
+    enabled = settings.PAPER_UPDATE_SCHEDULER_ENABLED
+    return {
+        "enabled": enabled,
+        "mode": settings.PAPER_UPDATE_SCHEDULER_MODE,
+        "interval_minutes": settings.PAPER_UPDATE_SCHEDULER_INTERVAL_MINUTES,
+        "after_market_close_only": settings.PAPER_UPDATE_SCHEDULER_AFTER_MARKET_CLOSE_ONLY,
+        "dry_run_first": settings.PAPER_UPDATE_SCHEDULER_DRY_RUN_FIRST,
+        "max_trades": settings.PAPER_UPDATE_SCHEDULER_MAX_TRADES,
+        "max_writes": settings.PAPER_UPDATE_SCHEDULER_MAX_WRITES,
+        "next_run_at": None,
+        "last_run_id": latest_run.get("run_id") if latest_run else None,
+        "last_run_status": latest_run.get("status") if latest_run else None,
+        "lock": lock_status,
+        "scheduler_running": False,
+        "automatic_updates_enabled": False,
+        "paper_only": True,
+        "live_trading": False,
+        "broker_orders": False,
+    }
 
 
 def normalize_status(value) -> str:
@@ -1060,6 +1085,11 @@ async def get_paper_update_run(run_id: str) -> dict:
 @router.get("/update-lock")
 async def get_paper_update_lock() -> dict:
     return await get_paper_update_lock_status(get_database())
+
+
+@router.get("/update-scheduler/status")
+async def get_paper_update_scheduler_status_endpoint() -> dict:
+    return await get_paper_update_scheduler_status(get_database())
 
 
 @router.get("/trades")

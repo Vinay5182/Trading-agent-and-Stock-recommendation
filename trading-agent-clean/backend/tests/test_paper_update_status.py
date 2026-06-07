@@ -81,6 +81,19 @@ def test_waiting_trade_legacy_planned_alias_is_noop() -> None:
     assert bool(update) is False
 
 
+def test_waiting_trade_legacy_planned_alias_entry_triggered_becomes_active() -> None:
+    plan = make_plan("PLANNED")
+    plan["entry_triggered"] = False
+
+    update = paper.update_plan_status(plan, make_candle(high=100.0, low=95.0, close=101.0))
+
+    assert update["status"] == "ACTIVE"
+    assert update["outcome_status"] == "ACTIVE"
+    assert update["entry_triggered"] is True
+    assert update["exit_reason"] is None
+    assert update["paper_pnl"] == pytest.approx(10.0)
+
+
 def test_active_trade_stop_loss_hit() -> None:
     plan = make_plan("ACTIVE")
 
@@ -118,6 +131,32 @@ def test_target_1_hit_continues_open_without_stop_or_next_target() -> None:
     assert update["exit_price"] is None
     assert update["paper_pnl"] == pytest.approx(240.0)
     assert update["paper_pnl_percent"] == pytest.approx(24.0)
+
+
+def test_target_1_hit_reaches_target_2() -> None:
+    plan = make_plan("TARGET_1_HIT")
+
+    update = paper.update_plan_status(plan, make_candle(high=130.0, low=95.0, close=128.0))
+
+    assert update["status"] == "TARGET_2_HIT"
+    assert update["outcome_status"] == "TARGET_2_HIT"
+    assert update["exit_reason"] == "TARGET_2_HIT"
+    assert update["exit_price"] == 130.0
+    assert update["paper_pnl"] == pytest.approx(300.0)
+    assert update["paper_pnl_percent"] == pytest.approx(30.0)
+
+
+def test_target_1_hit_stops_after_target_1() -> None:
+    plan = make_plan("TARGET_1_HIT")
+
+    update = paper.update_plan_status(plan, make_candle(high=125.0, low=90.0, close=95.0))
+
+    assert update["status"] == "STOPPED_AFTER_T1"
+    assert update["outcome_status"] == "STOPPED_AFTER_T1"
+    assert update["exit_reason"] == "STOPPED_AFTER_T1"
+    assert update["exit_price"] == 90.0
+    assert update["paper_pnl"] == pytest.approx(-100.0)
+    assert update["paper_pnl_percent"] == pytest.approx(-10.0)
 
 
 class FakeCursor:
@@ -216,6 +255,33 @@ def test_terminal_status_is_skipped_without_reprocessing(monkeypatch: pytest.Mon
     assert result["proposed_new_status"] == status
     assert result["proposed_new_outcome_status"] == status
     assert result["proposed_pnl"] == 42.0
+    assert result["proposed_reason"] == "TERMINAL_STATUS"
+    assert result["would_write"] is False
+    assert collection.update_calls == []
+    assert collection.delete_calls == []
+
+
+def test_completed_target_2_status_is_skipped_without_reprocessing(monkeypatch: pytest.MonkeyPatch) -> None:
+    plan = make_plan("TARGET_2_HIT")
+    plan["paper_pnl"] = 300.0
+    collection = FakePaperTrades([plan])
+    fake_db = SimpleNamespace(paper_trades=collection)
+
+    class FailIfCalledTradingViewClient:
+        def __init__(self) -> None:
+            raise AssertionError("Completed target trades must be skipped before TradingView access")
+
+    monkeypatch.setattr(paper, "get_database", lambda: fake_db)
+    monkeypatch.setattr(paper, "TradingViewClient", FailIfCalledTradingViewClient)
+
+    response = asyncio.run(paper.run_paper_trade_update(1, "1D", True, "test-target-2-skip"))
+
+    result = response["results"][0]
+    assert response["updated_count"] == 0
+    assert response["would_update_count"] == 0
+    assert result["proposed_new_status"] == "TARGET_2_HIT"
+    assert result["proposed_new_outcome_status"] == "TARGET_2_HIT"
+    assert result["proposed_pnl"] == 300.0
     assert result["proposed_reason"] == "TERMINAL_STATUS"
     assert result["would_write"] is False
     assert collection.update_calls == []

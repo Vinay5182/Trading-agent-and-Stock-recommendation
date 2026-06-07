@@ -105,6 +105,8 @@ def proposed_update_reason(plan: dict, update: dict) -> str:
         return update["exit_reason"]
     current_status = normalize_status(plan.get("status"))
     proposed_status = normalize_status(update.get("status", plan.get("status")))
+    if current_status in WAITING_STATUSES and proposed_status in WAITING_STATUSES and not update:
+        return "WAITING_FOR_ENTRY"
     return f"STATUS_CHANGE_{current_status}_TO_{proposed_status}" if proposed_status != current_status else "NO_STATUS_CHANGE"
 
 
@@ -209,6 +211,9 @@ def update_plan_status(plan: dict, latest: dict) -> dict:
             new_status = "TARGET_2_HIT"
             exit_price = plan["target_2"]
             exit_reason = "TARGET_2_HIT"
+
+    if logic_status == "PLANNED" and new_status == logic_status:
+        return {}
 
     paper_pnl, paper_pnl_percent = calculate_pnl(plan, latest_close, exit_price)
     now = datetime.utcnow().isoformat()
@@ -397,7 +402,7 @@ async def run_paper_trade_update(limit: int, timeframe: str, dry_run: bool, mode
                 would_write = bool(update)
                 would_update_count += 1 if would_write else 0
                 modified = 0
-                if not dry_run:
+                if not dry_run and would_write:
                     try:
                         result = await db.paper_trades.update_one({"_id": plan["_id"]}, {"$set": update})
                         modified = result.modified_count
@@ -426,17 +431,17 @@ async def run_paper_trade_update(limit: int, timeframe: str, dry_run: bool, mode
                         "latest_candle_timestamp": candle_timestamp(candles[-1]),
                         "proposed_new_status": update.get("status", plan.get("status")),
                         "proposed_new_outcome_status": update.get("outcome_status", plan.get("outcome_status")),
-                        "proposed_pnl": update.get("paper_pnl"),
+                        "proposed_pnl": update.get("paper_pnl", plan.get("paper_pnl", 0)),
                         "proposed_reason": proposed_update_reason(plan, update),
                         "updated": modified > 0,
                         "would_write": would_write,
                         "dry_run": dry_run,
-                        "latest_close": update["latest_close"],
-                        "latest_high": update["latest_high"],
-                        "latest_low": update["latest_low"],
-                        "exit_reason": update["exit_reason"],
-                        "paper_pnl": update["paper_pnl"],
-                        "paper_pnl_percent": update["paper_pnl_percent"],
+                        "latest_close": update.get("latest_close", candles[-1].get("close")),
+                        "latest_high": update.get("latest_high", candles[-1].get("high")),
+                        "latest_low": update.get("latest_low", candles[-1].get("low")),
+                        "exit_reason": update.get("exit_reason"),
+                        "paper_pnl": update.get("paper_pnl", plan.get("paper_pnl", 0)),
+                        "paper_pnl_percent": update.get("paper_pnl_percent", plan.get("paper_pnl_percent", 0)),
                     }
                 )
             except Exception as exc:
@@ -924,7 +929,7 @@ async def update_pipeline_plans(
             continue
         update = update_plan_status(plan, candles[-1])
         modified = 0
-        if save:
+        if save and update:
             try:
                 result = await db.paper_trades.update_one({"_id": plan["_id"]}, {"$set": update})
                 modified = result.modified_count

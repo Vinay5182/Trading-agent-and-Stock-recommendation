@@ -11,9 +11,78 @@ from tv_confirmation import PAPER_PLAN_FIELDS, build_price_action_paper_plan_fro
 
 
 router = APIRouter()
-TRACKABLE_STATUSES = ["PLANNED", "ACTIVE", "TARGET_1_HIT"]
-OPEN_STATUSES = ["PLANNED", "ACTIVE", "TARGET_1_HIT"]
-CLOSED_STATUSES = ["TARGET_2_HIT", "STOPPED", "STOPPED_AFTER_T1"]
+WAITING_STATUSES = {"NOT_TRIGGERED", "PLANNED"}
+ACTIVE_STATUSES = {"ACTIVE", "TARGET_1_HIT"}
+TERMINAL_STATUSES = {
+    "CLOSED",
+    "EXPIRED",
+    "TARGET_HIT",
+    "TARGET_1_HIT_FINAL",
+    "TARGET_2_HIT",
+    "TARGET_3_HIT",
+    "T1_HIT",
+    "T2_HIT",
+    "T3_HIT",
+    "WON_T1",
+    "WON_T2",
+    "WON_T3",
+    "STOP_HIT",
+    "STOPPED",
+    "STOPPED_AFTER_T1",
+    "SL_HIT",
+    "LOST_SL",
+    "AMBIGUOUS",
+}
+TRACKABLE_STATUSES = sorted(WAITING_STATUSES | ACTIVE_STATUSES)
+OPEN_STATUSES = sorted(ACTIVE_STATUSES)
+NON_TERMINAL_STATUSES = sorted(WAITING_STATUSES | ACTIVE_STATUSES)
+CLOSED_STATUSES = sorted(TERMINAL_STATUSES)
+PAPER_UPDATE_PROGRESS = {
+    "running": False,
+    "mode": "idle",
+    "dry_run": True,
+    "processed": 0,
+    "updated_count": 0,
+    "would_update_count": 0,
+    "errors": [],
+    "started_at": None,
+    "finished_at": None,
+}
+
+
+def normalize_status(value) -> str:
+    return str(value or "").upper()
+
+
+def trade_statuses(trade: dict) -> set[str]:
+    return {
+        status
+        for status in (
+            normalize_status(trade.get("status")),
+            normalize_status(trade.get("outcome_status")),
+        )
+        if status
+    }
+
+
+def is_terminal_trade(trade: dict) -> bool:
+    return bool(trade_statuses(trade) & TERMINAL_STATUSES)
+
+
+def is_waiting_trade(trade: dict) -> bool:
+    statuses = trade_statuses(trade)
+    if statuses & (ACTIVE_STATUSES | TERMINAL_STATUSES):
+        return False
+    return bool(statuses & WAITING_STATUSES) or trade.get("entry_triggered") is False
+
+
+def is_open_trade(trade: dict) -> bool:
+    statuses = trade_statuses(trade)
+    return bool(statuses & ACTIVE_STATUSES) and not bool(statuses & TERMINAL_STATUSES)
+
+
+def tv_symbol_for_trade(trade: dict) -> str | None:
+    return trade.get("tradingview_symbol") or trade.get("symbol")
 
 
 def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: float, risk_percent: float) -> dict | None:
@@ -49,10 +118,13 @@ def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: fl
     now = datetime.utcnow().isoformat()
     return {
         "symbol": signal["symbol"],
+        "tradingview_symbol": signal.get("tradingview_symbol") or signal.get("symbol"),
         "timeframe": signal["timeframe"],
         "source_signal_type": signal.get("signal_type", "SWING_TV_CONFIRMED"),
         "paper_only": True,
-        "status": "PLANNED",
+        "status": "NOT_TRIGGERED",
+        "outcome_status": "NOT_TRIGGERED",
+        "entry_triggered": False,
         "entry_price": entry_price,
         "stop_loss": stop_loss,
         "target_1": target_1,
@@ -85,14 +157,15 @@ def update_plan_status(plan: dict, latest: dict) -> dict:
     latest_high = latest["high"]
     latest_low = latest["low"]
     latest_close = latest["close"]
-    status = plan["status"]
-    new_status = status
+    status = normalize_status(plan.get("status"))
+    logic_status = "PLANNED" if status == "NOT_TRIGGERED" else status
+    new_status = logic_status
     exit_price = None
     exit_reason = None
 
-    if status == "PLANNED" and latest_high >= plan["entry_price"]:
+    if logic_status == "PLANNED" and latest_high >= plan["entry_price"]:
         new_status = "ACTIVE"
-    elif status == "ACTIVE":
+    elif logic_status == "ACTIVE":
         if latest_low <= plan["stop_loss"]:
             new_status = "STOPPED"
             exit_price = plan["stop_loss"]
@@ -104,7 +177,7 @@ def update_plan_status(plan: dict, latest: dict) -> dict:
         elif latest_high >= plan["target_1"]:
             new_status = "TARGET_1_HIT"
             exit_reason = "TARGET_1_HIT"
-    elif status == "TARGET_1_HIT":
+    elif logic_status == "TARGET_1_HIT":
         if latest_low <= plan["stop_loss"]:
             new_status = "STOPPED_AFTER_T1"
             exit_price = plan["stop_loss"]
@@ -127,9 +200,15 @@ def update_plan_status(plan: dict, latest: dict) -> dict:
         "paper_pnl": paper_pnl,
         "paper_pnl_percent": paper_pnl_percent,
     }
-    if new_status != status:
+    if new_status != logic_status:
         update["status"] = new_status
+        update["outcome_status"] = new_status
         update["status_updated_at"] = now
+        if new_status == "ACTIVE":
+            update["entry_triggered"] = True
+            update["entry_triggered_at"] = now
+        if new_status == "TARGET_1_HIT":
+            update["t1_hit"] = True
     return update
 
 
@@ -221,12 +300,22 @@ async def get_paper_plans(
     return {"count": len(plans), "plans": plans}
 
 
-@router.post("/update-plans")
-async def update_paper_plans(
-    limit: int = Query(default=10, ge=1, le=100),
-    timeframe: str = Query(default="1D"),
-) -> dict:
+async def run_paper_trade_update(limit: int, timeframe: str, dry_run: bool, mode: str) -> dict:
     db = get_database()
+    started = datetime.utcnow()
+    PAPER_UPDATE_PROGRESS.update(
+        {
+            "running": True,
+            "mode": mode,
+            "dry_run": dry_run,
+            "processed": 0,
+            "updated_count": 0,
+            "would_update_count": 0,
+            "errors": [],
+            "started_at": started.isoformat(),
+            "finished_at": None,
+        }
+    )
     cursor = db.paper_trades.find(
         {"paper_only": True, "status": {"$in": TRACKABLE_STATUSES}, "timeframe": timeframe},
     ).sort("updated_at", -1).limit(limit)
@@ -234,48 +323,159 @@ async def update_paper_plans(
     results = []
     processed = 0
     updated_count = 0
-    async for plan in cursor:
-        processed += 1
-        client = TradingViewClient()
-        client.connect_to_debug_port()
-        client.open_symbol(plan["symbol"])
-        candles = client.fetch_candles(timeframe, min_candles=1)
-        if not candles:
-            results.append({"symbol": plan["symbol"], "status": plan["status"], "updated": False, "reason": "NO_CANDLES"})
-            continue
-        update = update_plan_status(plan, candles[-1])
-        try:
-            result = await db.paper_trades.update_one({"_id": plan["_id"]}, {"$set": update})
-            modified = result.modified_count
-        except DuplicateKeyError:
-            merged_status = update.get("status", plan["status"])
-            identity = {
-                "symbol": plan["symbol"],
-                "timeframe": plan["timeframe"],
-                "source_signal_type": plan["source_signal_type"],
-                "paper_only": plan["paper_only"],
-                "status": merged_status,
-            }
-            await db.paper_trades.update_one(identity, {"$set": update})
-            await db.paper_trades.delete_one({"_id": plan["_id"]})
-            modified = 1
-        updated_count += modified
-        results.append(
+    would_update_count = 0
+    errors = []
+    try:
+        async for plan in cursor:
+            symbol = plan.get("symbol")
+            tradingview_symbol = tv_symbol_for_trade(plan)
+            if is_terminal_trade(plan):
+                results.append(
+                    {
+                        "symbol": symbol,
+                        "previous_status": plan.get("status"),
+                        "previous_outcome_status": plan.get("outcome_status"),
+                        "updated": False,
+                        "would_write": False,
+                        "reason": "TERMINAL_STATUS",
+                    }
+                )
+                continue
+            processed += 1
+            PAPER_UPDATE_PROGRESS["processed"] = processed
+            try:
+                client = TradingViewClient()
+                client.connect_to_debug_port()
+                client.open_symbol(tradingview_symbol)
+                candles = client.fetch_candles(timeframe, min_candles=1)
+                if not candles:
+                    results.append(
+                        {
+                            "symbol": symbol,
+                            "status": plan.get("status"),
+                            "outcome_status": plan.get("outcome_status"),
+                            "updated": False,
+                            "would_write": False,
+                            "reason": "NO_CANDLES",
+                        }
+                    )
+                    continue
+                update = update_plan_status(plan, candles[-1])
+                would_write = bool(update)
+                would_update_count += 1 if would_write else 0
+                modified = 0
+                if not dry_run:
+                    try:
+                        result = await db.paper_trades.update_one({"_id": plan["_id"]}, {"$set": update})
+                        modified = result.modified_count
+                    except DuplicateKeyError:
+                        merged_status = update.get("status", plan.get("status"))
+                        identity = {
+                            "symbol": plan["symbol"],
+                            "timeframe": plan["timeframe"],
+                            "source_signal_type": plan["source_signal_type"],
+                            "paper_only": plan["paper_only"],
+                            "status": merged_status,
+                        }
+                        await db.paper_trades.update_one(identity, {"$set": update})
+                        await db.paper_trades.delete_one({"_id": plan["_id"]})
+                        modified = 1
+                    updated_count += modified
+                PAPER_UPDATE_PROGRESS["updated_count"] = updated_count
+                PAPER_UPDATE_PROGRESS["would_update_count"] = would_update_count
+                results.append(
+                    {
+                        "symbol": symbol,
+                        "previous_status": plan.get("status"),
+                        "status": update.get("status", plan.get("status")),
+                        "previous_outcome_status": plan.get("outcome_status"),
+                        "outcome_status": update.get("outcome_status", plan.get("outcome_status")),
+                        "updated": modified > 0,
+                        "would_write": would_write,
+                        "dry_run": dry_run,
+                        "latest_close": update["latest_close"],
+                        "latest_high": update["latest_high"],
+                        "latest_low": update["latest_low"],
+                        "exit_reason": update["exit_reason"],
+                        "paper_pnl": update["paper_pnl"],
+                        "paper_pnl_percent": update["paper_pnl_percent"],
+                    }
+                )
+            except Exception as exc:
+                message = str(exc)
+                errors.append({"symbol": symbol, "tradingview_symbol": tradingview_symbol, "error": message})
+                PAPER_UPDATE_PROGRESS["errors"] = errors
+                results.append(
+                    {
+                        "symbol": symbol,
+                        "tradingview_symbol": tradingview_symbol,
+                        "previous_status": plan.get("status"),
+                        "previous_outcome_status": plan.get("outcome_status"),
+                        "updated": False,
+                        "would_write": False,
+                        "dry_run": dry_run,
+                        "error": message,
+                    }
+                )
+    finally:
+        PAPER_UPDATE_PROGRESS.update(
             {
-                "symbol": plan["symbol"],
-                "previous_status": plan["status"],
-                "status": update.get("status", plan["status"]),
-                "updated": modified > 0,
-                "latest_close": update["latest_close"],
-                "latest_high": update["latest_high"],
-                "latest_low": update["latest_low"],
-                "exit_reason": update["exit_reason"],
-                "paper_pnl": update["paper_pnl"],
-                "paper_pnl_percent": update["paper_pnl_percent"],
+                "running": False,
+                "processed": processed,
+                "updated_count": updated_count,
+                "would_update_count": would_update_count,
+                "errors": errors,
+                "finished_at": datetime.utcnow().isoformat(),
             }
         )
 
-    return {"processed": processed, "updated_count": updated_count, "results": results}
+    return {
+        "mode": mode,
+        "paper_only": True,
+        "live_trading": False,
+        "broker_orders": False,
+        "timeframe": timeframe,
+        "limit": limit,
+        "dry_run": dry_run,
+        "mongo_writes_enabled": not dry_run,
+        "processed": processed,
+        "updated_count": updated_count,
+        "would_update_count": would_update_count,
+        "errors": errors,
+        "results": results,
+        "started_at": started.isoformat(),
+        "finished_at": PAPER_UPDATE_PROGRESS["finished_at"],
+    }
+
+
+@router.post("/update-plans")
+async def update_paper_plans(
+    limit: int = Query(default=10, ge=1, le=100),
+    timeframe: str = Query(default="1D"),
+    dry_run: bool = Query(default=False),
+) -> dict:
+    return await run_paper_trade_update(limit, timeframe, dry_run, "update-plans")
+
+
+@router.post("/update-trades")
+async def update_paper_trades(
+    max_trades: int | None = Query(default=None, ge=1, le=100),
+    limit: int | None = Query(default=None, ge=1, le=100),
+    timeframe: str = Query(default="1D"),
+    dry_run: bool = Query(default=True),
+) -> dict:
+    effective_limit = max_trades or limit or 10
+    return await run_paper_trade_update(effective_limit, timeframe, dry_run, "update-trades")
+
+
+@router.get("/update-progress")
+async def get_paper_update_progress() -> dict:
+    return {
+        **PAPER_UPDATE_PROGRESS,
+        "paper_only": True,
+        "live_trading": False,
+        "broker_orders": False,
+    }
 
 
 @router.get("/trades")
@@ -289,22 +489,27 @@ async def get_paper_trades(limit: int = Query(default=100, ge=1, le=500)) -> dic
 async def get_paper_summary() -> dict:
     cursor = get_database().paper_trades.find({"paper_only": True}, {"_id": 0})
     trades = [row async for row in cursor]
-    total_pnl = sum(trade.get("paper_pnl") or 0 for trade in trades)
-    closed = [trade for trade in trades if trade.get("status") in CLOSED_STATUSES]
+    waiting = [trade for trade in trades if is_waiting_trade(trade)]
+    active = [trade for trade in trades if is_open_trade(trade)]
+    closed = [trade for trade in trades if is_terminal_trade(trade)]
+    pnl_trades = active + closed
+    total_pnl = sum(trade.get("paper_pnl") or 0 for trade in pnl_trades)
     winning = [trade for trade in closed if (trade.get("paper_pnl") or 0) > 0]
     losing = [trade for trade in closed if (trade.get("paper_pnl") or 0) < 0]
     return {
         "total_trades": len(trades),
-        "planned": sum(1 for trade in trades if trade.get("status") == "PLANNED"),
-        "active": sum(1 for trade in trades if trade.get("status") == "ACTIVE"),
-        "target_1_hit": sum(1 for trade in trades if trade.get("status") == "TARGET_1_HIT"),
-        "target_2_hit": sum(1 for trade in trades if trade.get("status") == "TARGET_2_HIT"),
-        "stopped": sum(1 for trade in trades if trade.get("status") == "STOPPED"),
-        "stopped_after_t1": sum(1 for trade in trades if trade.get("status") == "STOPPED_AFTER_T1"),
+        "waiting_trades": len(waiting),
+        "planned": sum(1 for trade in trades if normalize_status(trade.get("status")) == "PLANNED"),
+        "not_triggered": sum(1 for trade in trades if normalize_status(trade.get("status")) == "NOT_TRIGGERED"),
+        "active": sum(1 for trade in trades if normalize_status(trade.get("status")) == "ACTIVE"),
+        "target_1_hit": sum(1 for trade in trades if normalize_status(trade.get("status")) == "TARGET_1_HIT"),
+        "target_2_hit": sum(1 for trade in trades if normalize_status(trade.get("status")) == "TARGET_2_HIT"),
+        "stopped": sum(1 for trade in trades if normalize_status(trade.get("status")) in {"STOPPED", "STOP_HIT", "SL_HIT"}),
+        "stopped_after_t1": sum(1 for trade in trades if normalize_status(trade.get("status")) == "STOPPED_AFTER_T1"),
         "closed_trades": len(closed),
-        "open_trades": sum(1 for trade in trades if trade.get("status") in OPEN_STATUSES),
+        "open_trades": len(active),
         "total_paper_pnl": total_pnl,
-        "average_paper_pnl": total_pnl / len(trades) if trades else 0,
+        "average_paper_pnl": total_pnl / len(pnl_trades) if pnl_trades else 0,
         "winning_trades": len(winning),
         "losing_trades": len(losing),
         "win_rate_percent": (len(winning) / len(closed) * 100) if closed else 0,
@@ -314,11 +519,9 @@ async def get_paper_summary() -> dict:
 
 @router.get("/active")
 async def get_active_paper_trades(limit: int = Query(default=100, ge=1, le=500)) -> dict:
-    cursor = get_database().paper_trades.find(
-        {"paper_only": True, "status": {"$in": OPEN_STATUSES}},
-        {"_id": 0},
-    ).sort("updated_at", -1).limit(limit)
-    trades = [row async for row in cursor]
+    cursor = get_database().paper_trades.find({"paper_only": True}, {"_id": 0}).sort("updated_at", -1)
+    trades = [row async for row in cursor if is_open_trade(row)]
+    trades = trades[:limit]
     return {"count": len(trades), "trades": trades}
 
 
@@ -627,7 +830,7 @@ async def upsert_paper_plans(plans: list[dict]) -> tuple[int, int]:
                 "timeframe": plan["timeframe"],
                 "source_signal_type": plan["source_signal_type"],
                 "paper_only": plan["paper_only"],
-                "status": {"$in": OPEN_STATUSES},
+                "status": {"$in": NON_TERMINAL_STATUSES},
             },
             {"_id": 1},
         )
@@ -670,7 +873,10 @@ async def update_pipeline_plans(
         plans = preview_plans[:limit]
     for plan in plans:
         processed += 1
-        candles = get_candles(plan["symbol"])
+        if is_terminal_trade(plan):
+            results.append({"symbol": plan["symbol"], "status": plan.get("status"), "updated": False, "reason": "TERMINAL_STATUS"})
+            continue
+        candles = get_candles(tv_symbol_for_trade(plan))
         if not candles:
             results.append({"symbol": plan["symbol"], "status": plan["status"], "updated": False, "reason": "NO_CANDLES"})
             continue

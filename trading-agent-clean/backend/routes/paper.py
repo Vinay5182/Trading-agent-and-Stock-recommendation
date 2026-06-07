@@ -1,7 +1,7 @@
 import hashlib
 import json
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from math import floor
 from uuid import uuid4
 
@@ -41,6 +41,8 @@ TRACKABLE_STATUSES = sorted(WAITING_STATUSES | ACTIVE_STATUSES)
 OPEN_STATUSES = sorted(ACTIVE_STATUSES)
 NON_TERMINAL_STATUSES = sorted(WAITING_STATUSES | ACTIVE_STATUSES)
 CLOSED_STATUSES = sorted(TERMINAL_STATUSES)
+PAPER_UPDATE_LOCK_NAME = "paper_trade_outcome_update"
+PAPER_UPDATE_LOCK_TTL_SECONDS = 15 * 60
 PAPER_UPDATE_PROGRESS = {
     "running": False,
     "mode": "idle",
@@ -67,6 +69,10 @@ def paper_update_runs_collection(db):
     return getattr(db, "paper_update_runs", None)
 
 
+def paper_update_locks_collection(db):
+    return getattr(db, "paper_update_locks", None)
+
+
 def serialize_run_doc(doc: dict | None) -> dict | None:
     if doc is None:
         return None
@@ -74,6 +80,157 @@ def serialize_run_doc(doc: dict | None) -> dict | None:
     if "_id" in serialized:
         serialized["_id"] = str(serialized["_id"])
     return serialized
+
+
+def serialize_lock_doc(doc: dict | None) -> dict | None:
+    if doc is None:
+        return None
+    serialized = dict(doc)
+    if "_id" in serialized:
+        serialized["_id"] = str(serialized["_id"])
+    return serialized
+
+
+def lock_is_expired(lock_doc: dict | None, now: str | None = None) -> bool:
+    if not lock_doc:
+        return False
+    expires_at = lock_doc.get("expires_at")
+    if not expires_at:
+        return False
+    return str(expires_at) <= (now or datetime.utcnow().isoformat())
+
+
+async def ensure_paper_update_lock_index(collection) -> None:
+    create_index = getattr(collection, "create_index", None)
+    if create_index is not None:
+        await create_index("lock_name", unique=True)
+
+
+async def acquire_paper_update_lock(
+    db,
+    run_id: str,
+    *,
+    owner: str = "MANUAL_ENDPOINT",
+    ttl_seconds: int = PAPER_UPDATE_LOCK_TTL_SECONDS,
+) -> dict:
+    collection = paper_update_locks_collection(db)
+    if collection is None:
+        return {"acquired": True, "lock": None, "lock_required": False}
+    await ensure_paper_update_lock_index(collection)
+    now_dt = datetime.utcnow()
+    now = now_dt.isoformat()
+    expires_at = (now_dt + timedelta(seconds=ttl_seconds)).isoformat()
+    lock_doc = {
+        "lock_name": PAPER_UPDATE_LOCK_NAME,
+        "status": "LOCKED",
+        "run_id": run_id,
+        "owner": owner,
+        "source": owner,
+        "locked_at": now,
+        "expires_at": expires_at,
+        "released_at": None,
+        "heartbeat_at": now,
+        "paper_only": True,
+        "live_trading": False,
+        "broker_orders": False,
+    }
+    filter_doc = {
+        "lock_name": PAPER_UPDATE_LOCK_NAME,
+        "$or": [
+            {"status": {"$in": ["RELEASED", "EXPIRED"]}},
+            {"expires_at": {"$lte": now}},
+            {"run_id": {"$exists": False}},
+        ],
+    }
+    try:
+        result = await collection.update_one(
+            filter_doc,
+            {"$set": lock_doc, "$setOnInsert": {"created_at": now}},
+            upsert=True,
+        )
+    except DuplicateKeyError:
+        return {
+            "acquired": False,
+            "lock": await get_paper_update_lock_status(db),
+            "lock_required": True,
+        }
+    acquired = bool(
+        getattr(result, "upserted_id", None) is not None
+        or getattr(result, "modified_count", 0)
+        or getattr(result, "matched_count", 0)
+    )
+    return {
+        "acquired": acquired,
+        "lock": lock_doc if acquired else await get_paper_update_lock_status(db),
+        "lock_required": True,
+    }
+
+
+async def release_paper_update_lock(db, run_id: str) -> dict:
+    collection = paper_update_locks_collection(db)
+    if collection is None:
+        return {"released": True, "lock": None, "lock_required": False}
+    now = datetime.utcnow().isoformat()
+    result = await collection.update_one(
+        {
+            "lock_name": PAPER_UPDATE_LOCK_NAME,
+            "run_id": run_id,
+            "status": "LOCKED",
+        },
+        {
+            "$set": {
+                "status": "RELEASED",
+                "released_at": now,
+                "heartbeat_at": now,
+                "paper_only": True,
+                "live_trading": False,
+                "broker_orders": False,
+            }
+        },
+        upsert=False,
+    )
+    return {
+        "released": bool(getattr(result, "modified_count", 0)),
+        "lock": await get_paper_update_lock_status(db),
+        "lock_required": True,
+    }
+
+
+async def get_paper_update_lock_status(db) -> dict:
+    collection = paper_update_locks_collection(db)
+    if collection is None:
+        return {
+            "lock_name": PAPER_UPDATE_LOCK_NAME,
+            "status": "RELEASED",
+            "held": False,
+            "expired": False,
+            "paper_only": True,
+            "live_trading": False,
+            "broker_orders": False,
+        }
+    doc = serialize_lock_doc(await collection.find_one({"lock_name": PAPER_UPDATE_LOCK_NAME}, {"_id": 0}))
+    if doc is None:
+        return {
+            "lock_name": PAPER_UPDATE_LOCK_NAME,
+            "status": "RELEASED",
+            "held": False,
+            "expired": False,
+            "paper_only": True,
+            "live_trading": False,
+            "broker_orders": False,
+        }
+    expired = doc.get("status") == "LOCKED" and lock_is_expired(doc)
+    derived_status = "EXPIRED" if expired else doc.get("status", "RELEASED")
+    return {
+        **doc,
+        "status": derived_status,
+        "raw_status": doc.get("status"),
+        "held": derived_status == "LOCKED",
+        "expired": expired,
+        "paper_only": True,
+        "live_trading": False,
+        "broker_orders": False,
+    }
 
 
 async def capture_paper_update_snapshot(db) -> dict:
@@ -436,7 +593,92 @@ async def run_paper_trade_update(
     started = datetime.utcnow()
     started_at = started.isoformat()
     run_mode = "DRY_RUN" if dry_run else "REAL"
+    lock_result = await acquire_paper_update_lock(db, run_id)
     pre_snapshot = await capture_paper_update_snapshot(db)
+    if not lock_result.get("acquired"):
+        finished_at = datetime.utcnow().isoformat()
+        blocked_response = {
+            "run_id": run_id,
+            "mode": mode,
+            "paper_only": True,
+            "live_trading": False,
+            "broker_orders": False,
+            "timeframe": timeframe,
+            "limit": limit,
+            "max_trades": limit,
+            "max_writes": max_writes,
+            "dry_run": dry_run,
+            "mongo_writes_enabled": False,
+            "processed": 0,
+            "proposed_write_count": 0,
+            "updated_count": 0,
+            "would_update_count": 0,
+            "successful_updates_count": 0,
+            "errors_count": 0,
+            "blocked": True,
+            "block_reason": "LOCK_ALREADY_HELD",
+            "errors": [],
+            "results": [],
+            "lock": lock_result.get("lock"),
+            "started_at": started_at,
+            "finished_at": finished_at,
+        }
+        PAPER_UPDATE_PROGRESS.update(
+            {
+                "running": False,
+                "run_id": run_id,
+                "mode": mode,
+                "dry_run": dry_run,
+                "status": "BLOCKED",
+                "processed": 0,
+                "updated_count": 0,
+                "would_update_count": 0,
+                "errors": [],
+                "started_at": started_at,
+                "finished_at": finished_at,
+            }
+        )
+        await upsert_paper_update_run_log(
+            db,
+            run_id,
+            {
+                "run_id": run_id,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "mode": run_mode,
+                "endpoint_mode": mode,
+                "dry_run": dry_run,
+                "dry_run_first": dry_run,
+                "status": "BLOCKED",
+                "processed": 0,
+                "proposed_write_count": 0,
+                "would_update_count": 0,
+                "updated_count": 0,
+                "successful_updates_count": 0,
+                "errors_count": 0,
+                "blocked": True,
+                "block_reason": "LOCK_ALREADY_HELD",
+                "max_trades": limit,
+                "max_writes": max_writes,
+                "pre_snapshot": pre_snapshot,
+                "post_snapshot": pre_snapshot,
+                "changed_trade_ids": [],
+                "details": {
+                    "timeframe": timeframe,
+                    "operation": mode,
+                    "lock": lock_result.get("lock"),
+                },
+                "per_trade_results": [],
+                "owner": "MANUAL_ENDPOINT",
+                "source": "MANUAL_ENDPOINT",
+                "paper_only": True,
+                "live_trading": False,
+                "broker_orders": False,
+                "mongo_writes_enabled": False,
+            },
+            set_on_insert={"created_at": started_at},
+        )
+        return blocked_response
     PAPER_UPDATE_PROGRESS.update(
         {
             "running": True,
@@ -477,7 +719,7 @@ async def run_paper_trade_update(
             "pre_snapshot": pre_snapshot,
             "post_snapshot": None,
             "changed_trade_ids": [],
-            "details": {"timeframe": timeframe, "operation": mode},
+            "details": {"timeframe": timeframe, "operation": mode, "lock": lock_result.get("lock")},
             "per_trade_results": [],
             "owner": "MANUAL_ENDPOINT",
             "source": "MANUAL_ENDPOINT",
@@ -500,6 +742,7 @@ async def run_paper_trade_update(
     proposals = []
     blocked = False
     block_reason = None
+    lock_release_result = {"released": False, "lock": None, "lock_required": lock_result.get("lock_required", False)}
     try:
         async for plan in cursor:
             symbol = plan.get("symbol")
@@ -667,8 +910,17 @@ async def run_paper_trade_update(
                 "finished_at": datetime.utcnow().isoformat(),
             }
         )
+        try:
+            lock_release_result = await release_paper_update_lock(db, run_id)
+        except Exception as exc:
+            lock_release_result = {
+                "released": False,
+                "error": str(exc),
+                "lock_required": lock_result.get("lock_required", False),
+            }
 
     response = {
+        "run_id": run_id,
         "mode": mode,
         "paper_only": True,
         "live_trading": False,
@@ -689,6 +941,7 @@ async def run_paper_trade_update(
         "block_reason": block_reason,
         "errors": errors,
         "results": results,
+        "lock_released": lock_release_result.get("released"),
         "started_at": started_at,
         "finished_at": PAPER_UPDATE_PROGRESS["finished_at"],
     }
@@ -725,6 +978,8 @@ async def run_paper_trade_update(
                 "timeframe": timeframe,
                 "operation": mode,
                 "errors": errors,
+                "lock": lock_result.get("lock"),
+                "lock_release": lock_release_result,
             },
             "per_trade_results": results,
             "mongo_writes_enabled": not dry_run and not blocked,
@@ -800,6 +1055,11 @@ async def get_paper_update_run(run_id: str) -> dict:
     if run is None:
         raise HTTPException(status_code=404, detail="paper update run not found")
     return run
+
+
+@router.get("/update-lock")
+async def get_paper_update_lock() -> dict:
+    return await get_paper_update_lock_status(get_database())
 
 
 @router.get("/trades")

@@ -2,9 +2,9 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   API_BASE, buildMomentumSignals, buildPaperPlans, buildSwingSignals, getActiveTrades,
   getAllTrades, getHealth, getMarketDataSymbol, getMarketLoadProgress, getMomentumCandidates, getMomentumPrecheck, getPaperPlans, getPaperSignals,
-  getMomentumSummary, getMomentumTvConfirmed, getPaperSummary, getPaperUpdateLock, getPaperUpdateProgress, getPaperUpdateRuns, getPaperUpdateSchedulerStatus, getScanRows, getScoreSummary, getSettings, getSwingCandidates,
+  getMomentumSummary, getMomentumTvConfirmed, getPaperEquity, getPaperSummary, getPaperUpdateLock, getPaperUpdateProgress, getPaperUpdateRuns, getPaperUpdateSchedulerStatus, getScanRows, getScoreSummary, getSettings, getSwingCandidates,
   getSwingPrecheck, getSwingSummary, getSwingTvConfirmed, momentumTvConfirm, loadAllMarketData, runPaperPipeline, runScan, runScoring,
-  swingTvConfirm, testTvSymbol, updatePaperPlans,
+  runPaperUpdateDryRun, swingTvConfirm, testTvSymbol, updatePaperPlans,
 } from "./api";
 
 const NAV_ITEMS = [
@@ -233,12 +233,85 @@ const boolTone = (value, safeWhenFalse = false) => {
 function SafetyMetric({ label, value, tone = "green" }) {
   return <div><span>{label}</span><strong>{val(value)}</strong>{tone && <Badge tone={tone}>{val(value)}</Badge>}</div>;
 }
-function PaperUpdateSafety({ progress, schedulerStatus, lockStatus }) {
+const paperUpdateProposalRows = (result) => {
+  const directKeys = ["results", "per_trade_results", "proposals", "trades"];
+  for (const key of directKeys) {
+    if (Array.isArray(result?.[key])) return result[key];
+  }
+  const details = result?.details;
+  for (const key of directKeys) {
+    if (Array.isArray(details?.[key])) return details[key];
+  }
+  return [];
+};
+function PaperUpdateDryRunWarnings({ result }) {
+  if (!result) return null;
+  const warnings = [];
+  const maxWrites = Number(result?.max_writes ?? 1);
+  const proposedWrites = Number(result?.proposed_write_count ?? 0);
+  const errorsCount = Number(result?.errors_count ?? (Array.isArray(result?.errors) ? result.errors.length : 0));
+  if (result?.mongo_writes_enabled !== false) warnings.push("UNSAFE: mongo_writes_enabled is not false during dry-run.");
+  if (result?.live_trading === true) warnings.push("UNSAFE: live_trading is true.");
+  if (result?.broker_orders === true) warnings.push("UNSAFE: broker_orders is true.");
+  if (proposedWrites > maxWrites) warnings.push(`Blocked warning: proposed_write_count ${proposedWrites} exceeds max_writes ${maxWrites}.`);
+  if (errorsCount > 0) warnings.push(`Error warning: dry-run reported ${errorsCount} error(s).`);
+  if (!warnings.length) return <div className="safeNotice">Dry-run safety flags are safe: no Mongo writes, no live trading, no broker orders.</div>;
+  return <div className="safetyWarningList">{warnings.map((warning) => <div key={warning}>{warning}</div>)}</div>;
+}
+function PaperUpdateDryRunResult({ result }) {
+  if (!result) return null;
+  const rows = paperUpdateProposalRows(result);
+  const summaryItems = [
+    ["processed", result?.processed],
+    ["proposed_write_count", result?.proposed_write_count],
+    ["updated_count", result?.updated_count],
+    ["errors_count", result?.errors_count],
+    ["blocked", boolLabel(result?.blocked)],
+    ["block_reason", result?.block_reason || "-"],
+    ["max_trades", result?.max_trades],
+    ["max_writes", result?.max_writes],
+    ["mongo_writes_enabled", boolLabel(result?.mongo_writes_enabled)],
+    ["paper_only", boolLabel(result?.paper_only)],
+    ["live_trading", boolLabel(result?.live_trading)],
+    ["broker_orders", boolLabel(result?.broker_orders)],
+  ];
+  const columns = ["symbol", "current status", "proposed status", "current outcome", "proposed outcome", "proposed P&L", "reason", "would_write", "write_attempted"];
+  return <div className="paperUpdateResultPanel">
+    <h3>Latest Manual Dry-Run Result</h3>
+    <PaperUpdateDryRunWarnings result={result} />
+    <div className="safetyGrid">
+      {summaryItems.map(([label, value]) => <SafetyMetric key={label} label={label} value={value ?? "-"} tone={label.includes("enabled") || label.includes("live") || label.includes("broker") ? boolTone(value === "true", true) : "gray"} />)}
+    </div>
+    <div className="tableShell results-table-wrap"><table><thead><tr>{columns.map((column) => <th key={column}>{column}</th>)}</tr></thead><tbody>
+      {rows.length ? rows.map((row, index) => {
+        const values = {
+          symbol: row?.symbol || row?.tradingview_symbol || row?.canonical_symbol || "-",
+          "current status": row?.previous_status ?? row?.current_status ?? row?.status,
+          "proposed status": row?.proposed_new_status ?? row?.proposed_status ?? row?.status,
+          "current outcome": row?.previous_outcome_status ?? row?.current_outcome_status ?? row?.outcome_status,
+          "proposed outcome": row?.proposed_new_outcome_status ?? row?.proposed_outcome_status ?? row?.outcome_status,
+          "proposed P&L": row?.proposed_pnl ?? row?.paper_pnl,
+          reason: row?.proposed_reason ?? row?.reason ?? row?.error_message,
+          would_write: boolLabel(row?.would_write),
+          write_attempted: boolLabel(row?.write_attempted),
+        };
+        return <tr key={`${values.symbol}-${index}`}>{columns.map((column) => (
+          <td key={column} className={column === "reason" ? "wideText" : ""}>{fmt(values[column])}</td>
+        ))}</tr>;
+      }) : <tr><td colSpan={columns.length}>No per-trade dry-run proposals returned.</td></tr>}
+    </tbody></table></div>
+  </div>;
+}
+function PaperUpdateSafety({ progress, schedulerStatus, lockStatus, dryRunResult, onRunDryRun, dryRunLoading, actionDisabled }) {
   const lock = lockStatus || schedulerStatus?.lock || {};
   const schedulerEnabled = schedulerStatus?.enabled;
   const schedulerRunning = schedulerStatus?.scheduler_running;
   const autoEnabled = schedulerStatus?.automatic_updates_enabled;
   return <Card title="Paper Update Safety / Automation Status" eyebrow="read-only">
+    <div className="safetyActions">
+      <ActionButton onClick={onRunDryRun} disabled={actionDisabled || dryRunLoading}>{dryRunLoading ? "Running Paper Update Dry-Run..." : "Run Paper Update Dry-Run"}</ActionButton>
+      <p className="muted">Dry-run only. It evaluates existing paper trades and must not write to MongoDB, place orders, run scans, scoring, market loading, pipeline generation, or TV confirmation.</p>
+    </div>
     <div className="safetyGrid">
       <SafetyMetric label="scheduler enabled" value={boolLabel(schedulerEnabled)} tone={boolTone(schedulerEnabled, true)} />
       <SafetyMetric label="scheduler_running" value={boolLabel(schedulerRunning)} tone={boolTone(schedulerRunning, true)} />
@@ -260,6 +333,7 @@ function PaperUpdateSafety({ progress, schedulerStatus, lockStatus }) {
       <SafetyMetric label="live_trading" value={boolLabel(schedulerStatus?.live_trading ?? progress?.live_trading)} tone={boolTone(schedulerStatus?.live_trading ?? progress?.live_trading, true)} />
       <SafetyMetric label="broker_orders" value={boolLabel(schedulerStatus?.broker_orders ?? progress?.broker_orders)} tone={boolTone(schedulerStatus?.broker_orders ?? progress?.broker_orders, true)} />
     </div>
+    <PaperUpdateDryRunResult result={dryRunResult} />
   </Card>;
 }
 function PaperUpdateRunHistory({ runs = [] }) {
@@ -277,7 +351,7 @@ function PaperUpdateRunHistory({ runs = [] }) {
   </Card>;
 }
 
-function Dashboard({ summary, scoreSummary, swingSummary, momentumSummary, paperUpdateProgress, paperUpdateRuns, paperUpdateLock, paperUpdateScheduler, onSummary, onDryRun, onSaveRun, loading }) {
+function Dashboard({ summary, scoreSummary, swingSummary, momentumSummary, paperUpdateProgress, paperUpdateRuns, paperUpdateLock, paperUpdateScheduler, paperUpdateDryRunResult, onSummary, onDryRun, onSaveRun, onPaperUpdateDryRun, paperUpdateDryRunLoading, loading }) {
   return <div className="pageStack">
     <section className="heroCard">
       <div><span>Paper control room</span><h1>Indian Stock Trading Assistant</h1><p>Swing and momentum workflows powered by TradingView candles. Paper records only.</p></div>
@@ -297,7 +371,7 @@ function Dashboard({ summary, scoreSummary, swingSummary, momentumSummary, paper
       <StatCard label="Swing Candidates" value={swingSummary?.swing_candidates_count ?? scoreSummary?.swing_candidates_count ?? "--"} tone="yellow" />
       <StatCard label="Momentum Candidates" value={momentumSummary?.momentum_candidates_count ?? scoreSummary?.momentum_candidates_count ?? "--"} />
     </div>
-    <PaperUpdateSafety progress={paperUpdateProgress} schedulerStatus={paperUpdateScheduler} lockStatus={paperUpdateLock} />
+    <PaperUpdateSafety progress={paperUpdateProgress} schedulerStatus={paperUpdateScheduler} lockStatus={paperUpdateLock} dryRunResult={paperUpdateDryRunResult} onRunDryRun={onPaperUpdateDryRun} dryRunLoading={paperUpdateDryRunLoading} actionDisabled={loading} />
     <PaperUpdateRunHistory runs={paperUpdateRuns} />
     <div className="threeGrid">
       <Card title="Recent Activity" eyebrow="paper log"><div className="activityList"><p>Summary ready</p><p>TradingView candles available</p><p>Pipeline dry-run enabled</p></div></Card>
@@ -317,6 +391,14 @@ const SCAN_SCORE_WARNING = "Market data updated. Please run Score Market Data be
 const SCORE_REFRESH_MESSAGE = "Score Market Data completed. Now load Swing/Momentum candidates.";
 const MOMENTUM_SCORE_STALE_MESSAGE = "Market data is newer than scored candidates. Rerun Score Market Data before Momentum TV Confirm.";
 const TRADINGVIEW_ERROR_HINT = "If this is a TradingView connection issue, make sure TradingView Desktop/debug access and the backend on 127.0.0.1:8011 are running.";
+const PAPER_UPDATE_DRY_RUN_CONFIRM = [
+  "Run Paper Update Dry-Run?",
+  "",
+  "This calls dry_run=true only.",
+  "It will not write to paper_trades or MongoDB.",
+  "It will not place broker/live orders.",
+  "It will not run scan, scoring, market loading, paper pipeline generation, or TradingView confirmation endpoints.",
+].join("\n");
 
 function formatActionError(err, actionName = "request") {
   const status = err?.status ? `HTTP ${err.status}` : "HTTP status unavailable";
@@ -1359,6 +1441,7 @@ export default function App() {
   const [paperUpdateRuns, setPaperUpdateRuns] = useState([]);
   const [paperUpdateLock, setPaperUpdateLock] = useState(null);
   const [paperUpdateScheduler, setPaperUpdateScheduler] = useState(null);
+  const [paperUpdateDryRunResult, setPaperUpdateDryRunResult] = useState(null);
   const [signals, setSignals] = useState([]);
   const [plans, setPlans] = useState([]);
   const [activeTrades, setActiveTrades] = useState([]);
@@ -1414,6 +1497,21 @@ export default function App() {
     try { const data = await fn(); setLastResponse(data); return data; }
     catch (err) { console.error(`${name} failed`, err); setError(formatActionError(err, name)); return null; }
     finally { setLoading(""); }
+  };
+
+  const refreshPaperUpdateSafety = async () => {
+    const [progress, runs, lock, scheduler] = await Promise.all([
+      getPaperUpdateProgress(),
+      getPaperUpdateRuns(10),
+      getPaperUpdateLock(),
+      getPaperUpdateSchedulerStatus(),
+    ]);
+    const runRows = arr(runs, ["runs"]);
+    setPaperUpdateProgress(progress);
+    setPaperUpdateRuns(runRows);
+    setPaperUpdateLock(lock);
+    setPaperUpdateScheduler(scheduler);
+    return { progress, runs: runRows, lock, scheduler };
   };
 
   useEffect(() => {
@@ -1516,6 +1614,22 @@ export default function App() {
   };
   const handlers = {
     loadSummary: () => act("summary", async () => { const data = await getPaperSummary(); setSummary(data); return data; }),
+    paperUpdateDryRun: () => {
+      if (!window.confirm(PAPER_UPDATE_DRY_RUN_CONFIRM)) {
+        setNotice("Paper update dry-run cancelled.");
+        return null;
+      }
+      return act("paper update dry-run", async () => {
+        const result = await runPaperUpdateDryRun({ maxTrades: 6, maxWrites: 1 });
+        setPaperUpdateDryRunResult(result);
+        const [safety, summaryData, equityData] = await Promise.all([
+          refreshPaperUpdateSafety(),
+          getPaperSummary().then((data) => { setSummary(data); return data; }),
+          getPaperEquity(),
+        ]);
+        return { dry_run_result: result, refreshed: { safety, summary: summaryData, paper_equity: equityData } };
+      });
+    },
     dryRun: () => act("pipeline dry run", () => runPaperPipeline({ limit: 1, timeframe: "1D", dryRun: true, strategy: "swing" })),
     saveRun: () => act("pipeline save", () => runPaperPipeline({ limit: 1, timeframe: "1D", dryRun: false, strategy: "swing" })),
     scan: () => act("scan", async () => { const data = await runScan(); if (data?.scan_run_id) setLatestScanRunId(data.scan_run_id); setScanRows(await getPaperSafeScanRows(data?.scan_run_id)); return data; }),
@@ -1759,8 +1873,8 @@ export default function App() {
     if (activePage === "Stock Detail") return <StockDetailPage search={search} stockMarketData={stockMarketData} stockSwingPrecheck={stockSwingPrecheck} stockMomentumPrecheck={stockMomentumPrecheck} stockSwingTvResult={stockSwingTvResult} stockMomentumTvResult={stockMomentumTvResult} stockSavedSwingResult={stockSavedSwingResult} stockSavedMomentumResult={stockSavedMomentumResult} latestSwingTvRows={latestSwingTvRows} latestMomentumTvRows={latestMomentumTvRows} stockSwingTimeframes={stockSwingTimeframes} setStockSwingTimeframes={setStockSwingTimeframes} stockMomentumTimeframes={stockMomentumTimeframes} setStockMomentumTimeframes={setStockMomentumTimeframes} onLoadStockMarket={handlers.stockMarketData} onSwingPrecheck={handlers.stockSwingPrecheck} onMomentumPrecheck={handlers.stockMomentumPrecheck} onStockSwingTvConfirm={handlers.stockSwingTvConfirm} onStockMomentumTvConfirm={handlers.stockMomentumTvConfirm} loading={!!loading} />;
     if (activePage === "Paper Trades") return <PaperTrades signals={signals} plans={plans} activeTrades={activeTrades} allTrades={allTrades} onSignals={handlers.paperSignals} onPlans={handlers.paperPlans} onActive={handlers.active} onAll={handlers.all} onUpdate={handlers.update} loading={!!loading} />;
     if (activePage === "Settings") return <Settings settings={settings} health={health} />;
-    return <Dashboard summary={summary} scoreSummary={scoreSummary} swingSummary={swingSummary} momentumSummary={momentumSummary} paperUpdateProgress={paperUpdateProgress} paperUpdateRuns={paperUpdateRuns} paperUpdateLock={paperUpdateLock} paperUpdateScheduler={paperUpdateScheduler} onSummary={handlers.loadSummary} onDryRun={handlers.dryRun} onSaveRun={handlers.saveRun} loading={!!loading} />;
-  }, [activePage, settings, health, summary, scoreSummary, swingSummary, momentumSummary, paperUpdateProgress, paperUpdateRuns, paperUpdateLock, paperUpdateScheduler, swingRows, latestSwingTvRows, swingTvRowsLoaded, swingBatchResults, swingBatchProgress, swingBatchError, swingBatchStopRequested, swingBatchStopMessage, swingCandidatesStale, momentumRows, momentumCandidatesStale, latestMomentumTvRows, momentumTvRowsLoaded, momentumBatchResults, momentumBatchProgress, momentumBatchError, momentumBatchStopRequested, momentumBatchStopMessage, stockMarketData, stockSwingPrecheck, stockMomentumPrecheck, stockSwingTvResult, stockMomentumTvResult, stockSavedSwingResult, stockSavedMomentumResult, stockSwingTimeframes, stockMomentumTimeframes, search, tv, tvResult, marketLoadResult, marketProgress, scoreRunResult, marketDataNeedsScore, signals, plans, activeTrades, allTrades, loading, lastResponse]);
+    return <Dashboard summary={summary} scoreSummary={scoreSummary} swingSummary={swingSummary} momentumSummary={momentumSummary} paperUpdateProgress={paperUpdateProgress} paperUpdateRuns={paperUpdateRuns} paperUpdateLock={paperUpdateLock} paperUpdateScheduler={paperUpdateScheduler} paperUpdateDryRunResult={paperUpdateDryRunResult} onSummary={handlers.loadSummary} onDryRun={handlers.dryRun} onSaveRun={handlers.saveRun} onPaperUpdateDryRun={handlers.paperUpdateDryRun} paperUpdateDryRunLoading={loading === "paper update dry-run"} loading={!!loading} />;
+  }, [activePage, settings, health, summary, scoreSummary, swingSummary, momentumSummary, paperUpdateProgress, paperUpdateRuns, paperUpdateLock, paperUpdateScheduler, paperUpdateDryRunResult, swingRows, latestSwingTvRows, swingTvRowsLoaded, swingBatchResults, swingBatchProgress, swingBatchError, swingBatchStopRequested, swingBatchStopMessage, swingCandidatesStale, momentumRows, momentumCandidatesStale, latestMomentumTvRows, momentumTvRowsLoaded, momentumBatchResults, momentumBatchProgress, momentumBatchError, momentumBatchStopRequested, momentumBatchStopMessage, stockMarketData, stockSwingPrecheck, stockMomentumPrecheck, stockSwingTvResult, stockMomentumTvResult, stockSavedSwingResult, stockSavedMomentumResult, stockSwingTimeframes, stockMomentumTimeframes, search, tv, tvResult, marketLoadResult, marketProgress, scoreRunResult, marketDataNeedsScore, signals, plans, activeTrades, allTrades, loading, lastResponse]);
 
   return <div className="appShell">
     <aside className="sidebar"><div className="brand"><div className="brandMark">TA</div><div><h1>Trading Agent</h1><p>Paper Terminal</p></div></div><div className="navSeparator">Workspace</div><nav>{NAV_WITH_STOCK_DETAIL.map((item) => <button className={activePage === item.label ? "navItem active" : "navItem"} key={item.label} onClick={() => setActivePage(item.label)}><span>{item.icon}</span>{item.label}</button>)}</nav><div className="sidebarFooter"><Badge tone="yellow">PAPER ONLY</Badge><p>No live trading. No broker orders.</p></div></aside>

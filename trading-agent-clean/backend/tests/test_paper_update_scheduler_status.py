@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from config import settings
 from main import app
 from routes import paper
+from services import paper_update_scheduler as scheduler
 
 
 def matches_query(row: dict, query: dict | None) -> bool:
@@ -41,6 +42,8 @@ class FakePaperTrades:
     def __init__(self) -> None:
         self.find_calls = []
         self.update_calls = []
+        self.insert_calls = []
+        self.delete_calls = []
 
     def find(self, *args, **kwargs):
         self.find_calls.append((args, kwargs))
@@ -49,6 +52,14 @@ class FakePaperTrades:
     async def update_one(self, *args, **kwargs):
         self.update_calls.append((args, kwargs))
         raise AssertionError("scheduler status must not update paper_trades")
+
+    async def insert_one(self, *args, **kwargs):
+        self.insert_calls.append((args, kwargs))
+        raise AssertionError("scheduler status must not insert paper_trades")
+
+    async def delete_one(self, *args, **kwargs):
+        self.delete_calls.append((args, kwargs))
+        raise AssertionError("scheduler status must not delete paper_trades")
 
 
 class FakePaperUpdateRuns:
@@ -80,7 +91,36 @@ class FailIfCalledTradingViewClient:
         raise AssertionError("scheduler status must not call TradingView")
 
 
-def patch_fake_db(monkeypatch, *, runs: list[dict] | None = None, lock: dict | None = None):
+async def fail_if_update_runner_called(*_args, **_kwargs):
+    raise AssertionError("scheduler status must not call dry-run or real update runner")
+
+
+def make_scheduler_settings(**overrides) -> SimpleNamespace:
+    values = {
+        "PAPER_UPDATE_SCHEDULER_ENABLED": False,
+        "PAPER_UPDATE_SCHEDULER_MODE": "dry_run_only",
+        "PAPER_UPDATE_SCHEDULER_DRY_RUN_ONLY": True,
+        "PAPER_UPDATE_SCHEDULER_ALLOW_REAL_WRITES": False,
+        "PAPER_UPDATE_SCHEDULER_INTERVAL_MINUTES": 30,
+        "PAPER_UPDATE_SCHEDULER_AFTER_MARKET_CLOSE_ONLY": True,
+        "PAPER_UPDATE_SCHEDULER_DRY_RUN_FIRST": True,
+        "PAPER_UPDATE_SCHEDULER_MAX_TRADES": 6,
+        "PAPER_UPDATE_SCHEDULER_MAX_WRITES": 1,
+        "PAPER_MODE": True,
+        "LIVE_TRADING_ENABLED": False,
+        "BROKER_ORDERS_ENABLED": False,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def patch_fake_db(
+    monkeypatch,
+    *,
+    runs: list[dict] | None = None,
+    lock: dict | None = None,
+    scheduler_settings: SimpleNamespace | None = None,
+):
     db = SimpleNamespace(
         paper_trades=FakePaperTrades(),
         paper_update_runs=FakePaperUpdateRuns(runs),
@@ -88,6 +128,9 @@ def patch_fake_db(monkeypatch, *, runs: list[dict] | None = None, lock: dict | N
     )
     monkeypatch.setattr(paper, "get_database", lambda: db)
     monkeypatch.setattr(paper, "TradingViewClient", FailIfCalledTradingViewClient)
+    monkeypatch.setattr(paper, "run_paper_trade_update", fail_if_update_runner_called)
+    if scheduler_settings is not None:
+        monkeypatch.setattr(paper, "settings", scheduler_settings)
     return db
 
 
@@ -108,6 +151,11 @@ def test_scheduler_status_returns_disabled_defaults(monkeypatch) -> None:
     assert payload["last_block_reason"] == "SCHEDULER_DISABLED"
     assert payload["scheduler_running"] is False
     assert payload["automatic_updates_enabled"] is False
+    assert payload["recurring_loop_enabled"] is False
+    assert payload["blocked"] is False
+    assert payload["unsafe_config"] is False
+    assert payload["unsafe_reasons"] == []
+    assert payload["emergency_warning"] is None
     assert payload["paper_only"] is True
     assert payload["live_trading"] is False
     assert payload["broker_orders"] is False
@@ -122,6 +170,115 @@ def test_scheduler_status_does_not_run_updates_or_tradingview(monkeypatch) -> No
     assert response.status_code == 200
     assert db.paper_trades.find_calls == []
     assert db.paper_trades.update_calls == []
+    assert db.paper_trades.insert_calls == []
+    assert db.paper_trades.delete_calls == []
+
+
+def test_scheduler_status_warns_when_enabled_for_dry_run_only(monkeypatch) -> None:
+    patch_fake_db(
+        monkeypatch,
+        scheduler_settings=make_scheduler_settings(PAPER_UPDATE_SCHEDULER_ENABLED=True),
+    )
+    client = TestClient(app)
+
+    response = client.get("/api/paper/update-scheduler/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["enabled"] is True
+    assert payload["mode"] == "dry_run_only"
+    assert payload["dry_run_only"] is True
+    assert payload["allow_real_writes"] is False
+    assert payload["recurring_loop_enabled"] is False
+    assert payload["automatic_updates_enabled"] is False
+    assert payload["blocked"] is False
+    assert payload["unsafe_config"] is False
+    assert payload["next_run_at"]
+    assert "cannot approve" in payload["emergency_warning"]
+    assert "cannot write to paper_trades" in payload["emergency_warning"]
+
+
+def test_scheduler_status_blocks_allow_real_writes(monkeypatch) -> None:
+    patch_fake_db(
+        monkeypatch,
+        scheduler_settings=make_scheduler_settings(
+            PAPER_UPDATE_SCHEDULER_ENABLED=True,
+            PAPER_UPDATE_SCHEDULER_ALLOW_REAL_WRITES=True,
+        ),
+    )
+    client = TestClient(app)
+
+    response = client.get("/api/paper/update-scheduler/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["blocked"] is True
+    assert payload["unsafe_config"] is True
+    assert payload["block_reason"] == "SCHEDULER_REAL_WRITES_NOT_ALLOWED"
+    assert "SCHEDULER_REAL_WRITES_NOT_ALLOWED" in payload["unsafe_reasons"]
+    assert payload["next_run_at"] is None
+    assert payload["unsafe_warning"] == scheduler.SCHEDULER_UNSAFE_CONFIG_WARNING
+    assert payload["emergency_warning"] == scheduler.SCHEDULER_UNSAFE_CONFIG_WARNING
+
+
+def test_scheduler_status_blocks_max_writes_not_one(monkeypatch) -> None:
+    patch_fake_db(
+        monkeypatch,
+        scheduler_settings=make_scheduler_settings(
+            PAPER_UPDATE_SCHEDULER_ENABLED=True,
+            PAPER_UPDATE_SCHEDULER_MAX_WRITES=2,
+        ),
+    )
+    client = TestClient(app)
+
+    response = client.get("/api/paper/update-scheduler/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["blocked"] is True
+    assert payload["block_reason"] == "MAX_WRITES_MUST_EQUAL_1"
+    assert "MAX_WRITES_MUST_EQUAL_1" in payload["unsafe_reasons"]
+    assert payload["max_writes"] == 2
+
+
+def test_scheduler_status_blocks_mode_not_dry_run_only(monkeypatch) -> None:
+    patch_fake_db(
+        monkeypatch,
+        scheduler_settings=make_scheduler_settings(
+            PAPER_UPDATE_SCHEDULER_ENABLED=True,
+            PAPER_UPDATE_SCHEDULER_MODE="manual",
+        ),
+    )
+    client = TestClient(app)
+
+    response = client.get("/api/paper/update-scheduler/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["blocked"] is True
+    assert payload["block_reason"] == "SCHEDULER_MODE_NOT_DRY_RUN_ONLY"
+    assert "SCHEDULER_MODE_NOT_DRY_RUN_ONLY" in payload["unsafe_reasons"]
+    assert payload["mode"] == "manual"
+
+
+def test_scheduler_status_blocks_live_trading_enabled(monkeypatch) -> None:
+    patch_fake_db(
+        monkeypatch,
+        scheduler_settings=make_scheduler_settings(
+            PAPER_UPDATE_SCHEDULER_ENABLED=True,
+            LIVE_TRADING_ENABLED=True,
+        ),
+    )
+    client = TestClient(app)
+
+    response = client.get("/api/paper/update-scheduler/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["blocked"] is True
+    assert payload["block_reason"] == "LIVE_TRADING_ENABLED"
+    assert "LIVE_TRADING_ENABLED" in payload["unsafe_reasons"]
+    assert payload["live_trading"] is True
 
 
 def test_scheduler_status_includes_lock_status(monkeypatch) -> None:

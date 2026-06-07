@@ -6,6 +6,15 @@ from config import settings
 
 SCHEDULER_DRY_RUN_OWNER = "SCHEDULER_DRY_RUN_ONLY"
 SCHEDULER_DRY_RUN_ENDPOINT_MODE = "scheduler-dry-run-only"
+SCHEDULER_DRY_RUN_ENABLED_WARNING = (
+    "Scheduler config is enabled for dry-run-only monitoring. It cannot approve, cannot write to "
+    "paper_trades, and cannot place broker orders."
+)
+SCHEDULER_UNSAFE_CONFIG_WARNING = (
+    "Scheduler config is unsafe and blocked. Dry-run-only scheduler requires mode=dry_run_only, "
+    "dry_run_only=true, allow_real_writes=false, paper_mode=true, live_trading=false, "
+    "broker_orders=false, max_trades<=6, and max_writes=1."
+)
 MAX_SCHEDULER_TRADES = 6
 MAX_SCHEDULER_WRITES = 1
 MARKET_CLOSE_BUFFER_TIME = time(15, 45)
@@ -93,6 +102,27 @@ def scheduled_run_fields(latest_run: dict | None) -> dict:
     }
 
 
+def scheduler_unsafe_reasons(config: dict) -> list[str]:
+    reasons = []
+    if config["mode"] != "dry_run_only":
+        reasons.append("SCHEDULER_MODE_NOT_DRY_RUN_ONLY")
+    if config["dry_run_only"] is not True:
+        reasons.append("SCHEDULER_DRY_RUN_ONLY_NOT_ENABLED")
+    if config["allow_real_writes"] is not False:
+        reasons.append("SCHEDULER_REAL_WRITES_NOT_ALLOWED")
+    if config["paper_mode"] is not True:
+        reasons.append("PAPER_MODE_REQUIRED")
+    if config["live_trading_enabled"] is not False:
+        reasons.append("LIVE_TRADING_ENABLED")
+    if config["broker_orders"] is not False:
+        reasons.append("BROKER_ORDERS_ENABLED")
+    if config["max_writes"] != MAX_SCHEDULER_WRITES:
+        reasons.append("MAX_WRITES_MUST_EQUAL_1")
+    if config["max_trades"] > MAX_SCHEDULER_TRADES:
+        reasons.append("MAX_TRADES_TOO_HIGH")
+    return reasons
+
+
 def build_paper_update_scheduler_status(
     *,
     latest_run: dict | None,
@@ -104,6 +134,14 @@ def build_paper_update_scheduler_status(
     config = scheduler_config(scheduler_settings)
     scheduled_fields = scheduled_run_fields(latest_scheduled_run or latest_run)
     disabled_reason = None if config["enabled"] else "SCHEDULER_DISABLED"
+    unsafe_reasons = scheduler_unsafe_reasons(config)
+    unsafe_config = bool(unsafe_reasons)
+    emergency_warning = None
+    if unsafe_config:
+        emergency_warning = SCHEDULER_UNSAFE_CONFIG_WARNING
+    elif config["enabled"]:
+        emergency_warning = SCHEDULER_DRY_RUN_ENABLED_WARNING
+    last_block_reason = unsafe_reasons[0] if unsafe_reasons else scheduled_fields["last_block_reason"] or disabled_reason
     return {
         "enabled": config["enabled"],
         "mode": config["mode"],
@@ -115,7 +153,7 @@ def build_paper_update_scheduler_status(
         "max_trades": config["max_trades"],
         "max_writes": config["max_writes"],
         "next_run_at": compute_next_run_at(
-            enabled=config["enabled"],
+            enabled=config["enabled"] and not unsafe_config,
             interval_minutes=config["interval_minutes"],
             after_market_close_only=config["after_market_close_only"],
             now=now,
@@ -123,13 +161,20 @@ def build_paper_update_scheduler_status(
         "last_run_id": latest_run.get("run_id") if latest_run else None,
         "last_run_status": latest_run.get("status") if latest_run else None,
         **scheduled_fields,
-        "last_block_reason": scheduled_fields["last_block_reason"] or disabled_reason,
+        "last_block_reason": last_block_reason,
         "lock": lock_status,
         "scheduler_running": False,
         "automatic_updates_enabled": False,
-        "paper_only": True,
-        "live_trading": False,
-        "broker_orders": False,
+        "recurring_loop_enabled": False,
+        "blocked": unsafe_config,
+        "block_reason": unsafe_reasons[0] if unsafe_reasons else None,
+        "unsafe_config": unsafe_config,
+        "unsafe_reasons": unsafe_reasons,
+        "unsafe_warning": SCHEDULER_UNSAFE_CONFIG_WARNING if unsafe_config else None,
+        "emergency_warning": emergency_warning,
+        "paper_only": config["paper_mode"],
+        "live_trading": config["live_trading_enabled"],
+        "broker_orders": config["broker_orders"],
     }
 
 
@@ -147,22 +192,7 @@ async def can_run_paper_update_scheduler(
 
     if not config["enabled"]:
         reasons.append("SCHEDULER_DISABLED")
-    if config["mode"] != "dry_run_only":
-        reasons.append("SCHEDULER_MODE_NOT_DRY_RUN_ONLY")
-    if config["dry_run_only"] is not True:
-        reasons.append("SCHEDULER_DRY_RUN_ONLY_NOT_ENABLED")
-    if config["allow_real_writes"] is not False:
-        reasons.append("SCHEDULER_REAL_WRITES_NOT_ALLOWED")
-    if config["paper_mode"] is not True:
-        reasons.append("PAPER_MODE_REQUIRED")
-    if config["live_trading_enabled"] is not False:
-        reasons.append("LIVE_TRADING_ENABLED")
-    if config["broker_orders"] is not False:
-        reasons.append("BROKER_ORDERS_ENABLED")
-    if config["max_writes"] != MAX_SCHEDULER_WRITES:
-        reasons.append("MAX_WRITES_MUST_EQUAL_1")
-    if config["max_trades"] > MAX_SCHEDULER_TRADES:
-        reasons.append("MAX_TRADES_TOO_HIGH")
+    reasons.extend(scheduler_unsafe_reasons(config))
     if update_running:
         reasons.append("PAPER_UPDATE_ALREADY_RUNNING")
     if not market_time_rule_satisfied(

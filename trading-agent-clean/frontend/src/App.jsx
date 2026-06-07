@@ -457,20 +457,36 @@ function PaperUpdateSafety({
   const schedulerRunning = schedulerStatus?.scheduler_running;
   const autoEnabled = schedulerStatus?.automatic_updates_enabled;
   const approvalDryRun = normalizeDryRunForApproval(dryRunResult, progress, updateRuns);
+  const schedulerWarnings = [
+    schedulerStatus?.unsafe_warning,
+    schedulerStatus?.emergency_warning && schedulerStatus?.emergency_warning !== schedulerStatus?.unsafe_warning
+      ? schedulerStatus.emergency_warning
+      : null,
+  ].filter(Boolean);
+  const unsafeReasons = Array.isArray(schedulerStatus?.unsafe_reasons) ? schedulerStatus.unsafe_reasons : [];
   return <Card title="Paper Update Safety / Automation Status" eyebrow="read-only">
     <div className="safetyActions">
       <ActionButton onClick={onRunDryRun} disabled={actionDisabled || dryRunLoading}>{dryRunLoading ? "Running Paper Update Dry-Run..." : "Run Paper Update Dry-Run"}</ActionButton>
       <p className="muted">Dry-run only. It evaluates existing paper trades and must not write to MongoDB, place orders, run scans, scoring, market loading, pipeline generation, or TV confirmation.</p>
     </div>
+    {schedulerWarnings.length ? <div className="safetyWarningList">{schedulerWarnings.map((warning) => <div key={warning}>{warning}</div>)}</div> : null}
+    {unsafeReasons.length ? <div className="safetyWarningList">{unsafeReasons.map((reason) => <div key={reason}>Unsafe scheduler config: {reason}</div>)}</div> : null}
     <div className="safetyGrid">
       <SafetyMetric label="scheduler enabled" value={boolLabel(schedulerEnabled)} tone={boolTone(schedulerEnabled, true)} />
       <SafetyMetric label="scheduler_running" value={boolLabel(schedulerRunning)} tone={boolTone(schedulerRunning, true)} />
       <SafetyMetric label="automatic_updates_enabled" value={boolLabel(autoEnabled)} tone={boolTone(autoEnabled, true)} />
+      <SafetyMetric label="recurring_loop_enabled" value={boolLabel(schedulerStatus?.recurring_loop_enabled)} tone={boolTone(schedulerStatus?.recurring_loop_enabled, true)} />
       <SafetyMetric label="mode" value={schedulerStatus?.mode} tone="gray" />
+      <SafetyMetric label="dry_run_only" value={boolLabel(schedulerStatus?.dry_run_only)} tone={boolTone(schedulerStatus?.dry_run_only)} />
+      <SafetyMetric label="allow_real_writes" value={boolLabel(schedulerStatus?.allow_real_writes)} tone={boolTone(schedulerStatus?.allow_real_writes, true)} />
+      <SafetyMetric label="after_market_close_only" value={boolLabel(schedulerStatus?.after_market_close_only)} tone={boolTone(schedulerStatus?.after_market_close_only)} />
       <SafetyMetric label="dry_run_first" value={boolLabel(schedulerStatus?.dry_run_first)} tone={boolTone(schedulerStatus?.dry_run_first)} />
       <SafetyMetric label="max_trades" value={schedulerStatus?.max_trades} tone="yellow" />
       <SafetyMetric label="max_writes" value={schedulerStatus?.max_writes} tone={Number(schedulerStatus?.max_writes) <= 1 ? "green" : "yellow"} />
       <SafetyMetric label="next_run_at" value={schedulerStatus?.next_run_at || "disabled"} tone={schedulerStatus?.next_run_at ? "yellow" : "green"} />
+      <SafetyMetric label="last scheduled run ID" value={schedulerStatus?.last_scheduled_run_id || "-"} tone="gray" />
+      <SafetyMetric label="last scheduled status" value={schedulerStatus?.last_scheduled_run_status || "-"} tone={statusTone(schedulerStatus?.last_scheduled_run_status)} />
+      <SafetyMetric label="scheduler block reason" value={schedulerStatus?.block_reason || schedulerStatus?.last_block_reason || "-"} tone={schedulerStatus?.blocked ? "red" : schedulerStatus?.last_block_reason ? "yellow" : "green"} />
       <SafetyMetric label="latest run ID" value={schedulerStatus?.last_run_id || progress?.run_id || "-"} tone="gray" />
       <SafetyMetric label="latest run status" value={schedulerStatus?.last_run_status || progress?.status || "-"} tone={statusTone(schedulerStatus?.last_run_status || progress?.status)} />
       <SafetyMetric label="proposed_write_count" value={progress?.proposed_write_count ?? 0} tone={Number(progress?.proposed_write_count || 0) <= 1 ? "green" : "yellow"} />

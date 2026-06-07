@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+frontend/node_modules/
+frontend/dist/
+trading-agent-clean/frontend/node_modules/
+trading-agent-clean/frontend/dist/
+.cache/
+mongo_backups/
+*.log
+.env
+.env.*
+.DS_Store

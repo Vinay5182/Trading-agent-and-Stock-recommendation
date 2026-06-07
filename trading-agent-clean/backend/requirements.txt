@@ -1,0 +1,11 @@
+fastapi==0.136.3
+uvicorn==0.48.0
+motor==3.7.1
+pymongo==4.17.0
+pydantic==2.13.4
+requests==2.34.2
+websockets==16.0
+tzdata==2026.2
+yfinance==1.4.1
+pandas==3.0.3
+numpy==2.4.6

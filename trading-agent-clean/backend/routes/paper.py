@@ -328,7 +328,13 @@ async def get_paper_plans(
     return {"count": len(plans), "plans": plans}
 
 
-async def run_paper_trade_update(limit: int, timeframe: str, dry_run: bool, mode: str) -> dict:
+async def run_paper_trade_update(
+    limit: int,
+    timeframe: str,
+    dry_run: bool,
+    mode: str,
+    max_writes: int = 1,
+) -> dict:
     db = get_database()
     started = datetime.utcnow()
     PAPER_UPDATE_PROGRESS.update(
@@ -352,7 +358,11 @@ async def run_paper_trade_update(limit: int, timeframe: str, dry_run: bool, mode
     processed = 0
     updated_count = 0
     would_update_count = 0
+    successful_updates_count = 0
     errors = []
+    proposals = []
+    blocked = False
+    block_reason = None
     try:
         async for plan in cursor:
             symbol = plan.get("symbol")
@@ -370,6 +380,7 @@ async def run_paper_trade_update(limit: int, timeframe: str, dry_run: bool, mode
                         "proposed_reason": "TERMINAL_STATUS",
                         "updated": False,
                         "would_write": False,
+                        "write_attempted": False,
                         "reason": "TERMINAL_STATUS",
                     }
                 )
@@ -394,6 +405,7 @@ async def run_paper_trade_update(limit: int, timeframe: str, dry_run: bool, mode
                             "proposed_reason": "NO_CANDLES",
                             "updated": False,
                             "would_write": False,
+                            "write_attempted": False,
                             "reason": "NO_CANDLES",
                         }
                     )
@@ -401,52 +413,41 @@ async def run_paper_trade_update(limit: int, timeframe: str, dry_run: bool, mode
                 update = update_plan_status(plan, candles[-1])
                 would_write = bool(update)
                 would_update_count += 1 if would_write else 0
-                modified = 0
-                if not dry_run and would_write:
-                    try:
-                        result = await db.paper_trades.update_one({"_id": plan["_id"]}, {"$set": update})
-                        modified = result.modified_count
-                    except DuplicateKeyError:
-                        merged_status = update.get("status", plan.get("status"))
-                        identity = {
-                            "symbol": plan["symbol"],
-                            "timeframe": plan["timeframe"],
-                            "source_signal_type": plan["source_signal_type"],
-                            "paper_only": plan["paper_only"],
-                            "status": merged_status,
-                        }
-                        await db.paper_trades.update_one(identity, {"$set": update})
-                        await db.paper_trades.delete_one({"_id": plan["_id"]})
-                        modified = 1
-                    updated_count += modified
-                PAPER_UPDATE_PROGRESS["updated_count"] = updated_count
                 PAPER_UPDATE_PROGRESS["would_update_count"] = would_update_count
-                results.append(
-                    {
-                        **paper_trade_proposal_context(plan),
-                        "previous_status": plan.get("status"),
-                        "status": update.get("status", plan.get("status")),
-                        "previous_outcome_status": plan.get("outcome_status"),
-                        "outcome_status": update.get("outcome_status", plan.get("outcome_status")),
-                        "latest_candle_timestamp": candle_timestamp(candles[-1]),
-                        "proposed_new_status": update.get("status", plan.get("status")),
-                        "proposed_new_outcome_status": update.get("outcome_status", plan.get("outcome_status")),
-                        "proposed_pnl": update.get("paper_pnl", plan.get("paper_pnl", 0)),
-                        "proposed_reason": proposed_update_reason(plan, update),
-                        "updated": modified > 0,
-                        "would_write": would_write,
-                        "dry_run": dry_run,
-                        "latest_close": update.get("latest_close", candles[-1].get("close")),
-                        "latest_high": update.get("latest_high", candles[-1].get("high")),
-                        "latest_low": update.get("latest_low", candles[-1].get("low")),
-                        "exit_reason": update.get("exit_reason"),
-                        "paper_pnl": update.get("paper_pnl", plan.get("paper_pnl", 0)),
-                        "paper_pnl_percent": update.get("paper_pnl_percent", plan.get("paper_pnl_percent", 0)),
-                    }
-                )
+                proposal_result = {
+                    **paper_trade_proposal_context(plan),
+                    "previous_status": plan.get("status"),
+                    "status": update.get("status", plan.get("status")),
+                    "previous_outcome_status": plan.get("outcome_status"),
+                    "outcome_status": update.get("outcome_status", plan.get("outcome_status")),
+                    "latest_candle_timestamp": candle_timestamp(candles[-1]),
+                    "proposed_new_status": update.get("status", plan.get("status")),
+                    "proposed_new_outcome_status": update.get("outcome_status", plan.get("outcome_status")),
+                    "proposed_pnl": update.get("paper_pnl", plan.get("paper_pnl", 0)),
+                    "proposed_reason": proposed_update_reason(plan, update),
+                    "updated": False,
+                    "would_write": would_write,
+                    "write_attempted": False,
+                    "dry_run": dry_run,
+                    "latest_close": update.get("latest_close", candles[-1].get("close")),
+                    "latest_high": update.get("latest_high", candles[-1].get("high")),
+                    "latest_low": update.get("latest_low", candles[-1].get("low")),
+                    "exit_reason": update.get("exit_reason"),
+                    "paper_pnl": update.get("paper_pnl", plan.get("paper_pnl", 0)),
+                    "paper_pnl_percent": update.get("paper_pnl_percent", plan.get("paper_pnl_percent", 0)),
+                }
+                results.append(proposal_result)
+                if would_write:
+                    proposals.append((plan, update, proposal_result))
             except Exception as exc:
                 message = str(exc)
-                errors.append({"symbol": symbol, "tradingview_symbol": tradingview_symbol, "error": message})
+                error = {
+                    **paper_trade_proposal_context(plan),
+                    "error_message": message,
+                    "error_stage": "BEFORE_WRITE_ATTEMPT",
+                    "write_attempted": False,
+                }
+                errors.append(error)
                 PAPER_UPDATE_PROGRESS["errors"] = errors
                 results.append(
                     {
@@ -462,8 +463,61 @@ async def run_paper_trade_update(limit: int, timeframe: str, dry_run: bool, mode
                         "would_write": False,
                         "dry_run": dry_run,
                         "error": message,
+                        "error_message": message,
+                        "error_stage": "BEFORE_WRITE_ATTEMPT",
+                        "write_attempted": False,
                     }
                 )
+
+        blocked = would_update_count > max_writes
+        block_reason = "MAX_WRITES_EXCEEDED" if blocked else None
+        if not dry_run and not blocked:
+            for plan, update, proposal_result in proposals:
+                proposal_result["write_attempted"] = True
+                try:
+                    result = await db.paper_trades.update_one({"_id": plan["_id"]}, {"$set": update})
+                    modified = result.modified_count
+                    successful_updates_count += 1
+                except DuplicateKeyError:
+                    try:
+                        merged_status = update.get("status", plan.get("status"))
+                        identity = {
+                            "symbol": plan["symbol"],
+                            "timeframe": plan["timeframe"],
+                            "source_signal_type": plan["source_signal_type"],
+                            "paper_only": plan["paper_only"],
+                            "status": merged_status,
+                        }
+                        await db.paper_trades.update_one(identity, {"$set": update})
+                        await db.paper_trades.delete_one({"_id": plan["_id"]})
+                        modified = 1
+                        successful_updates_count += 1
+                    except Exception as exc:
+                        modified = 0
+                        message = str(exc)
+                        error = {
+                            **paper_trade_proposal_context(plan),
+                            "error_message": message,
+                            "error_stage": "AFTER_WRITE_ATTEMPT",
+                            "write_attempted": True,
+                        }
+                        errors.append(error)
+                        proposal_result.update({"error": message, **error})
+                except Exception as exc:
+                    modified = 0
+                    message = str(exc)
+                    error = {
+                        **paper_trade_proposal_context(plan),
+                        "error_message": message,
+                        "error_stage": "AFTER_WRITE_ATTEMPT",
+                        "write_attempted": True,
+                    }
+                    errors.append(error)
+                    proposal_result.update({"error": message, **error})
+                updated_count += modified
+                proposal_result["updated"] = modified > 0
+        for result in results:
+            result["write_blocked"] = bool(blocked and result.get("would_write"))
     finally:
         PAPER_UPDATE_PROGRESS.update(
             {
@@ -483,11 +537,18 @@ async def run_paper_trade_update(limit: int, timeframe: str, dry_run: bool, mode
         "broker_orders": False,
         "timeframe": timeframe,
         "limit": limit,
+        "max_trades": limit,
+        "max_writes": max_writes,
         "dry_run": dry_run,
-        "mongo_writes_enabled": not dry_run,
+        "mongo_writes_enabled": not dry_run and not blocked,
         "processed": processed,
+        "proposed_write_count": would_update_count,
         "updated_count": updated_count,
         "would_update_count": would_update_count,
+        "successful_updates_count": successful_updates_count,
+        "errors_count": len(errors),
+        "blocked": blocked,
+        "block_reason": block_reason,
         "errors": errors,
         "results": results,
         "started_at": started.isoformat(),
@@ -498,10 +559,13 @@ async def run_paper_trade_update(limit: int, timeframe: str, dry_run: bool, mode
 @router.post("/update-plans")
 async def update_paper_plans(
     limit: int = Query(default=10, ge=1, le=100),
+    max_trades: int | None = Query(default=None, ge=1, le=100),
     timeframe: str = Query(default="1D"),
     dry_run: bool = Query(default=False),
+    max_writes: int = Query(default=1, ge=0, le=100),
 ) -> dict:
-    return await run_paper_trade_update(limit, timeframe, dry_run, "update-plans")
+    effective_limit = max_trades or limit
+    return await run_paper_trade_update(effective_limit, timeframe, dry_run, "update-plans", max_writes)
 
 
 @router.post("/update-trades")
@@ -510,9 +574,10 @@ async def update_paper_trades(
     limit: int | None = Query(default=None, ge=1, le=100),
     timeframe: str = Query(default="1D"),
     dry_run: bool = Query(default=True),
+    max_writes: int = Query(default=1, ge=0, le=100),
 ) -> dict:
     effective_limit = max_trades or limit or 10
-    return await run_paper_trade_update(effective_limit, timeframe, dry_run, "update-trades")
+    return await run_paper_trade_update(effective_limit, timeframe, dry_run, "update-trades", max_writes)
 
 
 @router.get("/update-progress")

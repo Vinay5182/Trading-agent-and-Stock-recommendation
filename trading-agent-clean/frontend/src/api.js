@@ -33,6 +33,7 @@ export const getAiFeatureDatasetSummary = ({ strategyType, timeframe } = {}) => 
   const query = params.toString();
   return request(`/api/ai/features/summary${query ? `?${query}` : ""}`);
 };
+export const getAiDataCollectionStatus = () => request("/api/ai/features/collection-status");
 export const getAiFeatureSnapshots = (limit = 50) => request(`/api/ai/features/snapshots?limit=${encodeURIComponent(limit)}`);
 export const getAiOutcomePreview = (limit = 50) => request(`/api/ai/features/outcome-preview?limit=${encodeURIComponent(limit)}`);
 export const runScan = () => request("/api/scan", {

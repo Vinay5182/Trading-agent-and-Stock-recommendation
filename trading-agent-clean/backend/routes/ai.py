@@ -31,6 +31,8 @@ TRAINING_RESULT_LABELS = ("WIN", "LOSS", "BREAKEVEN")
 MINIMUM_LABELS_FOR_TRAINING = 100
 UNLINKED_SNAPSHOT_WARNING = "Unlinked snapshots cannot receive paper outcomes later."
 SNAPSHOT_SOURCES = ("scored_candidates", "paper_trades", "paper_trades_backfill")
+WAITING_PAPER_TRADE_STATUSES = {"NOT_TRIGGERED", "PLANNED"}
+OPEN_PAPER_TRADE_STATUSES = {"ACTIVE", "TARGET_1_HIT"}
 SNAPSHOT_DISPLAY_FIELDS = (
     "symbol",
     "strategy_type",
@@ -538,6 +540,26 @@ def _display_timestamp(value: Any) -> str | None:
     return str(value) if value not in (None, "") else None
 
 
+def _paper_trade_statuses(trade: dict) -> set[str]:
+    return {
+        str(value).strip().upper()
+        for value in (trade.get("status"), trade.get("outcome_status"))
+        if value not in (None, "")
+    }
+
+
+def _is_waiting_paper_trade(trade: dict) -> bool:
+    statuses = _paper_trade_statuses(trade)
+    if statuses & (OPEN_PAPER_TRADE_STATUSES | CLOSED_TRADE_STATUSES):
+        return False
+    return bool(statuses & WAITING_PAPER_TRADE_STATUSES) or trade.get("entry_triggered") is False
+
+
+def _is_open_paper_trade(trade: dict) -> bool:
+    statuses = _paper_trade_statuses(trade)
+    return bool(statuses & OPEN_PAPER_TRADE_STATUSES) and not bool(statuses & CLOSED_TRADE_STATUSES)
+
+
 @router.get("/features/summary")
 async def get_ai_feature_dataset_summary(
     strategy_type: str | None = Query(default=None),
@@ -618,6 +640,80 @@ async def get_ai_feature_dataset_summary(
         "average_risk_reward": _average(rows, "risk_reward"),
         "latest_snapshot_time": max(snapshot_times) if snapshot_times else None,
         "earliest_snapshot_time": min(snapshot_times) if snapshot_times else None,
+    }
+
+
+@router.get("/features/collection-status")
+async def get_ai_data_collection_status() -> dict:
+    db = get_database()
+    paper_trades = [row async for row in db.paper_trades.find({"paper_only": True})]
+    snapshots = [row async for row in db.ai_feature_snapshots.find({"paper_only": True})]
+    paper_trades_by_id = {
+        str(trade["_id"]): trade
+        for trade in paper_trades
+        if trade.get("_id") not in (None, "")
+    }
+    represented_trade_ids = {
+        str(snapshot["paper_trade_id"])
+        for snapshot in snapshots
+        if snapshot.get("paper_trade_id") not in (None, "")
+    }
+    terminal_trades = [trade for trade in paper_trades if is_closed_paper_trade(trade)]
+    terminal_without_snapshot = [
+        trade
+        for trade in terminal_trades
+        if str(trade.get("_id")) not in represented_trade_ids
+    ]
+    labeled_count = sum(snapshot.get("result_label") not in (None, "") for snapshot in snapshots)
+    result_label_counts = {
+        label: sum(str(snapshot.get("result_label") or "").strip().upper() == label for snapshot in snapshots)
+        for label in TRAINING_RESULT_LABELS
+    }
+    training_label_classes = sum(count > 0 for count in result_label_counts.values())
+    missing_source_mode_count = _missing_count(snapshots, "source_mode")
+    missing_data_completeness_count = _missing_count(snapshots, "data_completeness")
+    leakage_failure_count = sum(
+        snapshot.get("result_label") in (None, "") and not initial_snapshot_has_no_leakage(snapshot)
+        for snapshot in snapshots
+    )
+    readiness_reason = []
+    if labeled_count < MINIMUM_LABELS_FOR_TRAINING:
+        readiness_reason.append(f"labeled_count must be at least {MINIMUM_LABELS_FOR_TRAINING}")
+    if training_label_classes < 2:
+        readiness_reason.append("at least two training label classes are required")
+    if missing_source_mode_count or missing_data_completeness_count:
+        readiness_reason.append("source_mode and data_completeness metadata must be complete")
+    if leakage_failure_count:
+        readiness_reason.append("unlabeled snapshot leakage checks must pass")
+    outcome_attach_eligible_count = sum(
+        snapshot_has_no_attached_outcome(snapshot)
+        and is_closed_paper_trade(paper_trades_by_id.get(str(snapshot.get("paper_trade_id"))))
+        for snapshot in snapshots
+    )
+
+    return {
+        "paper_only": True,
+        "read_only": True,
+        "mongo_writes_enabled": False,
+        "total_paper_trades": len(paper_trades),
+        "waiting_paper_trades": sum(_is_waiting_paper_trade(trade) for trade in paper_trades),
+        "open_paper_trades": sum(_is_open_paper_trade(trade) for trade in paper_trades),
+        "terminal_paper_trades": len(terminal_trades),
+        "terminal_trades_without_ai_snapshot_count": len(terminal_without_snapshot),
+        "terminal_trades_without_ai_snapshot_symbols": sorted(
+            str(trade.get("symbol"))
+            for trade in terminal_without_snapshot
+            if trade.get("symbol") not in (None, "")
+        ),
+        "total_ai_snapshots": len(snapshots),
+        "labeled_ai_snapshots": labeled_count,
+        "unlabeled_ai_snapshots": len(snapshots) - labeled_count,
+        "outcome_attach_eligible_count": outcome_attach_eligible_count,
+        "minimum_labels_for_training": MINIMUM_LABELS_FOR_TRAINING,
+        "labels_remaining_before_training": max(MINIMUM_LABELS_FOR_TRAINING - labeled_count, 0),
+        "ready_for_model_training": not readiness_reason,
+        "ai_model_training_blocked": bool(readiness_reason),
+        "readiness_reason": readiness_reason,
     }
 
 

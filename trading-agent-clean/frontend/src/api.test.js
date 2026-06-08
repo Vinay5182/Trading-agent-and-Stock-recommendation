@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-import { approvePaperUpdateFromDryRun, getAiFeatureDatasetSummary, getAiFeatureSnapshots, getAiOutcomePreview } from "./api.js";
+import { approvePaperUpdateFromDryRun, getAiDataCollectionStatus, getAiFeatureDatasetSummary, getAiFeatureSnapshots, getAiOutcomePreview } from "./api.js";
 import { aiDataCollectionChecklist, aiOutcomeSkippedRows, aiSnapshotDisplayRows } from "./aiDataset.js";
 
 const CONFIRMATION_TEXT = "I understand this will write to paper_trades only and will not place broker orders";
@@ -143,6 +143,31 @@ test("getAiOutcomePreview parses the read-only dry-run preview", async (t) => {
   assert.deepEqual(await getAiOutcomePreview(50), payload);
 });
 
+test("getAiDataCollectionStatus parses the read-only paper data report", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const payload = {
+    read_only: true,
+    mongo_writes_enabled: false,
+    total_paper_trades: 6,
+    terminal_trades_without_ai_snapshot_count: 0,
+    labeled_ai_snapshots: 1,
+    unlabeled_ai_snapshots: 4,
+    outcome_attach_eligible_count: 0,
+    labels_remaining_before_training: 99,
+    ai_model_training_blocked: true,
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = async (url, options = {}) => {
+    assert.equal(url, "http://127.0.0.1:8011/api/ai/features/collection-status");
+    assert.equal(options.method, undefined);
+    return { ok: true, status: 200, text: async () => JSON.stringify(payload) };
+  };
+
+  assert.deepEqual(await getAiDataCollectionStatus(), payload);
+});
+
 test("outcome preview rows render ATHERENERG labeled and four open skips", () => {
   const rows = aiOutcomeSkippedRows([
     { symbol: "ATHERENERG", reason: "already_labeled", result_label: "LOSS" },
@@ -260,6 +285,16 @@ test("dashboard renders the read-only AI data collection checklist and not-ready
   assert.ok(summarySource.includes("This is dataset tracking only, not trade advice."));
 });
 
+test("dashboard renders the read-only paper data collection status report", () => {
+  const summarySource = aiDatasetSummarySource();
+
+  assert.ok(summarySource.includes("Paper Data Collection Status"));
+  assert.ok(summarySource.includes("Terminal Missing AI Snapshot"));
+  assert.ok(summarySource.includes("Outcome Attach Eligible"));
+  assert.ok(summarySource.includes("Labels Remaining Before Training"));
+  assert.ok(summarySource.includes("AI model training is still blocked."));
+});
+
 test("AI dataset dashboard remains read-only without training or prediction actions", () => {
   const summarySource = aiDatasetSummarySource();
 
@@ -268,6 +303,7 @@ test("AI dataset dashboard remains read-only without training or prediction acti
   assert.ok(summarySource.includes("AI Feature Snapshots"));
   assert.ok(summarySource.includes("Outcome Attach Preview"));
   assert.ok(summarySource.includes("AI Data Collection Checklist"));
+  assert.ok(summarySource.includes("Paper Data Collection Status"));
   assert.ok(summarySource.includes("This is a dry-run preview only. It does not attach labels or modify MongoDB."));
   assert.equal(/<ActionButton[^>]*>\s*(Train|Predict|Prediction|Recommend)/i.test(summarySource), false);
   assert.equal(/<ActionButton[^>]*>\s*(Attach|Write|Save|Collect)/i.test(summarySource), false);

@@ -333,6 +333,8 @@ td { color: #defce8; }
   font-weight: 800;
   margin-top: 10px;
 }
+.aiSnapshotTable { margin-top: 14px; }
+.aiSnapshotTable .datasetTrackingReminder { margin: 0 0 12px; }
 .tvControlGrid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));

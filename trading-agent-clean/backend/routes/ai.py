@@ -31,6 +31,19 @@ TRAINING_RESULT_LABELS = ("WIN", "LOSS", "BREAKEVEN")
 MINIMUM_LABELS_FOR_TRAINING = 100
 UNLINKED_SNAPSHOT_WARNING = "Unlinked snapshots cannot receive paper outcomes later."
 SNAPSHOT_SOURCES = ("scored_candidates", "paper_trades", "paper_trades_backfill")
+SNAPSHOT_DISPLAY_FIELDS = (
+    "symbol",
+    "strategy_type",
+    "timeframe",
+    "source_mode",
+    "data_completeness",
+    "paper_trade_id",
+    "result_label",
+    "outcome_status",
+    "created_at",
+    "snapshot_time",
+    "outcome_attached_at",
+)
 
 
 def normalize_strategy_type(strategy_type: str) -> str:
@@ -450,6 +463,10 @@ def _missing_count(rows: list[dict], field: str) -> int:
     return sum(row.get(field) in (None, "") for row in rows)
 
 
+def _display_timestamp(value: Any) -> str | None:
+    return str(value) if value not in (None, "") else None
+
+
 @router.get("/features/summary")
 async def get_ai_feature_dataset_summary(
     strategy_type: str | None = Query(default=None),
@@ -530,6 +547,55 @@ async def get_ai_feature_dataset_summary(
         "average_risk_reward": _average(rows, "risk_reward"),
         "latest_snapshot_time": max(snapshot_times) if snapshot_times else None,
         "earliest_snapshot_time": min(snapshot_times) if snapshot_times else None,
+    }
+
+
+@router.get("/features/snapshots")
+async def get_ai_feature_snapshots(
+    limit: int = Query(default=50, ge=1, le=500),
+) -> dict:
+    db = get_database()
+    projection = {"_id": 0, **{field: 1 for field in SNAPSHOT_DISPLAY_FIELDS}}
+    cursor = db.ai_feature_snapshots.find({"paper_only": True}, projection).sort("snapshot_time", -1).limit(limit)
+    snapshots = [row async for row in cursor]
+    rows = []
+
+    for snapshot in snapshots:
+        paper_trade_id = snapshot.get("paper_trade_id")
+        paper_trade = (
+            await _find_linked_paper_trade(db.paper_trades, paper_trade_id)
+            if paper_trade_id not in (None, "")
+            else None
+        )
+        result_label = snapshot.get("result_label")
+        rows.append(
+            {
+                "symbol": snapshot.get("symbol"),
+                "strategy_type": snapshot.get("strategy_type"),
+                "timeframe": snapshot.get("timeframe"),
+                "source_mode": snapshot.get("source_mode"),
+                "data_completeness": snapshot.get("data_completeness"),
+                "paper_trade_id_present": paper_trade_id not in (None, ""),
+                "linked_paper_trade_status": (
+                    paper_trade.get("status") or paper_trade.get("outcome_status")
+                    if paper_trade
+                    else None
+                ),
+                "result_label": result_label,
+                "outcome_status": snapshot.get("outcome_status"),
+                "label_status": "labeled" if result_label not in (None, "") else "unlabeled",
+                "created_at": _display_timestamp(snapshot.get("created_at") or snapshot.get("snapshot_time")),
+                "outcome_attached_at": _display_timestamp(snapshot.get("outcome_attached_at")),
+            }
+        )
+
+    return {
+        "paper_only": True,
+        "read_only": True,
+        "mongo_writes_enabled": False,
+        "limit": limit,
+        "count": len(rows),
+        "rows": rows,
     }
 
 

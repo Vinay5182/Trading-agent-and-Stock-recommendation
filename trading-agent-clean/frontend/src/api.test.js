@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-import { approvePaperUpdateFromDryRun, getAiFeatureDatasetSummary } from "./api.js";
+import { approvePaperUpdateFromDryRun, getAiFeatureDatasetSummary, getAiFeatureSnapshots } from "./api.js";
+import { aiSnapshotDisplayRows } from "./aiDataset.js";
 
 const CONFIRMATION_TEXT = "I understand this will write to paper_trades only and will not place broker orders";
 
@@ -95,6 +96,68 @@ test("getAiFeatureDatasetSummary uses the read-only summary endpoint and optiona
   assert.equal(calls[1].options.method, undefined);
 });
 
+test("getAiFeatureSnapshots parses the read-only snapshot table", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const payload = {
+    read_only: true,
+    mongo_writes_enabled: false,
+    rows: [
+      {
+        symbol: "ATHERENERG",
+        result_label: "LOSS",
+        linked_paper_trade_status: "SL_HIT",
+      },
+    ],
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = async (url, options = {}) => {
+    assert.equal(url, "http://127.0.0.1:8011/api/ai/features/snapshots?limit=50");
+    assert.equal(options.method, undefined);
+    return { ok: true, status: 200, text: async () => JSON.stringify(payload) };
+  };
+
+  assert.deepEqual(await getAiFeatureSnapshots(50), payload);
+});
+
+test("AI snapshot display rows render labeled and unlabeled linked trades", () => {
+  const rows = aiSnapshotDisplayRows([
+    {
+      symbol: "ATHERENERG",
+      strategy_type: "swing",
+      timeframe: "1D",
+      source_mode: "paper_trades_backfill",
+      data_completeness: "minimal",
+      result_label: "LOSS",
+      linked_paper_trade_status: "SL_HIT",
+      outcome_attached_at: "2026-01-05T15:30:00",
+    },
+    {
+      symbol: "IGIL",
+      strategy_type: "momentum",
+      timeframe: "1D",
+      result_label: null,
+      linked_paper_trade_status: "NOT_TRIGGERED",
+      outcome_attached_at: null,
+    },
+  ]);
+
+  assert.deepEqual(rows[0], {
+    Symbol: "ATHERENERG",
+    Strategy: "swing / 1D",
+    Source: "paper_trades_backfill",
+    Completeness: "minimal",
+    Label: "LOSS",
+    "Trade status": "SL_HIT",
+    "Outcome attached?": "yes",
+  });
+  assert.equal(rows[1].Symbol, "IGIL");
+  assert.equal(rows[1].Label, "unlabeled");
+  assert.equal(rows[1]["Trade status"], "NOT_TRIGGERED");
+  assert.equal(rows[1]["Outcome attached?"], "no");
+});
+
 const aiDatasetSummarySource = () => {
   const source = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
   const summaryStart = source.indexOf("function AiDatasetSummary");
@@ -126,5 +189,7 @@ test("AI dataset dashboard remains read-only without training or prediction acti
   const summarySource = aiDatasetSummarySource();
 
   assert.ok(summarySource.includes("This dashboard is for dataset tracking only. It does not generate predictions or trade recommendations."));
+  assert.ok(summarySource.includes("This table is for dataset tracking only. It does not generate predictions or trade recommendations."));
+  assert.ok(summarySource.includes("AI Feature Snapshots"));
   assert.equal(/<ActionButton[^>]*>\s*(Train|Predict|Prediction|Recommend)/i.test(summarySource), false);
 });

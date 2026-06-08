@@ -6,7 +6,7 @@ import {
   getSwingPrecheck, getSwingSummary, getSwingTvConfirmed, momentumTvConfirm, loadAllMarketData, runPaperPipeline, runScan, runScoring,
   runPaperUpdateDryRun, swingTvConfirm, testTvSymbol, updatePaperPlans,
 } from "./api";
-import { aiOutcomeEligibleRows, aiOutcomeSkippedRows, aiSnapshotDisplayRows } from "./aiDataset";
+import { aiDataCollectionChecklist, aiOutcomeEligibleRows, aiOutcomeSkippedRows, aiSnapshotDisplayRows } from "./aiDataset";
 import { canApprovePaperRealUpdate } from "./paperRealUpdateApproval";
 
 const NAV_ITEMS = [
@@ -535,6 +535,7 @@ const summaryBreakdownRows = (values = {}) => Object.entries(values || {}).map((
 function AiDatasetSummary({ summary, snapshots, outcomePreview, filters, onFiltersChange, onRefresh, loading }) {
   const readyForModelTraining = summary?.ready_for_model_training === true;
   const readinessReasons = Array.isArray(summary?.readiness_reason) ? summary.readiness_reason : [];
+  const checklist = aiDataCollectionChecklist(summary, outcomePreview);
   return <Card title="AI Dataset Summary" eyebrow="read-only dataset tracking">
     <div className="warningText">{readyForModelTraining ? "Dataset readiness checks passed. No AI model is running." : "AI model training is not ready yet."}</div>
     {readinessReasons.length ? <ul className="readinessReasonList">{readinessReasons.map((reason) => <li key={reason}>{reason}</li>)}</ul> : null}
@@ -569,6 +570,27 @@ function AiDatasetSummary({ summary, snapshots, outcomePreview, filters, onFilte
       <Card title="By Source Mode"><MiniTable rows={summaryBreakdownRows(summary?.source_mode_distribution)} columns={["label", "count"]} /></Card>
       <Card title="By Data Completeness"><MiniTable rows={summaryBreakdownRows(summary?.data_completeness_distribution)} columns={["label", "count"]} /></Card>
     </div>
+    <Card title="AI Data Collection Checklist" eyebrow="read-only readiness checklist">
+      <div className="warningText">{checklist.readyForModelTraining ? "Dataset readiness checks passed. Keep reviewing data quality." : "Keep collecting paper trades."}</div>
+      <ul className="readinessReasonList">
+        <li>Attach outcomes only after trades are closed.</li>
+        <li>Do not train a model until readiness becomes true.</li>
+        <li>This is dataset tracking only, not trade advice.</li>
+      </ul>
+      <div className="statsGrid compact aiDatasetBreakdowns">
+        <StatCard label="Minimum Labels Needed" value={checklist.minimumLabels} />
+        <StatCard label="Current Labeled Count" value={checklist.labeledCount} />
+        <StatCard label="Labels Remaining" value={checklist.labelsRemaining} tone="yellow" />
+        <StatCard label="At Least Two Label Classes" value={checklist.hasTwoLabelClasses ? "YES" : "NO"} tone={checklist.hasTwoLabelClasses ? "green" : "yellow"} />
+        <StatCard label="Win Count" value={checklist.winCount} />
+        <StatCard label="Loss Count" value={checklist.lossCount} tone="yellow" />
+        <StatCard label="Breakeven Count" value={checklist.breakevenCount} />
+        <StatCard label="Unlabeled / Open Snapshots" value={checklist.unlabeledCount} tone="yellow" />
+        <StatCard label="Outcome Preview Eligible" value={checklist.eligibleAttachCount} />
+        <StatCard label="Missing Metadata Count" value={checklist.missingMetadataCount} tone="yellow" />
+        <StatCard label="Ready for Model Training" value={checklist.readyForModelTraining ? "YES" : "NO"} tone={checklist.readyForModelTraining ? "green" : "yellow"} />
+      </div>
+    </Card>
     <Card title="AI Feature Snapshots" eyebrow="read-only snapshot table" className="aiSnapshotTable">
       <div className="datasetTrackingReminder">This table is for dataset tracking only. It does not generate predictions or trade recommendations.</div>
       <MiniTable rows={aiSnapshotDisplayRows(snapshots)} columns={["Symbol", "Strategy", "Source", "Completeness", "Label", "Trade status", "Outcome attached?"]} />

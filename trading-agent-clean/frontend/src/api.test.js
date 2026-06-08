@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 import { approvePaperUpdateFromDryRun, getAiFeatureDatasetSummary, getAiFeatureSnapshots, getAiOutcomePreview } from "./api.js";
-import { aiOutcomeSkippedRows, aiSnapshotDisplayRows } from "./aiDataset.js";
+import { aiDataCollectionChecklist, aiOutcomeSkippedRows, aiSnapshotDisplayRows } from "./aiDataset.js";
 
 const CONFIRMATION_TEXT = "I understand this will write to paper_trades only and will not place broker orders";
 
@@ -199,6 +199,28 @@ test("AI snapshot display rows render labeled and unlabeled linked trades", () =
   assert.equal(rows[1]["Outcome attached?"], "no");
 });
 
+test("AI data collection checklist calculates labels remaining and readiness inputs", () => {
+  const checklist = aiDataCollectionChecklist({
+    minimum_labels_for_training: 100,
+    labeled_count: 1,
+    unlabeled_count: 4,
+    win_count: 0,
+    loss_count: 1,
+    breakeven_count: 0,
+    missing_source_mode_count: 4,
+    missing_data_completeness_count: 4,
+    ready_for_model_training: false,
+  }, {
+    eligible_attach_count: 0,
+  });
+
+  assert.equal(checklist.labelsRemaining, 99);
+  assert.equal(checklist.hasTwoLabelClasses, false);
+  assert.equal(checklist.unlabeledCount, 4);
+  assert.equal(checklist.missingMetadataCount, 8);
+  assert.equal(checklist.readyForModelTraining, false);
+});
+
 const aiDatasetSummarySource = () => {
   const source = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
   const summaryStart = source.indexOf("function AiDatasetSummary");
@@ -226,6 +248,18 @@ test("dashboard renders readiness reasons and missing metadata counts", () => {
   assert.ok(summarySource.includes("data_completeness_distribution"));
 });
 
+test("dashboard renders the read-only AI data collection checklist and not-ready messages", () => {
+  const summarySource = aiDatasetSummarySource();
+
+  assert.ok(summarySource.includes("AI Data Collection Checklist"));
+  assert.ok(summarySource.includes("Labels Remaining"));
+  assert.ok(summarySource.includes("At Least Two Label Classes"));
+  assert.ok(summarySource.includes("Keep collecting paper trades."));
+  assert.ok(summarySource.includes("Attach outcomes only after trades are closed."));
+  assert.ok(summarySource.includes("Do not train a model until readiness becomes true."));
+  assert.ok(summarySource.includes("This is dataset tracking only, not trade advice."));
+});
+
 test("AI dataset dashboard remains read-only without training or prediction actions", () => {
   const summarySource = aiDatasetSummarySource();
 
@@ -233,7 +267,8 @@ test("AI dataset dashboard remains read-only without training or prediction acti
   assert.ok(summarySource.includes("This table is for dataset tracking only. It does not generate predictions or trade recommendations."));
   assert.ok(summarySource.includes("AI Feature Snapshots"));
   assert.ok(summarySource.includes("Outcome Attach Preview"));
+  assert.ok(summarySource.includes("AI Data Collection Checklist"));
   assert.ok(summarySource.includes("This is a dry-run preview only. It does not attach labels or modify MongoDB."));
   assert.equal(/<ActionButton[^>]*>\s*(Train|Predict|Prediction|Recommend)/i.test(summarySource), false);
-  assert.equal(/<ActionButton[^>]*>\s*(Attach|Write|Save Label)/i.test(summarySource), false);
+  assert.equal(/<ActionButton[^>]*>\s*(Attach|Write|Save|Collect)/i.test(summarySource), false);
 });

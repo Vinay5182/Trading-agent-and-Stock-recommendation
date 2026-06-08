@@ -7,6 +7,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ai.features import (
+    ATTACHED_OUTCOME_FIELDS,
     OUTCOME_FIELDS,
     ai_feature_snapshot_identity,
     attach_closed_paper_trade_outcome,
@@ -145,6 +146,7 @@ def test_build_ai_feature_snapshot_from_fake_documents() -> None:
         "scan_run_id": "scan-1",
     }
     assert all(snapshot[field] is None for field in OUTCOME_FIELDS)
+    assert all(field not in snapshot for field in ATTACHED_OUTCOME_FIELDS if field not in OUTCOME_FIELDS)
 
 
 def test_initial_snapshot_does_not_leak_closed_trade_outcome() -> None:
@@ -218,9 +220,41 @@ def test_paper_outcome_attaches_only_after_trade_closes() -> None:
 
     assert all(snapshot[field] is None for field in OUTCOME_FIELDS)
     assert updated["outcome_status"] == "TARGET_2_HIT"
+    assert updated["final_status"] == "TARGET_2_HIT"
+    assert updated["paper_pnl"] == 300
+    assert updated["paper_pnl_percent"] == 24
+    assert updated["exit_price"] == 156
+    assert updated["exit_time"] == "2026-01-05T15:30:00"
+    assert updated["result_label"] == "WIN"
+    assert updated["outcome_attached_at"]
     assert updated["outcome_label"] == "WIN"
     assert updated["outcome_pnl"] == 300
     assert updated["outcome_pnl_percent"] == 24
     assert updated["outcome_exit_price"] == 156
     assert updated["outcome_exit_reason"] == "TARGET_2_HIT"
     assert updated["outcome_closed_at"] == "2026-01-05T15:30:00"
+
+
+@pytest.mark.parametrize(
+    ("status", "paper_pnl", "expected"),
+    [
+        ("TARGET_2_HIT", 0.0, "WIN"),
+        ("STOPPED", 0.0, "LOSS"),
+        ("CLOSED", 0.0, "BREAKEVEN"),
+        ("AMBIGUOUS", 300.0, "UNKNOWN"),
+    ],
+)
+def test_closed_paper_outcome_result_labels(status: str, paper_pnl: float, expected: str) -> None:
+    snapshot = build_ai_feature_snapshot(
+        fake_scored_candidate(),
+        fake_market_data(),
+        fake_tv_confirmation(),
+        fake_paper_signal(),
+        fake_paper_trade("ACTIVE"),
+    )
+    trade = fake_paper_trade(status)
+    trade["paper_pnl"] = paper_pnl
+
+    updated = attach_closed_paper_trade_outcome(snapshot, trade)
+
+    assert updated["result_label"] == expected

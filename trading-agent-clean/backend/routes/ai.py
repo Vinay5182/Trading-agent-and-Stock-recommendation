@@ -1,12 +1,18 @@
 from typing import Any
 
+from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Query
 from pymongo.errors import DuplicateKeyError
 
 from ai.features import (
+    ATTACHED_OUTCOME_FIELDS,
+    OUTCOME_FIELDS,
     ai_feature_snapshot_identity,
+    build_closed_paper_trade_outcome,
     build_ai_feature_snapshot,
     initial_snapshot_has_no_leakage,
+    is_closed_paper_trade,
+    snapshot_has_no_attached_outcome,
     utc_now_iso,
 )
 from database import get_database
@@ -165,6 +171,33 @@ async def _is_duplicate_snapshot(collection, snapshot: dict) -> bool:
     return existing is not None
 
 
+async def _find_linked_paper_trade(collection, paper_trade_id: Any) -> dict | None:
+    values = [paper_trade_id]
+    if ObjectId.is_valid(str(paper_trade_id)):
+        values.insert(0, ObjectId(str(paper_trade_id)))
+    for value in values:
+        trade = await collection.find_one({"_id": value, "paper_only": True})
+        if trade is not None:
+            return trade
+    return None
+
+
+def _serialize_id(value: Any) -> str | None:
+    return str(value) if value is not None else None
+
+
+def _outcome_update_guard(snapshot: dict) -> dict:
+    return {
+        "_id": snapshot.get("_id"),
+        "paper_only": True,
+        "paper_trade_id": snapshot.get("paper_trade_id"),
+        **{
+            field: {"$in": [None, ""]}
+            for field in set(OUTCOME_FIELDS) | set(ATTACHED_OUTCOME_FIELDS)
+        },
+    }
+
+
 @router.get("/features/preview")
 async def preview_ai_feature_snapshots(
     strategy_type: str = Query(default="momentum"),
@@ -246,4 +279,82 @@ async def save_ai_feature_snapshots(
         "saved_count": len(saved_rows),
         "duplicate_count": duplicate_count,
         "rows": saved_rows,
+    }
+
+
+@router.post("/features/attach-outcomes")
+async def attach_ai_feature_snapshot_outcomes(
+    dry_run: bool = Query(default=True),
+    limit: int = Query(default=50, ge=1, le=500),
+) -> dict:
+    db = get_database()
+    snapshot_collection = db.ai_feature_snapshots
+    cursor = snapshot_collection.find({"paper_only": True}).sort("snapshot_time", -1).limit(limit)
+    snapshots = [row async for row in cursor]
+    skipped = {
+        "missing_snapshot_id": 0,
+        "missing_paper_trade_id": 0,
+        "missing_paper_trade": 0,
+        "open_paper_trade": 0,
+        "already_labeled": 0,
+        "write_conflict": 0,
+    }
+    proposals = []
+    outcome_time = utc_now_iso()
+
+    for snapshot in snapshots:
+        if snapshot.get("_id") is None:
+            skipped["missing_snapshot_id"] += 1
+            continue
+        paper_trade_id = snapshot.get("paper_trade_id")
+        if paper_trade_id in (None, ""):
+            skipped["missing_paper_trade_id"] += 1
+            continue
+        if not snapshot_has_no_attached_outcome(snapshot):
+            skipped["already_labeled"] += 1
+            continue
+        paper_trade = await _find_linked_paper_trade(db.paper_trades, paper_trade_id)
+        if paper_trade is None:
+            skipped["missing_paper_trade"] += 1
+            continue
+        if not is_closed_paper_trade(paper_trade):
+            skipped["open_paper_trade"] += 1
+            continue
+        proposals.append(
+            {
+                "snapshot_id": _serialize_id(snapshot.get("_id")),
+                "paper_trade_id": _serialize_id(paper_trade_id),
+                "symbol": snapshot.get("symbol"),
+                "outcome": build_closed_paper_trade_outcome(paper_trade, outcome_time=outcome_time),
+                "_snapshot": snapshot,
+            }
+        )
+
+    attached_rows = []
+    if not dry_run:
+        for proposal in proposals:
+            result = await snapshot_collection.update_one(
+                _outcome_update_guard(proposal["_snapshot"]),
+                {"$set": proposal["outcome"]},
+                upsert=False,
+            )
+            if getattr(result, "modified_count", 0) == 1:
+                attached_rows.append({key: value for key, value in proposal.items() if key != "_snapshot"})
+            else:
+                skipped["write_conflict"] += 1
+
+    rows = (
+        [{key: value for key, value in proposal.items() if key != "_snapshot"} for proposal in proposals]
+        if dry_run
+        else attached_rows
+    )
+    return {
+        "paper_only": True,
+        "dry_run": dry_run,
+        "mongo_writes_enabled": not dry_run,
+        "processed_count": len(snapshots),
+        "would_attach_count": len(rows) if dry_run else 0,
+        "attached_count": len(attached_rows),
+        "skipped": skipped,
+        "rows": rows,
     }

@@ -50,6 +50,19 @@ OUTCOME_FIELDS = (
     "outcome_closed_at",
 )
 
+ATTACHED_OUTCOME_FIELDS = (
+    "outcome_status",
+    "final_status",
+    "paper_pnl",
+    "paper_pnl_percent",
+    "realized_pnl",
+    "exit_price",
+    "exit_time",
+    "holding_time",
+    "result_label",
+    "outcome_attached_at",
+)
+
 TREND_BREAKDOWN_KEYS = {
     "swing": ("price_strength", "near_day_high", "thirty_day_momentum", "above_open", "above_previous_close"),
     "momentum": ("price_strength", "near_high", "thirty_day_momentum", "clean_price_behavior"),
@@ -207,7 +220,11 @@ def _setup_status(
 
 
 def initial_snapshot_has_no_outcome(snapshot: Mapping[str, Any]) -> bool:
-    return all(snapshot.get(field) is None for field in OUTCOME_FIELDS)
+    return all(snapshot.get(field) is None for field in set(OUTCOME_FIELDS) | set(ATTACHED_OUTCOME_FIELDS))
+
+
+def snapshot_has_no_attached_outcome(snapshot: Mapping[str, Any]) -> bool:
+    return all(snapshot.get(field) in (None, "") for field in set(OUTCOME_FIELDS) | set(ATTACHED_OUTCOME_FIELDS))
 
 
 def initial_snapshot_has_no_leakage(snapshot: Mapping[str, Any]) -> bool:
@@ -355,13 +372,61 @@ def _outcome_label(statuses: set[str], pnl: float | int | None) -> str | None:
     if statuses & LOSS_STATUSES:
         return "LOSS"
     if "AMBIGUOUS" in statuses:
-        return "AMBIGUOUS"
+        return "UNKNOWN"
     if pnl is not None:
         if pnl > 0:
             return "WIN"
         if pnl < 0:
             return "LOSS"
-    return None
+        return "BREAKEVEN"
+    return "UNKNOWN"
+
+
+def build_closed_paper_trade_outcome(
+    paper_trade: Mapping[str, Any],
+    *,
+    outcome_time: str | None = None,
+) -> dict[str, Any]:
+    if not is_closed_paper_trade(paper_trade):
+        raise ValueError("Paper outcome can only be attached after the paper trade closes.")
+    statuses = _status_values(paper_trade)
+    terminal_status = next(
+        (
+            str(value)
+            for value in (paper_trade.get("outcome_status"), paper_trade.get("status"))
+            if value is not None and str(value).upper() in CLOSED_TRADE_STATUSES
+        ),
+        None,
+    )
+    paper_pnl = _number(paper_trade.get("paper_pnl"))
+    paper_pnl_percent = _number(paper_trade.get("paper_pnl_percent"))
+    realized_pnl = _number(paper_trade.get("realized_pnl"))
+    exit_price = _number(paper_trade.get("exit_price"))
+    exit_time = _first_value(
+        paper_trade.get("exit_time"),
+        paper_trade.get("closed_at"),
+        paper_trade.get("status_updated_at"),
+        paper_trade.get("updated_at"),
+    )
+    result_label = _outcome_label(statuses, _first_number(paper_pnl, realized_pnl))
+    return {
+        "outcome_status": terminal_status,
+        "final_status": terminal_status,
+        "paper_pnl": paper_pnl,
+        "paper_pnl_percent": paper_pnl_percent,
+        "realized_pnl": realized_pnl,
+        "exit_price": exit_price,
+        "exit_time": exit_time,
+        "holding_time": _first_value(paper_trade.get("holding_time"), paper_trade.get("holding_duration")),
+        "result_label": result_label,
+        "outcome_attached_at": outcome_time or utc_now_iso(),
+        "outcome_label": result_label,
+        "outcome_pnl": paper_pnl,
+        "outcome_pnl_percent": paper_pnl_percent,
+        "outcome_exit_price": exit_price,
+        "outcome_exit_reason": paper_trade.get("exit_reason"),
+        "outcome_closed_at": exit_time,
+    }
 
 
 def attach_closed_paper_trade_outcome(
@@ -370,25 +435,6 @@ def attach_closed_paper_trade_outcome(
     *,
     outcome_time: str | None = None,
 ) -> dict[str, Any]:
-    if not is_closed_paper_trade(paper_trade):
-        raise ValueError("Paper outcome can only be attached after the paper trade closes.")
-    statuses = _status_values(paper_trade)
-    pnl = _number(paper_trade.get("paper_pnl"))
     updated = dict(snapshot)
-    updated.update(
-        {
-            "outcome_status": _first_value(paper_trade.get("outcome_status"), paper_trade.get("status")),
-            "outcome_label": _outcome_label(statuses, pnl),
-            "outcome_pnl": pnl,
-            "outcome_pnl_percent": _number(paper_trade.get("paper_pnl_percent")),
-            "outcome_exit_price": _number(paper_trade.get("exit_price")),
-            "outcome_exit_reason": paper_trade.get("exit_reason"),
-            "outcome_closed_at": _first_value(
-                paper_trade.get("closed_at"),
-                paper_trade.get("status_updated_at"),
-                paper_trade.get("updated_at"),
-                outcome_time,
-            ),
-        }
-    )
+    updated.update(build_closed_paper_trade_outcome(paper_trade, outcome_time=outcome_time))
     return updated

@@ -34,6 +34,7 @@ export const getAiFeatureDatasetSummary = ({ strategyType, timeframe } = {}) => 
   return request(`/api/ai/features/summary${query ? `?${query}` : ""}`);
 };
 export const getAiFeatureSnapshots = (limit = 50) => request(`/api/ai/features/snapshots?limit=${encodeURIComponent(limit)}`);
+export const getAiOutcomePreview = (limit = 50) => request(`/api/ai/features/outcome-preview?limit=${encodeURIComponent(limit)}`);
 export const runScan = () => request("/api/scan", {
   method: "POST",
   body: JSON.stringify({ selected_index: "DEFAULT_UNIVERSE", limit: 50, force_refresh: false }),

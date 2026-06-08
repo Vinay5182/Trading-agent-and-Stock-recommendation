@@ -428,6 +428,77 @@ def _outcome_update_guard(snapshot: dict) -> dict:
     }
 
 
+async def _scan_outcome_attach_candidates(db, limit: int) -> dict:
+    cursor = db.ai_feature_snapshots.find({"paper_only": True}).sort("snapshot_time", -1).limit(limit)
+    snapshots = [row async for row in cursor]
+    skipped = {
+        "missing_snapshot_id": 0,
+        "missing_paper_trade_id": 0,
+        "missing_paper_trade": 0,
+        "open_paper_trade": 0,
+        "already_labeled": 0,
+        "write_conflict": 0,
+    }
+    skipped_rows = []
+    proposals = []
+    outcome_time = utc_now_iso()
+
+    for snapshot in snapshots:
+        if snapshot.get("_id") is None:
+            skipped["missing_snapshot_id"] += 1
+            skipped_rows.append({"symbol": snapshot.get("symbol"), "reason": "missing_snapshot_id"})
+            continue
+        paper_trade_id = snapshot.get("paper_trade_id")
+        if paper_trade_id in (None, ""):
+            skipped["missing_paper_trade_id"] += 1
+            skipped_rows.append({"symbol": snapshot.get("symbol"), "reason": "missing_paper_trade_id"})
+            continue
+        if not snapshot_has_no_attached_outcome(snapshot):
+            skipped["already_labeled"] += 1
+            skipped_rows.append(
+                {
+                    "symbol": snapshot.get("symbol"),
+                    "reason": "already_labeled",
+                    "result_label": snapshot.get("result_label"),
+                    "outcome_status": snapshot.get("outcome_status"),
+                }
+            )
+            continue
+        paper_trade = await _find_linked_paper_trade(db.paper_trades, paper_trade_id)
+        if paper_trade is None:
+            skipped["missing_paper_trade"] += 1
+            skipped_rows.append({"symbol": snapshot.get("symbol"), "reason": "missing_paper_trade"})
+            continue
+        linked_status = paper_trade.get("status") or paper_trade.get("outcome_status")
+        if not is_closed_paper_trade(paper_trade):
+            skipped["open_paper_trade"] += 1
+            skipped_rows.append(
+                {
+                    "symbol": snapshot.get("symbol"),
+                    "reason": "open_paper_trade",
+                    "linked_paper_trade_status": linked_status,
+                }
+            )
+            continue
+        proposals.append(
+            {
+                "snapshot_id": _serialize_id(snapshot.get("_id")),
+                "paper_trade_id": _serialize_id(paper_trade_id),
+                "symbol": snapshot.get("symbol"),
+                "linked_paper_trade_status": linked_status,
+                "outcome": build_closed_paper_trade_outcome(paper_trade, outcome_time=outcome_time),
+                "_snapshot": snapshot,
+            }
+        )
+
+    return {
+        "snapshots": snapshots,
+        "skipped": skipped,
+        "skipped_rows": skipped_rows,
+        "proposals": proposals,
+    }
+
+
 def _number(value: Any) -> float | int | None:
     if value is None or value == "":
         return None
@@ -723,6 +794,36 @@ async def save_ai_feature_snapshots(
     }
 
 
+@router.get("/features/outcome-preview")
+async def get_ai_feature_outcome_preview(
+    limit: int = Query(default=50, ge=1, le=500),
+) -> dict:
+    scan = await _scan_outcome_attach_candidates(get_database(), limit)
+    eligible_rows = [
+        {
+            "symbol": proposal.get("symbol"),
+            "linked_paper_trade_status": proposal.get("linked_paper_trade_status"),
+            "proposed_result_label": proposal["outcome"].get("result_label"),
+            "proposed_outcome_status": proposal["outcome"].get("outcome_status"),
+        }
+        for proposal in scan["proposals"]
+    ]
+    skipped = scan["skipped"]
+    return {
+        "paper_only": True,
+        "read_only": True,
+        "dry_run": True,
+        "mongo_writes_enabled": False,
+        "processed_count": len(scan["snapshots"]),
+        "eligible_attach_count": len(eligible_rows),
+        "skipped_open_count": skipped["open_paper_trade"],
+        "skipped_missing_trade_count": skipped["missing_paper_trade"] + skipped["missing_paper_trade_id"],
+        "skipped_already_labeled_count": skipped["already_labeled"],
+        "eligible_snapshots": eligible_rows,
+        "skipped_snapshots": scan["skipped_rows"],
+    }
+
+
 @router.post("/features/attach-outcomes")
 async def attach_ai_feature_snapshot_outcomes(
     dry_run: bool = Query(default=True),
@@ -730,46 +831,10 @@ async def attach_ai_feature_snapshot_outcomes(
 ) -> dict:
     db = get_database()
     snapshot_collection = db.ai_feature_snapshots
-    cursor = snapshot_collection.find({"paper_only": True}).sort("snapshot_time", -1).limit(limit)
-    snapshots = [row async for row in cursor]
-    skipped = {
-        "missing_snapshot_id": 0,
-        "missing_paper_trade_id": 0,
-        "missing_paper_trade": 0,
-        "open_paper_trade": 0,
-        "already_labeled": 0,
-        "write_conflict": 0,
-    }
-    proposals = []
-    outcome_time = utc_now_iso()
-
-    for snapshot in snapshots:
-        if snapshot.get("_id") is None:
-            skipped["missing_snapshot_id"] += 1
-            continue
-        paper_trade_id = snapshot.get("paper_trade_id")
-        if paper_trade_id in (None, ""):
-            skipped["missing_paper_trade_id"] += 1
-            continue
-        if not snapshot_has_no_attached_outcome(snapshot):
-            skipped["already_labeled"] += 1
-            continue
-        paper_trade = await _find_linked_paper_trade(db.paper_trades, paper_trade_id)
-        if paper_trade is None:
-            skipped["missing_paper_trade"] += 1
-            continue
-        if not is_closed_paper_trade(paper_trade):
-            skipped["open_paper_trade"] += 1
-            continue
-        proposals.append(
-            {
-                "snapshot_id": _serialize_id(snapshot.get("_id")),
-                "paper_trade_id": _serialize_id(paper_trade_id),
-                "symbol": snapshot.get("symbol"),
-                "outcome": build_closed_paper_trade_outcome(paper_trade, outcome_time=outcome_time),
-                "_snapshot": snapshot,
-            }
-        )
+    scan = await _scan_outcome_attach_candidates(db, limit)
+    snapshots = scan["snapshots"]
+    skipped = scan["skipped"]
+    proposals = scan["proposals"]
 
     attached_rows = []
     if not dry_run:

@@ -7,3 +7,16 @@ export const aiSnapshotDisplayRows = (rows = []) => (Array.isArray(rows) ? rows 
   "Trade status": row?.linked_paper_trade_status || "missing",
   "Outcome attached?": row?.outcome_attached_at ? "yes" : "no",
 }));
+
+export const aiOutcomeEligibleRows = (rows = []) => (Array.isArray(rows) ? rows : []).map((row) => ({
+  Symbol: row?.symbol || "-",
+  "Proposed label": row?.proposed_result_label || "UNKNOWN",
+  "Trade status": row?.linked_paper_trade_status || "-",
+}));
+
+export const aiOutcomeSkippedRows = (rows = []) => (Array.isArray(rows) ? rows : []).map((row) => ({
+  Symbol: row?.symbol || "-",
+  Reason: row?.reason || "unknown",
+  "Trade status": row?.linked_paper_trade_status || "-",
+  Label: row?.result_label || "unlabeled",
+}));

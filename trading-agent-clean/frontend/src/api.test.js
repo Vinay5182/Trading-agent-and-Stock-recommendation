@@ -2,8 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-import { approvePaperUpdateFromDryRun, getAiFeatureDatasetSummary, getAiFeatureSnapshots } from "./api.js";
-import { aiSnapshotDisplayRows } from "./aiDataset.js";
+import { approvePaperUpdateFromDryRun, getAiFeatureDatasetSummary, getAiFeatureSnapshots, getAiOutcomePreview } from "./api.js";
+import { aiOutcomeSkippedRows, aiSnapshotDisplayRows } from "./aiDataset.js";
 
 const CONFIRMATION_TEXT = "I understand this will write to paper_trades only and will not place broker orders";
 
@@ -121,6 +121,47 @@ test("getAiFeatureSnapshots parses the read-only snapshot table", async (t) => {
   assert.deepEqual(await getAiFeatureSnapshots(50), payload);
 });
 
+test("getAiOutcomePreview parses the read-only dry-run preview", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const payload = {
+    read_only: true,
+    dry_run: true,
+    mongo_writes_enabled: false,
+    eligible_attach_count: 0,
+    skipped_open_count: 4,
+    skipped_already_labeled_count: 1,
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = async (url, options = {}) => {
+    assert.equal(url, "http://127.0.0.1:8011/api/ai/features/outcome-preview?limit=50");
+    assert.equal(options.method, undefined);
+    return { ok: true, status: 200, text: async () => JSON.stringify(payload) };
+  };
+
+  assert.deepEqual(await getAiOutcomePreview(50), payload);
+});
+
+test("outcome preview rows render ATHERENERG labeled and four open skips", () => {
+  const rows = aiOutcomeSkippedRows([
+    { symbol: "ATHERENERG", reason: "already_labeled", result_label: "LOSS" },
+    ...["IGIL", "DIACABS", "YESBANK", "IDFCFIRSTB"].map((symbol) => ({
+      symbol,
+      reason: "open_paper_trade",
+      linked_paper_trade_status: "NOT_TRIGGERED",
+    })),
+  ]);
+
+  assert.deepEqual(rows[0], {
+    Symbol: "ATHERENERG",
+    Reason: "already_labeled",
+    "Trade status": "-",
+    Label: "LOSS",
+  });
+  assert.equal(rows.filter((row) => row.Reason === "open_paper_trade").length, 4);
+});
+
 test("AI snapshot display rows render labeled and unlabeled linked trades", () => {
   const rows = aiSnapshotDisplayRows([
     {
@@ -191,5 +232,8 @@ test("AI dataset dashboard remains read-only without training or prediction acti
   assert.ok(summarySource.includes("This dashboard is for dataset tracking only. It does not generate predictions or trade recommendations."));
   assert.ok(summarySource.includes("This table is for dataset tracking only. It does not generate predictions or trade recommendations."));
   assert.ok(summarySource.includes("AI Feature Snapshots"));
+  assert.ok(summarySource.includes("Outcome Attach Preview"));
+  assert.ok(summarySource.includes("This is a dry-run preview only. It does not attach labels or modify MongoDB."));
   assert.equal(/<ActionButton[^>]*>\s*(Train|Predict|Prediction|Recommend)/i.test(summarySource), false);
+  assert.equal(/<ActionButton[^>]*>\s*(Attach|Write|Save Label)/i.test(summarySource), false);
 });

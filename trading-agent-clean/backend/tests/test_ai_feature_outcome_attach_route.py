@@ -244,3 +244,49 @@ def test_attach_outcomes_skips_already_labeled_snapshot(monkeypatch) -> None:
     assert db.ai_feature_snapshots.update_calls == []
     assert db.paper_trades.find_one_calls == []
     assert_paper_trades_unchanged(db)
+
+
+def test_outcome_preview_is_read_only_and_reports_eligible_and_skipped_rows(monkeypatch) -> None:
+    snapshots = [
+        make_snapshot(_id="snapshot-eligible", symbol="ELIGIBLE", paper_trade_id="trade-eligible"),
+        make_snapshot(_id="snapshot-labeled", symbol="ATHERENERG", paper_trade_id="trade-labeled", result_label="LOSS"),
+        make_snapshot(_id="snapshot-open", symbol="IGIL", paper_trade_id="trade-open"),
+        make_snapshot(_id="snapshot-missing", symbol="MISSING", paper_trade_id="trade-missing"),
+    ]
+    trades = [
+        make_trade(_id="trade-eligible", status="TARGET_2_HIT"),
+        make_trade(_id="trade-labeled", status="SL_HIT"),
+        make_trade(_id="trade-open", status="NOT_TRIGGERED", paper_pnl=None),
+    ]
+    db = patch_database(monkeypatch, snapshots, trades)
+    client = TestClient(app)
+
+    response = client.get("/api/ai/features/outcome-preview?limit=50")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["read_only"] is True
+    assert payload["dry_run"] is True
+    assert payload["mongo_writes_enabled"] is False
+    assert payload["processed_count"] == 4
+    assert payload["eligible_attach_count"] == 1
+    assert payload["skipped_open_count"] == 1
+    assert payload["skipped_missing_trade_count"] == 1
+    assert payload["skipped_already_labeled_count"] == 1
+    assert payload["eligible_snapshots"] == [
+        {
+            "symbol": "ELIGIBLE",
+            "linked_paper_trade_status": "TARGET_2_HIT",
+            "proposed_result_label": "WIN",
+            "proposed_outcome_status": "TARGET_2_HIT",
+        }
+    ]
+    assert {row["symbol"]: row["reason"] for row in payload["skipped_snapshots"]} == {
+        "ATHERENERG": "already_labeled",
+        "IGIL": "open_paper_trade",
+        "MISSING": "missing_paper_trade",
+    }
+    assert db.ai_feature_snapshots.update_calls == []
+    assert db.ai_feature_snapshots.insert_calls == []
+    assert db.ai_feature_snapshots.delete_calls == []
+    assert_paper_trades_unchanged(db)

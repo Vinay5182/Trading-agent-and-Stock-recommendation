@@ -319,6 +319,20 @@ td { color: #defce8; }
 .formGrid input, .formGrid select { margin-top: 6px; }
 .aiDatasetFilters { margin: 14px 0; }
 .aiDatasetBreakdowns { margin-top: 14px; }
+.readinessReasonList {
+  border: 1px solid rgba(245, 189, 59, 0.28);
+  border-radius: 8px;
+  color: #ffd36b;
+  margin: 10px 0 0;
+  padding: 12px 14px 12px 34px;
+}
+.readinessReasonList li + li { margin-top: 6px; }
+.datasetTrackingReminder {
+  color: #9cc8ad;
+  font-size: 13px;
+  font-weight: 800;
+  margin-top: 10px;
+}
 .tvControlGrid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));

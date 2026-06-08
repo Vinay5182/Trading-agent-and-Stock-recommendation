@@ -53,6 +53,22 @@ test("api source does not add an unbound dry_run=false paper update helper", () 
 test("getAiFeatureDatasetSummary uses the read-only summary endpoint and optional filters", async (t) => {
   const originalFetch = globalThis.fetch;
   const calls = [];
+  const readinessSummary = {
+    read_only: true,
+    mongo_writes_enabled: false,
+    ready_for_model_training: false,
+    readiness_reason: ["labeled_count must be at least 100"],
+    minimum_labels_for_training: 100,
+    labeled_count: 1,
+    unlabeled_count: 4,
+    win_count: 0,
+    loss_count: 1,
+    breakeven_count: 0,
+    missing_source_mode_count: 4,
+    missing_data_completeness_count: 4,
+    source_mode_distribution: { paper_trades_backfill: 1 },
+    data_completeness_distribution: { minimal: 1 },
+  };
   t.after(() => {
     globalThis.fetch = originalFetch;
   });
@@ -61,23 +77,54 @@ test("getAiFeatureDatasetSummary uses the read-only summary endpoint and optiona
     return {
       ok: true,
       status: 200,
-      text: async () => JSON.stringify({ read_only: true, mongo_writes_enabled: false }),
+      text: async () => JSON.stringify(readinessSummary),
     };
   };
 
-  await getAiFeatureDatasetSummary();
+  const result = await getAiFeatureDatasetSummary();
   await getAiFeatureDatasetSummary({ strategyType: "momentum", timeframe: "1D" });
 
+  assert.deepEqual(result, readinessSummary);
+  assert.equal(result.ready_for_model_training, false);
+  assert.deepEqual(result.readiness_reason, ["labeled_count must be at least 100"]);
+  assert.equal(result.missing_source_mode_count, 4);
+  assert.equal(result.missing_data_completeness_count, 4);
   assert.equal(calls[0].url, "http://127.0.0.1:8011/api/ai/features/summary");
   assert.equal(calls[0].options.method, undefined);
   assert.equal(calls[1].url, "http://127.0.0.1:8011/api/ai/features/summary?strategy_type=momentum&timeframe=1D");
   assert.equal(calls[1].options.method, undefined);
 });
 
-test("dashboard source presents AI dataset tracking without model or prediction actions", () => {
+const aiDatasetSummarySource = () => {
   const source = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+  const summaryStart = source.indexOf("function AiDatasetSummary");
+  const summaryEnd = source.indexOf("function Dashboard", summaryStart);
+  return source.slice(summaryStart, summaryEnd);
+};
 
-  assert.ok(source.includes("AI Dataset Summary"));
-  assert.ok(source.includes("This is dataset tracking only. No AI model or prediction is running."));
-  assert.equal(/<ActionButton[^>]*>\s*(Train|Predict|Prediction)/i.test(source), false);
+test("dashboard renders ready_for_model_training false as not ready", () => {
+  const summarySource = aiDatasetSummarySource();
+
+  assert.ok(summarySource.includes("AI Dataset Summary"));
+  assert.ok(summarySource.includes("ready_for_model_training"));
+  assert.ok(summarySource.includes("AI model training is not ready yet."));
+  assert.ok(summarySource.includes('readyForModelTraining ? "YES" : "NO"'));
+});
+
+test("dashboard renders readiness reasons and missing metadata counts", () => {
+  const summarySource = aiDatasetSummarySource();
+
+  assert.ok(summarySource.includes("readiness_reason"));
+  assert.ok(summarySource.includes('<ul className="readinessReasonList">'));
+  assert.ok(summarySource.includes("missing_source_mode_count"));
+  assert.ok(summarySource.includes("missing_data_completeness_count"));
+  assert.ok(summarySource.includes("source_mode_distribution"));
+  assert.ok(summarySource.includes("data_completeness_distribution"));
+});
+
+test("AI dataset dashboard remains read-only without training or prediction actions", () => {
+  const summarySource = aiDatasetSummarySource();
+
+  assert.ok(summarySource.includes("This dashboard is for dataset tracking only. It does not generate predictions or trade recommendations."));
+  assert.equal(/<ActionButton[^>]*>\s*(Train|Predict|Prediction|Recommend)/i.test(summarySource), false);
 });

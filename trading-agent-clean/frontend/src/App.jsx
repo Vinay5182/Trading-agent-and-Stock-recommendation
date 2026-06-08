@@ -532,17 +532,28 @@ function PaperUpdateRunHistory({ runs = [] }) {
 const summaryBreakdownRows = (values = {}) => Object.entries(values || {}).map(([label, count]) => ({ label, count }));
 
 function AiDatasetSummary({ summary, filters, onFiltersChange, onRefresh, loading }) {
+  const readyForModelTraining = summary?.ready_for_model_training === true;
+  const readinessReasons = Array.isArray(summary?.readiness_reason) ? summary.readiness_reason : [];
   return <Card title="AI Dataset Summary" eyebrow="read-only dataset tracking">
-    <div className="warningText">This is dataset tracking only. No AI model or prediction is running.</div>
+    <div className="warningText">{readyForModelTraining ? "Dataset readiness checks passed. No AI model is running." : "AI model training is not ready yet."}</div>
+    {readinessReasons.length ? <ul className="readinessReasonList">{readinessReasons.map((reason) => <li key={reason}>{reason}</li>)}</ul> : null}
+    <div className="datasetTrackingReminder">This dashboard is for dataset tracking only. It does not generate predictions or trade recommendations.</div>
     <div className="formGrid aiDatasetFilters">
       <label>Strategy type<select value={filters.strategyType} onChange={(event) => onFiltersChange({ ...filters, strategyType: event.target.value })}><option value="">All strategies</option><option value="momentum">Momentum</option><option value="swing">Swing</option></select></label>
       <label>Timeframe<input value={filters.timeframe} onChange={(event) => onFiltersChange({ ...filters, timeframe: event.target.value })} placeholder="All timeframes" /></label>
       <ActionButton onClick={onRefresh} disabled={loading}>Refresh Dataset Summary</ActionButton>
     </div>
     <div className="statsGrid compact">
+      <StatCard label="Ready for Model Training" value={readyForModelTraining ? "YES" : "NO"} tone={readyForModelTraining ? "green" : "yellow"} />
+      <StatCard label="Minimum Labels for Training" value={summary?.minimum_labels_for_training ?? "--"} />
       <StatCard label="Total Snapshots" value={summary?.total_snapshots ?? "--"} />
-      <StatCard label="Labeled Snapshots" value={summary?.labeled_snapshots ?? "--"} />
-      <StatCard label="Unlabeled Snapshots" value={summary?.unlabeled_snapshots ?? "--"} tone="yellow" />
+      <StatCard label="Labeled Snapshots" value={summary?.labeled_count ?? summary?.labeled_snapshots ?? "--"} />
+      <StatCard label="Unlabeled Snapshots" value={summary?.unlabeled_count ?? summary?.unlabeled_snapshots ?? "--"} tone="yellow" />
+      <StatCard label="Win Labels" value={summary?.win_count ?? "--"} />
+      <StatCard label="Loss Labels" value={summary?.loss_count ?? "--"} tone="yellow" />
+      <StatCard label="Breakeven Labels" value={summary?.breakeven_count ?? "--"} />
+      <StatCard label="Missing Source Mode" value={summary?.missing_source_mode_count ?? "--"} tone="yellow" />
+      <StatCard label="Missing Data Completeness" value={summary?.missing_data_completeness_count ?? "--"} tone="yellow" />
       <StatCard label="Average Rule Score" value={summary?.average_rule_score ?? "--"} />
       <StatCard label="Average Risk Reward" value={summary?.average_risk_reward ?? "--"} />
       <StatCard label="Earliest Snapshot" value={summary?.earliest_snapshot_time ?? "--"} />
@@ -552,6 +563,10 @@ function AiDatasetSummary({ summary, filters, onFiltersChange, onRefresh, loadin
       <Card title="By Strategy Type"><MiniTable rows={summaryBreakdownRows(summary?.by_strategy_type)} columns={["label", "count"]} /></Card>
       <Card title="By Timeframe"><MiniTable rows={summaryBreakdownRows(summary?.by_timeframe)} columns={["label", "count"]} /></Card>
       <Card title="By Result Label"><MiniTable rows={summaryBreakdownRows(summary?.by_result_label)} columns={["label", "count"]} /></Card>
+    </div>
+    <div className="twoGrid aiDatasetBreakdowns">
+      <Card title="By Source Mode"><MiniTable rows={summaryBreakdownRows(summary?.source_mode_distribution)} columns={["label", "count"]} /></Card>
+      <Card title="By Data Completeness"><MiniTable rows={summaryBreakdownRows(summary?.data_completeness_distribution)} columns={["label", "count"]} /></Card>
     </div>
   </Card>;
 }

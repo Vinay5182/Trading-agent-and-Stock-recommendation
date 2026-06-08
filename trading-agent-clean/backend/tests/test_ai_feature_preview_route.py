@@ -295,6 +295,8 @@ def test_ai_feature_preview_endpoint_is_read_only_and_no_outcome_leakage(monkeyp
     assert row["exchange"] == "NSE"
     assert row["strategy_type"] == "momentum"
     assert row["timeframe"] == "1D"
+    assert row["source_mode"] == "scored_candidates"
+    assert row["data_completeness"] == "unknown"
     assert row["rule_score"] == 82
     assert row["momentum_score"] == 76
     assert row["trend_score"] == 47
@@ -339,6 +341,8 @@ def test_ai_feature_preview_paper_trades_source_is_linked_without_candidate_flag
     row = payload["rows"][0]
     assert row["symbol"] == "TEST"
     assert row["paper_trade_id"] == "trade-closed"
+    assert row["source_mode"] == "paper_trades"
+    assert row["data_completeness"] == "unknown"
     assert row["data_source_ids"]["scored_candidate_id"] == "scored-1"
     assert row["setup_status"] == "MOMENTUM_CONFIRMED"
     assert all(row[field] is None for field in OUTCOME_FIELDS)
@@ -610,6 +614,8 @@ def test_ai_feature_save_real_mode_saves_without_outcome_or_paper_trade_writes(m
     assert len(db.ai_feature_snapshots.rows) == 1
     stored = db.ai_feature_snapshots.rows[0]
     assert stored["paper_only"] is True
+    assert stored["source_mode"] == "scored_candidates"
+    assert stored["data_completeness"] == "unknown"
     assert all(stored[field] is None for field in OUTCOME_FIELDS)
     assert "paper_pnl" not in stored
     assert "paper_pnl_percent" not in stored
@@ -648,6 +654,8 @@ def test_ai_feature_save_paper_trades_source_saves_linked_snapshot_and_prevents_
     assert len(db.ai_feature_snapshots.rows) == 1
     stored = db.ai_feature_snapshots.rows[0]
     assert stored["paper_trade_id"] == "trade-closed"
+    assert stored["source_mode"] == "paper_trades"
+    assert stored["data_completeness"] == "unknown"
     assert all(stored[field] is None for field in OUTCOME_FIELDS)
     assert "paper_pnl" not in stored
     assert "paper_pnl_percent" not in stored

@@ -75,6 +75,8 @@ def make_rows() -> list[dict]:
             "strategy_type": "momentum",
             "timeframe": "1D",
             "result_label": "WIN",
+            "source_mode": "scored_candidates",
+            "data_completeness": "unknown",
             "rule_score": 80,
             "risk_reward": 2.0,
             "snapshot_time": "2026-01-01T09:15:00",
@@ -84,6 +86,8 @@ def make_rows() -> list[dict]:
             "strategy_type": "momentum",
             "timeframe": "1H",
             "result_label": "LOSS",
+            "source_mode": "paper_trades",
+            "data_completeness": "unknown",
             "rule_score": 60,
             "risk_reward": 1.0,
             "snapshot_time": "2026-01-02T09:15:00",
@@ -93,6 +97,8 @@ def make_rows() -> list[dict]:
             "strategy_type": "swing",
             "timeframe": "1D",
             "result_label": "BREAKEVEN",
+            "source_mode": "paper_trades_backfill",
+            "data_completeness": "minimal",
             "rule_score": 70,
             "risk_reward": None,
             "snapshot_time": "2026-01-03T09:15:00",
@@ -102,6 +108,7 @@ def make_rows() -> list[dict]:
             "strategy_type": "swing",
             "timeframe": "1D",
             "result_label": "UNKNOWN",
+            "source_mode": "paper_trades",
             "rule_score": None,
             "risk_reward": 3.0,
             "snapshot_time": "2026-01-04T09:15:00",
@@ -151,6 +158,8 @@ def test_ai_feature_summary_empty_dataset(monkeypatch) -> None:
     assert payload["total_snapshots"] == 0
     assert payload["labeled_snapshots"] == 0
     assert payload["unlabeled_snapshots"] == 0
+    assert payload["labeled_count"] == 0
+    assert payload["unlabeled_count"] == 0
     assert payload["by_strategy_type"] == {}
     assert payload["by_timeframe"] == {}
     assert payload["by_result_label"] == {
@@ -164,6 +173,12 @@ def test_ai_feature_summary_empty_dataset(monkeypatch) -> None:
     assert payload["average_risk_reward"] is None
     assert payload["latest_snapshot_time"] is None
     assert payload["earliest_snapshot_time"] is None
+    assert payload["minimum_labels_for_training"] == 100
+    assert payload["ready_for_model_training"] is False
+    assert payload["readiness_reason"] == [
+        "labeled_count must be at least 100",
+        "at least two training label classes are required",
+    ]
     assert_no_writes(db)
 
 
@@ -181,6 +196,8 @@ def test_ai_feature_summary_mixed_labeled_and_unlabeled(monkeypatch) -> None:
     assert payload["total_snapshots"] == 5
     assert payload["labeled_snapshots"] == 4
     assert payload["unlabeled_snapshots"] == 1
+    assert payload["labeled_count"] == 4
+    assert payload["unlabeled_count"] == 1
     assert payload["by_strategy_type"] == {"momentum": 3, "swing": 2}
     assert payload["by_timeframe"] == {"1D": 4, "1H": 1}
     assert payload["by_result_label"] == {
@@ -190,10 +207,82 @@ def test_ai_feature_summary_mixed_labeled_and_unlabeled(monkeypatch) -> None:
         "UNKNOWN": 1,
         "unlabeled": 1,
     }
+    assert payload["result_label_distribution"] == payload["by_result_label"]
+    assert payload["source_mode_distribution"] == {
+        "scored_candidates": 1,
+        "paper_trades": 2,
+        "paper_trades_backfill": 1,
+    }
+    assert payload["data_completeness_distribution"] == {"unknown": 2, "minimal": 1}
+    assert payload["missing_source_mode_count"] == 1
+    assert payload["missing_data_completeness_count"] == 2
+    assert payload["win_count"] == 1
+    assert payload["loss_count"] == 1
+    assert payload["breakeven_count"] == 1
+    assert payload["minimum_labels_for_training"] == 100
+    assert payload["leakage_checks_passed"] is True
+    assert payload["leakage_failure_count"] == 0
+    assert payload["ready_for_model_training"] is False
+    assert payload["readiness_reason"] == [
+        "labeled_count must be at least 100",
+        "source_mode and data_completeness metadata must be complete",
+    ]
     assert payload["average_rule_score"] == 70
     assert payload["average_risk_reward"] == 2
     assert payload["latest_snapshot_time"] == "2026-01-05T09:15:00"
     assert payload["earliest_snapshot_time"] == "2026-01-01T09:15:00"
+    assert_no_writes(db)
+
+
+def test_ai_feature_summary_fails_readiness_when_unlabeled_snapshot_leaks_outcome(monkeypatch) -> None:
+    rows = [
+        {
+            "paper_only": True,
+            "strategy_type": "momentum",
+            "timeframe": "1D",
+            "source_mode": "scored_candidates",
+            "data_completeness": "unknown",
+            "result_label": None,
+            "paper_pnl": 10,
+        }
+    ]
+    db = patch_database(monkeypatch, rows)
+    client = TestClient(app)
+
+    response = client.get("/api/ai/features/summary")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["leakage_checks_passed"] is False
+    assert payload["leakage_failure_count"] == 1
+    assert payload["ready_for_model_training"] is False
+    assert "unlabeled snapshot leakage checks must pass" in payload["readiness_reason"]
+    assert_no_writes(db)
+
+
+def test_ai_feature_summary_fails_readiness_with_only_one_training_label_class(monkeypatch) -> None:
+    rows = [
+        {
+            "paper_only": True,
+            "strategy_type": "momentum",
+            "timeframe": "1D",
+            "source_mode": "scored_candidates",
+            "data_completeness": "unknown",
+            "result_label": "WIN",
+        }
+        for _ in range(100)
+    ]
+    db = patch_database(monkeypatch, rows)
+    client = TestClient(app)
+
+    response = client.get("/api/ai/features/summary")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["labeled_count"] == 100
+    assert payload["win_count"] == 100
+    assert payload["ready_for_model_training"] is False
+    assert payload["readiness_reason"] == ["at least two training label classes are required"]
     assert_no_writes(db)
 
 

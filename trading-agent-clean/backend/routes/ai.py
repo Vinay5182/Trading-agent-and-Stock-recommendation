@@ -27,6 +27,8 @@ STRATEGY_SIGNAL_TYPES = {
     "momentum": "MOMENTUM_TV_CONFIRMED",
 }
 RESULT_LABELS = ("WIN", "LOSS", "BREAKEVEN", "UNKNOWN")
+TRAINING_RESULT_LABELS = ("WIN", "LOSS", "BREAKEVEN")
+MINIMUM_LABELS_FOR_TRAINING = 100
 UNLINKED_SNAPSHOT_WARNING = "Unlinked snapshots cannot receive paper outcomes later."
 SNAPSHOT_SOURCES = ("scored_candidates", "paper_trades", "paper_trades_backfill")
 
@@ -228,17 +230,22 @@ async def _build_candidate_feature_snapshots(db, strategy: str, limit: int, time
         market_data = await _find_market_data(db, scored_candidate)
         paper_signal = await _find_paper_signal(db, scored_candidate, strategy, timeframe)
         paper_trade = await _find_paper_trade(db, scored_candidate, strategy, timeframe)
-        rows.append(
-            build_ai_feature_snapshot(
-                scored_candidate,
-                market_data,
-                None,
-                paper_signal,
-                paper_trade,
-                snapshot_time=snapshot_time,
-                timeframe=timeframe,
-            )
+        snapshot = build_ai_feature_snapshot(
+            scored_candidate,
+            market_data,
+            None,
+            paper_signal,
+            paper_trade,
+            snapshot_time=snapshot_time,
+            timeframe=timeframe,
         )
+        snapshot.update(
+            {
+                "source_mode": "scored_candidates",
+                "data_completeness": "unknown",
+            }
+        )
+        rows.append(snapshot)
     return rows
 
 
@@ -259,17 +266,22 @@ async def _build_paper_trade_feature_snapshots(db, strategy: str, limit: int, ti
         lookup_document = scored_candidate if candidate else paper_trade
         market_data = await _find_market_data(db, lookup_document)
         paper_signal = await _find_paper_signal(db, lookup_document, strategy, timeframe)
-        rows.append(
-            build_ai_feature_snapshot(
-                scored_candidate,
-                market_data,
-                None,
-                paper_signal,
-                paper_trade,
-                snapshot_time=snapshot_time,
-                timeframe=timeframe,
-            )
+        snapshot = build_ai_feature_snapshot(
+            scored_candidate,
+            market_data,
+            None,
+            paper_signal,
+            paper_trade,
+            snapshot_time=snapshot_time,
+            timeframe=timeframe,
         )
+        snapshot.update(
+            {
+                "source_mode": "paper_trades",
+                "data_completeness": "unknown",
+            }
+        )
+        rows.append(snapshot)
     return rows
 
 
@@ -434,6 +446,10 @@ def _counts(rows: list[dict], field: str) -> dict[str, int]:
     return counts
 
 
+def _missing_count(rows: list[dict], field: str) -> int:
+    return sum(row.get(field) in (None, "") for row in rows)
+
+
 @router.get("/features/summary")
 async def get_ai_feature_dataset_summary(
     strategy_type: str | None = Query(default=None),
@@ -460,7 +476,27 @@ async def get_ai_feature_dataset_summary(
         result_counts[label if label in RESULT_LABELS else "UNKNOWN"] += 1
 
     snapshot_times = [str(row["snapshot_time"]) for row in rows if row.get("snapshot_time") not in (None, "")]
-    unlabeled_snapshots = result_counts["unlabeled"]
+    unlabeled_count = result_counts["unlabeled"]
+    labeled_count = len(rows) - unlabeled_count
+    missing_source_mode_count = _missing_count(rows, "source_mode")
+    missing_data_completeness_count = _missing_count(rows, "data_completeness")
+    leakage_failure_count = sum(
+        row.get("result_label") in (None, "") and not initial_snapshot_has_no_leakage(row)
+        for row in rows
+    )
+    training_label_classes = sum(result_counts[label] > 0 for label in TRAINING_RESULT_LABELS)
+    readiness_reason = []
+    if labeled_count < MINIMUM_LABELS_FOR_TRAINING:
+        readiness_reason.append(
+            f"labeled_count must be at least {MINIMUM_LABELS_FOR_TRAINING}"
+        )
+    if training_label_classes < 2:
+        readiness_reason.append("at least two training label classes are required")
+    if missing_source_mode_count or missing_data_completeness_count:
+        readiness_reason.append("source_mode and data_completeness metadata must be complete")
+    if leakage_failure_count:
+        readiness_reason.append("unlabeled snapshot leakage checks must pass")
+
     return {
         "paper_only": True,
         "read_only": True,
@@ -470,11 +506,26 @@ async def get_ai_feature_dataset_summary(
             "timeframe": clean_timeframe,
         },
         "total_snapshots": len(rows),
-        "labeled_snapshots": len(rows) - unlabeled_snapshots,
-        "unlabeled_snapshots": unlabeled_snapshots,
+        "labeled_count": labeled_count,
+        "unlabeled_count": unlabeled_count,
+        "labeled_snapshots": labeled_count,
+        "unlabeled_snapshots": unlabeled_count,
         "by_strategy_type": _counts(rows, "strategy_type"),
         "by_timeframe": _counts(rows, "timeframe"),
         "by_result_label": result_counts,
+        "result_label_distribution": result_counts,
+        "source_mode_distribution": _counts(rows, "source_mode"),
+        "data_completeness_distribution": _counts(rows, "data_completeness"),
+        "missing_source_mode_count": missing_source_mode_count,
+        "missing_data_completeness_count": missing_data_completeness_count,
+        "win_count": result_counts["WIN"],
+        "loss_count": result_counts["LOSS"],
+        "breakeven_count": result_counts["BREAKEVEN"],
+        "minimum_labels_for_training": MINIMUM_LABELS_FOR_TRAINING,
+        "leakage_checks_passed": leakage_failure_count == 0,
+        "leakage_failure_count": leakage_failure_count,
+        "ready_for_model_training": not readiness_reason,
+        "readiness_reason": readiness_reason,
         "average_rule_score": _average(rows, "rule_score"),
         "average_risk_reward": _average(rows, "risk_reward"),
         "latest_snapshot_time": max(snapshot_times) if snapshot_times else None,

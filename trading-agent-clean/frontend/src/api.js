@@ -26,6 +26,13 @@ async function request(path, options = {}) {
 
 export const getHealth = () => request("/health");
 export const getSettings = () => request("/api/settings");
+export const getAiFeatureDatasetSummary = ({ strategyType, timeframe } = {}) => {
+  const params = new URLSearchParams();
+  if (strategyType) params.set("strategy_type", strategyType);
+  if (timeframe) params.set("timeframe", timeframe);
+  const query = params.toString();
+  return request(`/api/ai/features/summary${query ? `?${query}` : ""}`);
+};
 export const runScan = () => request("/api/scan", {
   method: "POST",
   body: JSON.stringify({ selected_index: "DEFAULT_UNIVERSE", limit: 50, force_refresh: false }),

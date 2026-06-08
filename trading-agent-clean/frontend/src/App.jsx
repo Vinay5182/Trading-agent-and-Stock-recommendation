@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   API_BASE, approvePaperUpdateFromDryRun, buildMomentumSignals, buildPaperPlans, buildSwingSignals, getActiveTrades,
-  getAllTrades, getHealth, getMarketDataSymbol, getMarketLoadProgress, getMomentumCandidates, getMomentumPrecheck, getPaperPlans, getPaperSignals,
+  getAiFeatureDatasetSummary, getAllTrades, getHealth, getMarketDataSymbol, getMarketLoadProgress, getMomentumCandidates, getMomentumPrecheck, getPaperPlans, getPaperSignals,
   getMomentumSummary, getMomentumTvConfirmed, getPaperEquity, getPaperSummary, getPaperUpdateLock, getPaperUpdateProgress, getPaperUpdateRuns, getPaperUpdateSchedulerStatus, getScanRows, getScoreSummary, getSettings, getSwingCandidates,
   getSwingPrecheck, getSwingSummary, getSwingTvConfirmed, momentumTvConfirm, loadAllMarketData, runPaperPipeline, runScan, runScoring,
   runPaperUpdateDryRun, swingTvConfirm, testTvSymbol, updatePaperPlans,
@@ -529,11 +529,40 @@ function PaperUpdateRunHistory({ runs = [] }) {
   </Card>;
 }
 
+const summaryBreakdownRows = (values = {}) => Object.entries(values || {}).map(([label, count]) => ({ label, count }));
+
+function AiDatasetSummary({ summary, filters, onFiltersChange, onRefresh, loading }) {
+  return <Card title="AI Dataset Summary" eyebrow="read-only dataset tracking">
+    <div className="warningText">This is dataset tracking only. No AI model or prediction is running.</div>
+    <div className="formGrid aiDatasetFilters">
+      <label>Strategy type<select value={filters.strategyType} onChange={(event) => onFiltersChange({ ...filters, strategyType: event.target.value })}><option value="">All strategies</option><option value="momentum">Momentum</option><option value="swing">Swing</option></select></label>
+      <label>Timeframe<input value={filters.timeframe} onChange={(event) => onFiltersChange({ ...filters, timeframe: event.target.value })} placeholder="All timeframes" /></label>
+      <ActionButton onClick={onRefresh} disabled={loading}>Refresh Dataset Summary</ActionButton>
+    </div>
+    <div className="statsGrid compact">
+      <StatCard label="Total Snapshots" value={summary?.total_snapshots ?? "--"} />
+      <StatCard label="Labeled Snapshots" value={summary?.labeled_snapshots ?? "--"} />
+      <StatCard label="Unlabeled Snapshots" value={summary?.unlabeled_snapshots ?? "--"} tone="yellow" />
+      <StatCard label="Average Rule Score" value={summary?.average_rule_score ?? "--"} />
+      <StatCard label="Average Risk Reward" value={summary?.average_risk_reward ?? "--"} />
+      <StatCard label="Earliest Snapshot" value={summary?.earliest_snapshot_time ?? "--"} />
+      <StatCard label="Latest Snapshot" value={summary?.latest_snapshot_time ?? "--"} />
+    </div>
+    <div className="threeGrid aiDatasetBreakdowns">
+      <Card title="By Strategy Type"><MiniTable rows={summaryBreakdownRows(summary?.by_strategy_type)} columns={["label", "count"]} /></Card>
+      <Card title="By Timeframe"><MiniTable rows={summaryBreakdownRows(summary?.by_timeframe)} columns={["label", "count"]} /></Card>
+      <Card title="By Result Label"><MiniTable rows={summaryBreakdownRows(summary?.by_result_label)} columns={["label", "count"]} /></Card>
+    </div>
+  </Card>;
+}
+
 function Dashboard({
   summary,
   scoreSummary,
   swingSummary,
   momentumSummary,
+  aiDatasetSummary,
+  aiDatasetFilters,
   paperUpdateProgress,
   paperUpdateRuns,
   paperUpdateLock,
@@ -548,6 +577,9 @@ function Dashboard({
   onPaperUpdateDryRun,
   onPaperUpdateApprove,
   onPaperUpdateApprovalTextChange,
+  onAiDatasetFiltersChange,
+  onAiDatasetRefresh,
+  aiDatasetLoading,
   paperUpdateDryRunLoading,
   paperUpdateApprovalLoading,
   loading,
@@ -571,6 +603,7 @@ function Dashboard({
       <StatCard label="Swing Candidates" value={swingSummary?.swing_candidates_count ?? scoreSummary?.swing_candidates_count ?? "--"} tone="yellow" />
       <StatCard label="Momentum Candidates" value={momentumSummary?.momentum_candidates_count ?? scoreSummary?.momentum_candidates_count ?? "--"} />
     </div>
+    <AiDatasetSummary summary={aiDatasetSummary} filters={aiDatasetFilters} onFiltersChange={onAiDatasetFiltersChange} onRefresh={onAiDatasetRefresh} loading={aiDatasetLoading} />
     <PaperUpdateSafety
       progress={paperUpdateProgress}
       schedulerStatus={paperUpdateScheduler}
@@ -1655,6 +1688,8 @@ export default function App() {
   const [scoreSummary, setScoreSummary] = useState(null);
   const [swingSummary, setSwingSummary] = useState(null);
   const [momentumSummary, setMomentumSummary] = useState(null);
+  const [aiDatasetSummary, setAiDatasetSummary] = useState(null);
+  const [aiDatasetFilters, setAiDatasetFilters] = useState({ strategyType: "", timeframe: "" });
   const [paperUpdateProgress, setPaperUpdateProgress] = useState(null);
   const [paperUpdateRuns, setPaperUpdateRuns] = useState([]);
   const [paperUpdateLock, setPaperUpdateLock] = useState(null);
@@ -1792,6 +1827,18 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
+    getAiFeatureDatasetSummary()
+      .then((data) => {
+        if (!cancelled) setAiDatasetSummary(data);
+      })
+      .catch((err) => console.error("AI dataset summary load failed", err));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
     Promise.all([
       getPaperUpdateProgress(),
       getPaperUpdateRuns(10),
@@ -1858,6 +1905,11 @@ export default function App() {
   };
   const handlers = {
     loadSummary: () => act("summary", async () => { const data = await getPaperSummary(); setSummary(data); return data; }),
+    aiDatasetSummary: () => act("AI dataset summary", async () => {
+      const data = await getAiFeatureDatasetSummary(aiDatasetFilters);
+      setAiDatasetSummary(data);
+      return data;
+    }),
     paperUpdateDryRun: () => {
       if (!window.confirm(PAPER_UPDATE_DRY_RUN_CONFIRM)) {
         setNotice("Paper update dry-run cancelled.");
@@ -2170,8 +2222,8 @@ export default function App() {
     if (activePage === "Stock Detail") return <StockDetailPage search={search} stockMarketData={stockMarketData} stockSwingPrecheck={stockSwingPrecheck} stockMomentumPrecheck={stockMomentumPrecheck} stockSwingTvResult={stockSwingTvResult} stockMomentumTvResult={stockMomentumTvResult} stockSavedSwingResult={stockSavedSwingResult} stockSavedMomentumResult={stockSavedMomentumResult} latestSwingTvRows={latestSwingTvRows} latestMomentumTvRows={latestMomentumTvRows} stockSwingTimeframes={stockSwingTimeframes} setStockSwingTimeframes={setStockSwingTimeframes} stockMomentumTimeframes={stockMomentumTimeframes} setStockMomentumTimeframes={setStockMomentumTimeframes} onLoadStockMarket={handlers.stockMarketData} onSwingPrecheck={handlers.stockSwingPrecheck} onMomentumPrecheck={handlers.stockMomentumPrecheck} onStockSwingTvConfirm={handlers.stockSwingTvConfirm} onStockMomentumTvConfirm={handlers.stockMomentumTvConfirm} loading={!!loading} />;
     if (activePage === "Paper Trades") return <PaperTrades signals={signals} plans={plans} activeTrades={activeTrades} allTrades={allTrades} onSignals={handlers.paperSignals} onPlans={handlers.paperPlans} onActive={handlers.active} onAll={handlers.all} onUpdate={handlers.update} loading={!!loading} />;
     if (activePage === "Settings") return <Settings settings={settings} health={health} />;
-    return <Dashboard summary={summary} scoreSummary={scoreSummary} swingSummary={swingSummary} momentumSummary={momentumSummary} paperUpdateProgress={paperUpdateProgress} paperUpdateRuns={paperUpdateRuns} paperUpdateLock={paperUpdateLock} paperUpdateScheduler={paperUpdateScheduler} paperUpdateDryRunResult={paperUpdateDryRunResult} paperUpdateApprovalText={paperUpdateApprovalText} paperUpdateApprovalResult={paperUpdateApprovalResult} paperUpdateApprovalError={paperUpdateApprovalError} onSummary={handlers.loadSummary} onDryRun={handlers.dryRun} onSaveRun={handlers.saveRun} onPaperUpdateDryRun={handlers.paperUpdateDryRun} onPaperUpdateApprove={handlers.paperUpdateApprove} onPaperUpdateApprovalTextChange={setPaperUpdateApprovalText} paperUpdateDryRunLoading={loading === "paper update dry-run"} paperUpdateApprovalLoading={loading === "paper update approval"} loading={!!loading} />;
-  }, [activePage, settings, health, summary, scoreSummary, swingSummary, momentumSummary, paperUpdateProgress, paperUpdateRuns, paperUpdateLock, paperUpdateScheduler, paperUpdateDryRunResult, paperUpdateApprovalText, paperUpdateApprovalResult, paperUpdateApprovalError, swingRows, latestSwingTvRows, swingTvRowsLoaded, swingBatchResults, swingBatchProgress, swingBatchError, swingBatchStopRequested, swingBatchStopMessage, swingCandidatesStale, momentumRows, momentumCandidatesStale, latestMomentumTvRows, momentumTvRowsLoaded, momentumBatchResults, momentumBatchProgress, momentumBatchError, momentumBatchStopRequested, momentumBatchStopMessage, stockMarketData, stockSwingPrecheck, stockMomentumPrecheck, stockSwingTvResult, stockMomentumTvResult, stockSavedSwingResult, stockSavedMomentumResult, stockSwingTimeframes, stockMomentumTimeframes, search, tv, tvResult, marketLoadResult, marketProgress, scoreRunResult, marketDataNeedsScore, signals, plans, activeTrades, allTrades, loading, lastResponse]);
+    return <Dashboard summary={summary} scoreSummary={scoreSummary} swingSummary={swingSummary} momentumSummary={momentumSummary} aiDatasetSummary={aiDatasetSummary} aiDatasetFilters={aiDatasetFilters} paperUpdateProgress={paperUpdateProgress} paperUpdateRuns={paperUpdateRuns} paperUpdateLock={paperUpdateLock} paperUpdateScheduler={paperUpdateScheduler} paperUpdateDryRunResult={paperUpdateDryRunResult} paperUpdateApprovalText={paperUpdateApprovalText} paperUpdateApprovalResult={paperUpdateApprovalResult} paperUpdateApprovalError={paperUpdateApprovalError} onSummary={handlers.loadSummary} onDryRun={handlers.dryRun} onSaveRun={handlers.saveRun} onAiDatasetRefresh={handlers.aiDatasetSummary} onAiDatasetFiltersChange={setAiDatasetFilters} onPaperUpdateDryRun={handlers.paperUpdateDryRun} onPaperUpdateApprove={handlers.paperUpdateApprove} onPaperUpdateApprovalTextChange={setPaperUpdateApprovalText} aiDatasetLoading={loading === "AI dataset summary"} paperUpdateDryRunLoading={loading === "paper update dry-run"} paperUpdateApprovalLoading={loading === "paper update approval"} loading={!!loading} />;
+  }, [activePage, settings, health, summary, scoreSummary, swingSummary, momentumSummary, aiDatasetSummary, aiDatasetFilters, paperUpdateProgress, paperUpdateRuns, paperUpdateLock, paperUpdateScheduler, paperUpdateDryRunResult, paperUpdateApprovalText, paperUpdateApprovalResult, paperUpdateApprovalError, swingRows, latestSwingTvRows, swingTvRowsLoaded, swingBatchResults, swingBatchProgress, swingBatchError, swingBatchStopRequested, swingBatchStopMessage, swingCandidatesStale, momentumRows, momentumCandidatesStale, latestMomentumTvRows, momentumTvRowsLoaded, momentumBatchResults, momentumBatchProgress, momentumBatchError, momentumBatchStopRequested, momentumBatchStopMessage, stockMarketData, stockSwingPrecheck, stockMomentumPrecheck, stockSwingTvResult, stockMomentumTvResult, stockSavedSwingResult, stockSavedMomentumResult, stockSwingTimeframes, stockMomentumTimeframes, search, tv, tvResult, marketLoadResult, marketProgress, scoreRunResult, marketDataNeedsScore, signals, plans, activeTrades, allTrades, loading, lastResponse]);
 
   return <div className="appShell">
     <aside className="sidebar"><div className="brand"><div className="brandMark">TA</div><div><h1>Trading Agent</h1><p>Paper Terminal</p></div></div><div className="navSeparator">Workspace</div><nav>{NAV_WITH_STOCK_DETAIL.map((item) => <button className={activePage === item.label ? "navItem active" : "navItem"} key={item.label} onClick={() => setActivePage(item.label)}><span>{item.icon}</span>{item.label}</button>)}</nav><div className="sidebarFooter"><Badge tone="yellow">PAPER ONLY</Badge><p>No live trading. No broker orders.</p></div></aside>

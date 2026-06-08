@@ -59,11 +59,11 @@ nav { display: grid; gap: 8px; }
   display: grid; grid-template-columns: minmax(180px, 1fr) minmax(240px, 420px) minmax(260px, auto);
   gap: 16px; align-items: center; padding: 16px 22px; min-width: 0; max-width: 100%;
 }
-.searchInput, .formGrid input {
+.searchInput, .formGrid input, .formGrid select {
   width: 100%; min-width: 0; border: 1px solid rgba(71, 214, 130, 0.28); border-radius: 8px; background: #06130d;
   color: #effff4; padding: 11px 12px; outline: none;
 }
-.searchInput:focus, .formGrid input:focus { border-color: #36e68a; box-shadow: 0 0 0 3px rgba(54, 230, 138, 0.12); }
+.searchInput:focus, .formGrid input:focus, .formGrid select:focus { border-color: #36e68a; box-shadow: 0 0 0 3px rgba(54, 230, 138, 0.12); }
 .statusBadges, .pipelineBox, .buttonRow { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .topHeader > *, .statusBadges, .pipelineBox, .buttonRow { min-width: 0; max-width: 100%; }
 .statusBadges { justify-content: flex-end; }
@@ -316,7 +316,9 @@ td { color: #defce8; }
 }
 .formGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; align-items: end; min-width: 0; max-width: 100%; }
 .formGrid label, .tvControlGrid label { color: #8eb69f; font-size: 12px; display: block; min-width: 0; max-width: 100%; }
-.formGrid input { margin-top: 6px; }
+.formGrid input, .formGrid select { margin-top: 6px; }
+.aiDatasetFilters { margin: 14px 0; }
+.aiDatasetBreakdowns { margin-top: 14px; }
 .tvControlGrid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));

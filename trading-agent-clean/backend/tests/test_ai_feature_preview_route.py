@@ -234,6 +234,24 @@ class FakeSaveDB(FakeDB):
         self.ai_feature_snapshots = FakeSnapshotCollection()
 
 
+def add_unlinked_candidate(db: FakeDB) -> None:
+    db.scored_candidates.rows.append(
+        {
+            "_id": "scored-unlinked",
+            "exchange": "NSE",
+            "symbol": "UNLINKED",
+            "canonical_symbol": "UNLINKED",
+            "tradingview_symbol": "NSE:UNLINKED",
+            "scan_run_id": "scan-unlinked",
+            "score": 70,
+            "momentum_score": 70,
+            "momentum_candidate": True,
+            "momentum_status": "MOMENTUM_PRECHECK_PASSED",
+            "updated_at": "2026-01-01T09:18:00",
+        }
+    )
+
+
 def test_ai_feature_preview_endpoint_is_read_only_and_no_outcome_leakage(monkeypatch) -> None:
     db = FakeDB()
     monkeypatch.setattr(ai_routes, "get_database", lambda: db)
@@ -247,6 +265,10 @@ def test_ai_feature_preview_endpoint_is_read_only_and_no_outcome_leakage(monkeyp
     assert payload["preview_only"] is True
     assert payload["mongo_writes_enabled"] is False
     assert payload["strategy_type"] == "momentum"
+    assert payload["linked_only"] is True
+    assert payload["warning"] is None
+    assert payload["skipped_unlinked_count"] == 0
+    assert payload["returned_count"] == 1
     assert payload["count"] == 1
 
     row = payload["rows"][0]
@@ -276,6 +298,43 @@ def test_ai_feature_preview_endpoint_is_read_only_and_no_outcome_leakage(monkeyp
     assert len(db.paper_trades.find_one_calls) == 1
 
 
+def test_ai_feature_preview_defaults_to_excluding_unlinked_snapshots(monkeypatch) -> None:
+    db = FakeDB()
+    add_unlinked_candidate(db)
+    monkeypatch.setattr(ai_routes, "get_database", lambda: db)
+    client = TestClient(app)
+
+    response = client.get("/api/ai/features/preview?strategy_type=momentum&limit=10&timeframe=1D")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["linked_only"] is True
+    assert payload["built_count"] == 2
+    assert payload["skipped_unlinked_count"] == 1
+    assert payload["returned_count"] == 1
+    assert [row["symbol"] for row in payload["rows"]] == ["TEST"]
+
+
+def test_ai_feature_preview_allows_unlinked_snapshots_only_when_explicit(monkeypatch) -> None:
+    db = FakeDB()
+    add_unlinked_candidate(db)
+    monkeypatch.setattr(ai_routes, "get_database", lambda: db)
+    client = TestClient(app)
+
+    response = client.get(
+        "/api/ai/features/preview?strategy_type=momentum&limit=10&timeframe=1D&linked_only=false"
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["linked_only"] is False
+    assert payload["warning"] == "Unlinked snapshots cannot receive paper outcomes later."
+    assert payload["built_count"] == 2
+    assert payload["skipped_unlinked_count"] == 0
+    assert payload["returned_count"] == 2
+    assert {row["symbol"] for row in payload["rows"]} == {"TEST", "UNLINKED"}
+
+
 def test_ai_feature_preview_rejects_unknown_strategy_without_db_access(monkeypatch) -> None:
     def fail_get_database():
         raise AssertionError("Invalid preview requests should not touch the database")
@@ -300,6 +359,8 @@ def test_ai_feature_save_defaults_to_dry_run_and_writes_nothing(monkeypatch) -> 
     payload = response.json()
     assert payload["dry_run"] is True
     assert payload["mongo_writes_enabled"] is False
+    assert payload["linked_only"] is True
+    assert payload["skipped_unlinked_count"] == 0
     assert payload["built_count"] == 1
     assert payload["would_save_count"] == 1
     assert payload["saved_count"] == 0
@@ -311,8 +372,35 @@ def test_ai_feature_save_defaults_to_dry_run_and_writes_nothing(monkeypatch) -> 
     assert db.ai_feature_snapshots.delete_calls == []
 
 
+def test_ai_feature_save_dry_run_allows_unlinked_snapshots_only_when_explicit(monkeypatch) -> None:
+    db = FakeSaveDB()
+    add_unlinked_candidate(db)
+    monkeypatch.setattr(ai_routes, "get_database", lambda: db)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/ai/features/save?strategy_type=momentum&limit=10&timeframe=1D&linked_only=false"
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["dry_run"] is True
+    assert payload["mongo_writes_enabled"] is False
+    assert payload["linked_only"] is False
+    assert payload["warning"] == "Unlinked snapshots cannot receive paper outcomes later."
+    assert payload["built_count"] == 2
+    assert payload["skipped_unlinked_count"] == 0
+    assert payload["would_save_count"] == 2
+    assert {row["symbol"] for row in payload["rows"]} == {"TEST", "UNLINKED"}
+    assert db.ai_feature_snapshots.create_index_calls == []
+    assert db.ai_feature_snapshots.insert_calls == []
+    assert db.ai_feature_snapshots.update_calls == []
+    assert db.ai_feature_snapshots.delete_calls == []
+
+
 def test_ai_feature_save_real_mode_saves_without_outcome_or_paper_trade_writes(monkeypatch) -> None:
     db = FakeSaveDB()
+    add_unlinked_candidate(db)
     monkeypatch.setattr(ai_routes, "get_database", lambda: db)
     client = TestClient(app)
 
@@ -325,6 +413,9 @@ def test_ai_feature_save_real_mode_saves_without_outcome_or_paper_trade_writes(m
     assert payload["dry_run"] is False
     assert payload["mongo_writes_enabled"] is True
     assert payload["overwrite_enabled"] is False
+    assert payload["linked_only"] is True
+    assert payload["built_count"] == 2
+    assert payload["skipped_unlinked_count"] == 1
     assert payload["saved_count"] == 1
     assert payload["duplicate_count"] == 0
     assert len(db.ai_feature_snapshots.rows) == 1
@@ -338,7 +429,7 @@ def test_ai_feature_save_real_mode_saves_without_outcome_or_paper_trade_writes(m
     assert db.ai_feature_snapshots.create_index_calls[0][1]["unique"] is True
     assert db.ai_feature_snapshots.update_calls == []
     assert db.ai_feature_snapshots.delete_calls == []
-    assert len(db.paper_trades.find_one_calls) == 1
+    assert len(db.paper_trades.find_one_calls) == 2
     assert db.paper_trades.update_calls == []
     assert db.paper_trades.insert_calls == []
     assert db.paper_trades.delete_calls == []

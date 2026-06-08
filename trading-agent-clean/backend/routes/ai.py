@@ -25,6 +25,7 @@ STRATEGY_SIGNAL_TYPES = {
     "momentum": "MOMENTUM_TV_CONFIRMED",
 }
 RESULT_LABELS = ("WIN", "LOSS", "BREAKEVEN", "UNKNOWN")
+UNLINKED_SNAPSHOT_WARNING = "Unlinked snapshots cannot receive paper outcomes later."
 
 
 def normalize_strategy_type(strategy_type: str) -> str:
@@ -161,6 +162,17 @@ async def _build_feature_snapshots(db, strategy: str, limit: int, timeframe: str
     return rows
 
 
+def _filter_linked_snapshots(snapshots: list[dict], linked_only: bool) -> tuple[list[dict], int]:
+    unlinked_count = sum(snapshot.get("paper_trade_id") in (None, "") for snapshot in snapshots)
+    if not linked_only:
+        return snapshots, 0
+    return [snapshot for snapshot in snapshots if snapshot.get("paper_trade_id") not in (None, "")], unlinked_count
+
+
+def _unlinked_snapshot_warning(linked_only: bool) -> str | None:
+    return None if linked_only else UNLINKED_SNAPSHOT_WARNING
+
+
 def _prepare_snapshot_for_save(snapshot: dict) -> dict:
     if not initial_snapshot_has_no_leakage(snapshot):
         raise HTTPException(status_code=500, detail="Initial AI feature snapshot contains outcome, PnL, or exit leakage")
@@ -283,10 +295,12 @@ async def preview_ai_feature_snapshots(
     strategy_type: str = Query(default="momentum"),
     limit: int = Query(default=10, ge=1, le=100),
     timeframe: str = Query(default="1D"),
+    linked_only: bool = Query(default=True),
 ) -> dict:
     strategy = normalize_strategy_type(strategy_type)
     clean_timeframe = (timeframe or "1D").strip().upper()
-    rows = await _build_feature_snapshots(get_database(), strategy, limit, clean_timeframe)
+    built_rows = await _build_feature_snapshots(get_database(), strategy, limit, clean_timeframe)
+    rows, skipped_unlinked_count = _filter_linked_snapshots(built_rows, linked_only)
 
     return {
         "paper_only": True,
@@ -294,6 +308,11 @@ async def preview_ai_feature_snapshots(
         "mongo_writes_enabled": False,
         "strategy_type": strategy,
         "timeframe": clean_timeframe,
+        "linked_only": linked_only,
+        "warning": _unlinked_snapshot_warning(linked_only),
+        "built_count": len(built_rows),
+        "skipped_unlinked_count": skipped_unlinked_count,
+        "returned_count": len(rows),
         "count": len(rows),
         "rows": rows,
     }
@@ -305,13 +324,16 @@ async def save_ai_feature_snapshots(
     limit: int = Query(default=10, ge=1, le=100),
     timeframe: str = Query(default="1D"),
     dry_run: bool = Query(default=True),
+    linked_only: bool = Query(default=True),
 ) -> dict:
     strategy = normalize_strategy_type(strategy_type)
     clean_timeframe = (timeframe or "1D").strip().upper()
     db = get_database()
+    built_snapshots = await _build_feature_snapshots(db, strategy, limit, clean_timeframe)
+    filtered_snapshots, skipped_unlinked_count = _filter_linked_snapshots(built_snapshots, linked_only)
     snapshots = [
         _prepare_snapshot_for_save(snapshot)
-        for snapshot in await _build_feature_snapshots(db, strategy, limit, clean_timeframe)
+        for snapshot in filtered_snapshots
     ]
     collection = db.ai_feature_snapshots
 
@@ -325,7 +347,10 @@ async def save_ai_feature_snapshots(
             "overwrite_enabled": False,
             "strategy_type": strategy,
             "timeframe": clean_timeframe,
-            "built_count": len(snapshots),
+            "linked_only": linked_only,
+            "warning": _unlinked_snapshot_warning(linked_only),
+            "built_count": len(built_snapshots),
+            "skipped_unlinked_count": skipped_unlinked_count,
             "would_save_count": len(rows),
             "saved_count": 0,
             "duplicate_count": duplicate_count,
@@ -354,7 +379,10 @@ async def save_ai_feature_snapshots(
         "overwrite_enabled": False,
         "strategy_type": strategy,
         "timeframe": clean_timeframe,
-        "built_count": len(snapshots),
+        "linked_only": linked_only,
+        "warning": _unlinked_snapshot_warning(linked_only),
+        "built_count": len(built_snapshots),
+        "skipped_unlinked_count": skipped_unlinked_count,
         "would_save_count": 0,
         "saved_count": len(saved_rows),
         "duplicate_count": duplicate_count,

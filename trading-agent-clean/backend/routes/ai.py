@@ -24,6 +24,7 @@ STRATEGY_SIGNAL_TYPES = {
     "swing": "SWING_TV_CONFIRMED",
     "momentum": "MOMENTUM_TV_CONFIRMED",
 }
+RESULT_LABELS = ("WIN", "LOSS", "BREAKEVEN", "UNKNOWN")
 
 
 def normalize_strategy_type(strategy_type: str) -> str:
@@ -195,6 +196,85 @@ def _outcome_update_guard(snapshot: dict) -> dict:
             field: {"$in": [None, ""]}
             for field in set(OUTCOME_FIELDS) | set(ATTACHED_OUTCOME_FIELDS)
         },
+    }
+
+
+def _number(value: Any) -> float | int | None:
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number:
+        return None
+    return int(number) if number.is_integer() else number
+
+
+def _average(rows: list[dict], field: str) -> float | int | None:
+    values = [_number(row.get(field)) for row in rows]
+    values = [value for value in values if value is not None]
+    if not values:
+        return None
+    average = sum(values) / len(values)
+    return int(average) if average.is_integer() else average
+
+
+def _counts(rows: list[dict], field: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        value = row.get(field)
+        if value not in (None, ""):
+            key = str(value)
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+@router.get("/features/summary")
+async def get_ai_feature_dataset_summary(
+    strategy_type: str | None = Query(default=None),
+    timeframe: str | None = Query(default=None),
+) -> dict:
+    clean_strategy = (strategy_type or "").strip()
+    strategy = normalize_strategy_type(clean_strategy) if clean_strategy else None
+    clean_timeframe = (timeframe or "").strip().upper() or None
+    query = {
+        "paper_only": True,
+        **({"strategy_type": strategy} if strategy else {}),
+        **({"timeframe": clean_timeframe} if clean_timeframe else {}),
+    }
+    rows = [row async for row in get_database().ai_feature_snapshots.find(query)]
+    result_counts = {label: 0 for label in RESULT_LABELS}
+    result_counts["unlabeled"] = 0
+
+    for row in rows:
+        raw_label = row.get("result_label")
+        if raw_label in (None, ""):
+            result_counts["unlabeled"] += 1
+            continue
+        label = str(raw_label).strip().upper()
+        result_counts[label if label in RESULT_LABELS else "UNKNOWN"] += 1
+
+    snapshot_times = [str(row["snapshot_time"]) for row in rows if row.get("snapshot_time") not in (None, "")]
+    unlabeled_snapshots = result_counts["unlabeled"]
+    return {
+        "paper_only": True,
+        "read_only": True,
+        "mongo_writes_enabled": False,
+        "filters": {
+            "strategy_type": strategy,
+            "timeframe": clean_timeframe,
+        },
+        "total_snapshots": len(rows),
+        "labeled_snapshots": len(rows) - unlabeled_snapshots,
+        "unlabeled_snapshots": unlabeled_snapshots,
+        "by_strategy_type": _counts(rows, "strategy_type"),
+        "by_timeframe": _counts(rows, "timeframe"),
+        "by_result_label": result_counts,
+        "average_rule_score": _average(rows, "rule_score"),
+        "average_risk_reward": _average(rows, "risk_reward"),
+        "latest_snapshot_time": max(snapshot_times) if snapshot_times else None,
+        "earliest_snapshot_time": min(snapshot_times) if snapshot_times else None,
     }
 
 

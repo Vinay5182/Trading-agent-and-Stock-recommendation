@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from typing import Any
 
 from bson import ObjectId
@@ -6,6 +7,7 @@ from pymongo.errors import DuplicateKeyError
 
 from ai.features import (
     ATTACHED_OUTCOME_FIELDS,
+    CLOSED_TRADE_STATUSES,
     OUTCOME_FIELDS,
     ai_feature_snapshot_identity,
     build_closed_paper_trade_outcome,
@@ -26,7 +28,7 @@ STRATEGY_SIGNAL_TYPES = {
 }
 RESULT_LABELS = ("WIN", "LOSS", "BREAKEVEN", "UNKNOWN")
 UNLINKED_SNAPSHOT_WARNING = "Unlinked snapshots cannot receive paper outcomes later."
-SNAPSHOT_SOURCES = ("scored_candidates", "paper_trades")
+SNAPSHOT_SOURCES = ("scored_candidates", "paper_trades", "paper_trades_backfill")
 
 
 def normalize_strategy_type(strategy_type: str) -> str:
@@ -39,8 +41,63 @@ def normalize_strategy_type(strategy_type: str) -> str:
 def normalize_snapshot_source(source: str) -> str:
     clean_source = (source or "").strip().lower()
     if clean_source not in SNAPSHOT_SOURCES:
-        raise HTTPException(status_code=400, detail="source must be scored_candidates or paper_trades")
+        raise HTTPException(
+            status_code=400,
+            detail="source must be scored_candidates, paper_trades, or paper_trades_backfill",
+        )
     return clean_source
+
+
+def _strategy_type_from_document(document: dict) -> str | None:
+    raw = (
+        document.get("strategy_type")
+        or document.get("strategy")
+        or document.get("source_signal_type")
+        or document.get("signal_type")
+    )
+    text = str(raw or "").strip().lower()
+    if "momentum" in text:
+        return "momentum"
+    if "swing" in text:
+        return "swing"
+    return None
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif value not in (None, ""):
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+
+def _is_document_safe_at(document: dict | None, cutoff: Any) -> bool:
+    if not document:
+        return False
+    cutoff_time = _parse_timestamp(cutoff)
+    document_time = _parse_timestamp(
+        document.get("updated_at")
+        or document.get("modified_at")
+        or document.get("created_at")
+    )
+    return cutoff_time is not None and document_time is not None and document_time <= cutoff_time
+
+
+def _resolve_snapshot_filters(
+    source: str,
+    strategy_type: str | None,
+    timeframe: str | None,
+) -> tuple[str | None, str | None]:
+    clean_strategy = (strategy_type or "").strip()
+    clean_timeframe = (timeframe or "").strip().upper() or None
+    if source == "paper_trades_backfill":
+        return (normalize_strategy_type(clean_strategy) if clean_strategy else None), clean_timeframe
+    return normalize_strategy_type(clean_strategy or "momentum"), clean_timeframe or "1D"
 
 
 def _candidate_query(strategy_type: str) -> dict[str, Any]:
@@ -216,15 +273,84 @@ async def _build_paper_trade_feature_snapshots(db, strategy: str, limit: int, ti
     return rows
 
 
+async def _build_paper_trade_backfill_snapshots(
+    db,
+    strategy: str | None,
+    limit: int,
+    timeframe: str | None,
+    terminal_only: bool,
+) -> list[dict]:
+    query: dict[str, Any] = {"paper_only": True}
+    if strategy:
+        query["source_signal_type"] = STRATEGY_SIGNAL_TYPES[strategy]
+    if timeframe:
+        query["timeframe"] = timeframe
+    if terminal_only:
+        terminal_statuses = sorted(CLOSED_TRADE_STATUSES)
+        query["$or"] = [
+            {"status": {"$in": terminal_statuses}},
+            {"outcome_status": {"$in": terminal_statuses}},
+        ]
+
+    cursor = db.paper_trades.find(query).sort("created_at", -1).limit(limit)
+    paper_trades = [row async for row in cursor]
+    rows = []
+
+    for paper_trade in paper_trades:
+        if paper_trade.get("_id") is None:
+            continue
+        trade_strategy = strategy or _strategy_type_from_document(paper_trade)
+        trade_timeframe = timeframe or str(paper_trade.get("timeframe") or "").strip().upper() or None
+        trade_created_at = paper_trade.get("created_at")
+        candidate = await _find_scored_candidate(db, paper_trade)
+        market_data = await _find_market_data(db, candidate or paper_trade)
+        paper_signal = (
+            await _find_paper_signal(db, candidate or paper_trade, trade_strategy, trade_timeframe)
+            if trade_strategy and trade_timeframe
+            else None
+        )
+        safe_signal = paper_signal if _is_document_safe_at(paper_signal, trade_created_at) else None
+        full_safe = (
+            _is_document_safe_at(candidate, trade_created_at)
+            and _is_document_safe_at(market_data, trade_created_at)
+        )
+        safe_candidate = candidate if full_safe else None
+        safe_market_data = market_data if full_safe else None
+        scored_candidate = {**(safe_candidate or {}), **({"strategy_type": trade_strategy} if trade_strategy else {})}
+        snapshot_time = trade_created_at or (safe_signal or {}).get("created_at") or utc_now_iso()
+        snapshot = build_ai_feature_snapshot(
+            scored_candidate,
+            safe_market_data,
+            None,
+            safe_signal,
+            paper_trade,
+            snapshot_time=str(snapshot_time),
+            timeframe=trade_timeframe,
+        )
+        snapshot.update(
+            {
+                "source_mode": "paper_trades_backfill",
+                "data_completeness": "full_safe" if full_safe else "minimal",
+            }
+        )
+        rows.append(snapshot)
+    return rows
+
+
 async def _build_feature_snapshots(
     db,
-    strategy: str,
+    strategy: str | None,
     limit: int,
-    timeframe: str,
+    timeframe: str | None,
     source: str,
+    terminal_only: bool,
 ) -> list[dict]:
+    if source == "paper_trades_backfill":
+        return await _build_paper_trade_backfill_snapshots(db, strategy, limit, timeframe, terminal_only)
     if source == "paper_trades":
+        assert strategy is not None and timeframe is not None
         return await _build_paper_trade_feature_snapshots(db, strategy, limit, timeframe)
+    assert strategy is not None and timeframe is not None
     return await _build_candidate_feature_snapshots(db, strategy, limit, timeframe)
 
 
@@ -358,16 +484,23 @@ async def get_ai_feature_dataset_summary(
 
 @router.get("/features/preview")
 async def preview_ai_feature_snapshots(
-    strategy_type: str = Query(default="momentum"),
+    strategy_type: str | None = Query(default=None),
     limit: int = Query(default=10, ge=1, le=100),
-    timeframe: str = Query(default="1D"),
+    timeframe: str | None = Query(default=None),
     linked_only: bool = Query(default=True),
     source: str = Query(default="scored_candidates"),
+    terminal_only: bool = Query(default=False),
 ) -> dict:
-    strategy = normalize_strategy_type(strategy_type)
     clean_source = normalize_snapshot_source(source)
-    clean_timeframe = (timeframe or "1D").strip().upper()
-    built_rows = await _build_feature_snapshots(get_database(), strategy, limit, clean_timeframe, clean_source)
+    strategy, clean_timeframe = _resolve_snapshot_filters(clean_source, strategy_type, timeframe)
+    built_rows = await _build_feature_snapshots(
+        get_database(),
+        strategy,
+        limit,
+        clean_timeframe,
+        clean_source,
+        terminal_only,
+    )
     rows, skipped_unlinked_count = _filter_linked_snapshots(built_rows, linked_only)
 
     return {
@@ -377,6 +510,7 @@ async def preview_ai_feature_snapshots(
         "strategy_type": strategy,
         "timeframe": clean_timeframe,
         "source": clean_source,
+        "terminal_only": terminal_only,
         "linked_only": linked_only,
         "warning": _unlinked_snapshot_warning(linked_only),
         "built_count": len(built_rows),
@@ -389,18 +523,25 @@ async def preview_ai_feature_snapshots(
 
 @router.post("/features/save")
 async def save_ai_feature_snapshots(
-    strategy_type: str = Query(default="momentum"),
+    strategy_type: str | None = Query(default=None),
     limit: int = Query(default=10, ge=1, le=100),
-    timeframe: str = Query(default="1D"),
+    timeframe: str | None = Query(default=None),
     dry_run: bool = Query(default=True),
     linked_only: bool = Query(default=True),
     source: str = Query(default="scored_candidates"),
+    terminal_only: bool = Query(default=False),
 ) -> dict:
-    strategy = normalize_strategy_type(strategy_type)
     clean_source = normalize_snapshot_source(source)
-    clean_timeframe = (timeframe or "1D").strip().upper()
+    strategy, clean_timeframe = _resolve_snapshot_filters(clean_source, strategy_type, timeframe)
     db = get_database()
-    built_snapshots = await _build_feature_snapshots(db, strategy, limit, clean_timeframe, clean_source)
+    built_snapshots = await _build_feature_snapshots(
+        db,
+        strategy,
+        limit,
+        clean_timeframe,
+        clean_source,
+        terminal_only,
+    )
     filtered_snapshots, skipped_unlinked_count = _filter_linked_snapshots(built_snapshots, linked_only)
     snapshots = [
         _prepare_snapshot_for_save(snapshot)
@@ -419,6 +560,7 @@ async def save_ai_feature_snapshots(
             "strategy_type": strategy,
             "timeframe": clean_timeframe,
             "source": clean_source,
+            "terminal_only": terminal_only,
             "linked_only": linked_only,
             "warning": _unlinked_snapshot_warning(linked_only),
             "built_count": len(built_snapshots),
@@ -452,6 +594,7 @@ async def save_ai_feature_snapshots(
         "strategy_type": strategy,
         "timeframe": clean_timeframe,
         "source": clean_source,
+        "terminal_only": terminal_only,
         "linked_only": linked_only,
         "warning": _unlinked_snapshot_warning(linked_only),
         "built_count": len(built_snapshots),

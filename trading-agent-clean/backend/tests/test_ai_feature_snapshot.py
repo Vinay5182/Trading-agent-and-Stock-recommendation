@@ -191,6 +191,21 @@ def test_initial_snapshot_leakage_guard_and_identity() -> None:
     assert ai_feature_snapshot_identity(snapshot) == ai_feature_snapshot_identity(same_sources_later)
     assert ai_feature_snapshot_identity(snapshot) != ai_feature_snapshot_identity(different_sources)
 
+    backfill = {
+        **snapshot,
+        "source_mode": "paper_trades_backfill",
+        "data_source_ids": {"paper_trade_id": "trade-1", "paper_signal_id": "signal-1"},
+    }
+    backfill_with_different_safe_sources = {
+        **backfill,
+        "data_source_ids": {
+            "paper_trade_id": "trade-1",
+            "paper_signal_id": "signal-1",
+            "scored_candidate_id": "scored-new",
+        },
+    }
+    assert ai_feature_snapshot_identity(backfill) == ai_feature_snapshot_identity(backfill_with_different_safe_sources)
+
 
 def test_paper_outcome_attaches_only_after_trade_closes() -> None:
     snapshot = build_ai_feature_snapshot(

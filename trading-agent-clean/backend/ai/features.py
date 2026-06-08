@@ -242,12 +242,20 @@ def initial_snapshot_has_no_leakage(snapshot: Mapping[str, Any]) -> bool:
 
 
 def ai_feature_snapshot_identity(snapshot: Mapping[str, Any]) -> str:
-    identity = {
-        "symbol": snapshot.get("symbol"),
-        "strategy_type": snapshot.get("strategy_type"),
-        "timeframe": snapshot.get("timeframe"),
-        "data_source_ids": snapshot.get("data_source_ids") or {},
-    }
+    if snapshot.get("source_mode") == "paper_trades_backfill":
+        identity = {
+            "paper_trade_id": snapshot.get("paper_trade_id"),
+            "source_mode": snapshot.get("source_mode"),
+            "strategy_type": snapshot.get("strategy_type"),
+            "timeframe": snapshot.get("timeframe"),
+        }
+    else:
+        identity = {
+            "symbol": snapshot.get("symbol"),
+            "strategy_type": snapshot.get("strategy_type"),
+            "timeframe": snapshot.get("timeframe"),
+            "data_source_ids": snapshot.get("data_source_ids") or {},
+        }
     canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode()).hexdigest()
 

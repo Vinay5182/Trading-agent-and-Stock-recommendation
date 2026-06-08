@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
+from pymongo.errors import DuplicateKeyError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -59,6 +61,10 @@ class ReadOnlyCollection:
         self.rows = rows
         self.find_calls = []
         self.find_one_calls = []
+        self.update_calls = []
+        self.insert_calls = []
+        self.delete_calls = []
+        self.create_index_calls = []
 
     def find(self, query: dict | None = None, *_args, **_kwargs) -> FakeCursor:
         self.find_calls.append(query)
@@ -72,16 +78,20 @@ class ReadOnlyCollection:
                 rows = sorted(rows, key=lambda row: row.get(key) or "", reverse=direction < 0)
         return rows[0] if rows else None
 
-    async def update_one(self, *_args, **_kwargs):
+    async def update_one(self, *args, **kwargs):
+        self.update_calls.append((args, kwargs))
         raise AssertionError("AI preview endpoint must not update MongoDB")
 
-    async def insert_one(self, *_args, **_kwargs):
+    async def insert_one(self, *args, **kwargs):
+        self.insert_calls.append((args, kwargs))
         raise AssertionError("AI preview endpoint must not insert MongoDB")
 
-    async def delete_one(self, *_args, **_kwargs):
+    async def delete_one(self, *args, **kwargs):
+        self.delete_calls.append((args, kwargs))
         raise AssertionError("AI preview endpoint must not delete MongoDB")
 
-    async def create_index(self, *_args, **_kwargs):
+    async def create_index(self, *args, **kwargs):
+        self.create_index_calls.append((args, kwargs))
         raise AssertionError("AI preview endpoint must not create MongoDB indexes")
 
 
@@ -185,6 +195,45 @@ class FakeDB:
         raise AttributeError(name)
 
 
+class FakeSnapshotCollection:
+    def __init__(self) -> None:
+        self.rows = []
+        self.find_one_calls = []
+        self.create_index_calls = []
+        self.insert_calls = []
+        self.update_calls = []
+        self.delete_calls = []
+
+    async def find_one(self, query: dict, *_args, **_kwargs) -> dict | None:
+        self.find_one_calls.append(query)
+        return next((row.copy() for row in self.rows if matches_query(row, query)), None)
+
+    async def create_index(self, *args, **kwargs) -> str:
+        self.create_index_calls.append((args, kwargs))
+        return "snapshot_identity_1"
+
+    async def insert_one(self, document: dict) -> SimpleNamespace:
+        self.insert_calls.append(document.copy())
+        if any(row["snapshot_identity"] == document["snapshot_identity"] for row in self.rows):
+            raise DuplicateKeyError("duplicate snapshot_identity")
+        self.rows.append(document.copy())
+        return SimpleNamespace(inserted_id=f"snapshot-{len(self.rows)}")
+
+    async def update_one(self, *args, **kwargs):
+        self.update_calls.append((args, kwargs))
+        raise AssertionError("AI feature save endpoint must not overwrite snapshots")
+
+    async def delete_one(self, *args, **kwargs):
+        self.delete_calls.append((args, kwargs))
+        raise AssertionError("AI feature save endpoint must not delete snapshots")
+
+
+class FakeSaveDB(FakeDB):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ai_feature_snapshots = FakeSnapshotCollection()
+
+
 def test_ai_feature_preview_endpoint_is_read_only_and_no_outcome_leakage(monkeypatch) -> None:
     db = FakeDB()
     monkeypatch.setattr(ai_routes, "get_database", lambda: db)
@@ -238,3 +287,83 @@ def test_ai_feature_preview_rejects_unknown_strategy_without_db_access(monkeypat
 
     assert response.status_code == 400
     assert response.json()["detail"] == "strategy_type must be swing or momentum"
+
+
+def test_ai_feature_save_defaults_to_dry_run_and_writes_nothing(monkeypatch) -> None:
+    db = FakeSaveDB()
+    monkeypatch.setattr(ai_routes, "get_database", lambda: db)
+    client = TestClient(app)
+
+    response = client.post("/api/ai/features/save?strategy_type=momentum&limit=10&timeframe=1D")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["dry_run"] is True
+    assert payload["mongo_writes_enabled"] is False
+    assert payload["built_count"] == 1
+    assert payload["would_save_count"] == 1
+    assert payload["saved_count"] == 0
+    assert payload["duplicate_count"] == 0
+    assert len(payload["rows"]) == 1
+    assert db.ai_feature_snapshots.create_index_calls == []
+    assert db.ai_feature_snapshots.insert_calls == []
+    assert db.ai_feature_snapshots.update_calls == []
+    assert db.ai_feature_snapshots.delete_calls == []
+
+
+def test_ai_feature_save_real_mode_saves_without_outcome_or_paper_trade_writes(monkeypatch) -> None:
+    db = FakeSaveDB()
+    monkeypatch.setattr(ai_routes, "get_database", lambda: db)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/ai/features/save?strategy_type=momentum&limit=10&timeframe=1D&dry_run=false"
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["dry_run"] is False
+    assert payload["mongo_writes_enabled"] is True
+    assert payload["overwrite_enabled"] is False
+    assert payload["saved_count"] == 1
+    assert payload["duplicate_count"] == 0
+    assert len(db.ai_feature_snapshots.rows) == 1
+    stored = db.ai_feature_snapshots.rows[0]
+    assert stored["paper_only"] is True
+    assert all(stored[field] is None for field in OUTCOME_FIELDS)
+    assert "paper_pnl" not in stored
+    assert "paper_pnl_percent" not in stored
+    assert "exit_price" not in stored
+    assert "exit_reason" not in stored
+    assert db.ai_feature_snapshots.create_index_calls[0][1]["unique"] is True
+    assert db.ai_feature_snapshots.update_calls == []
+    assert db.ai_feature_snapshots.delete_calls == []
+    assert len(db.paper_trades.find_one_calls) == 1
+    assert db.paper_trades.update_calls == []
+    assert db.paper_trades.insert_calls == []
+    assert db.paper_trades.delete_calls == []
+    assert db.paper_trades.create_index_calls == []
+
+
+def test_ai_feature_save_prevents_duplicate_snapshot_inserts(monkeypatch) -> None:
+    db = FakeSaveDB()
+    monkeypatch.setattr(ai_routes, "get_database", lambda: db)
+    client = TestClient(app)
+    endpoint = "/api/ai/features/save?strategy_type=momentum&limit=10&timeframe=1D&dry_run=false"
+
+    first = client.post(endpoint)
+    duplicate_dry_run = client.post("/api/ai/features/save?strategy_type=momentum&limit=10&timeframe=1D")
+    duplicate = client.post(endpoint)
+
+    assert first.status_code == 200
+    assert first.json()["saved_count"] == 1
+    assert duplicate_dry_run.status_code == 200
+    assert duplicate_dry_run.json()["would_save_count"] == 0
+    assert duplicate_dry_run.json()["duplicate_count"] == 1
+    assert duplicate.status_code == 200
+    assert duplicate.json()["saved_count"] == 0
+    assert duplicate.json()["duplicate_count"] == 1
+    assert len(db.ai_feature_snapshots.rows) == 1
+    assert len(db.ai_feature_snapshots.insert_calls) == 2
+    assert db.ai_feature_snapshots.update_calls == []
+    assert db.ai_feature_snapshots.delete_calls == []

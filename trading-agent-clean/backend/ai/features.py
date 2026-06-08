@@ -1,3 +1,5 @@
+import hashlib
+import json
 from datetime import UTC, datetime
 from typing import Any, Mapping
 
@@ -206,6 +208,31 @@ def _setup_status(
 
 def initial_snapshot_has_no_outcome(snapshot: Mapping[str, Any]) -> bool:
     return all(snapshot.get(field) is None for field in OUTCOME_FIELDS)
+
+
+def initial_snapshot_has_no_leakage(snapshot: Mapping[str, Any]) -> bool:
+    leakage_tokens = ("outcome", "pnl", "exit", "closed")
+    setup_status = str(snapshot.get("setup_status") or "").upper()
+    return (
+        setup_status not in CLOSED_TRADE_STATUSES
+        and initial_snapshot_has_no_outcome(snapshot)
+        and all(
+            value is None
+            for key, value in snapshot.items()
+            if any(token in str(key).lower() for token in leakage_tokens)
+        )
+    )
+
+
+def ai_feature_snapshot_identity(snapshot: Mapping[str, Any]) -> str:
+    identity = {
+        "symbol": snapshot.get("symbol"),
+        "strategy_type": snapshot.get("strategy_type"),
+        "timeframe": snapshot.get("timeframe"),
+        "data_source_ids": snapshot.get("data_source_ids") or {},
+    }
+    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def build_ai_feature_snapshot(

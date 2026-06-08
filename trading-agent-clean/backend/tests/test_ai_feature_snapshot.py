@@ -6,7 +6,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ai.features import OUTCOME_FIELDS, attach_closed_paper_trade_outcome, build_ai_feature_snapshot
+from ai.features import (
+    OUTCOME_FIELDS,
+    ai_feature_snapshot_identity,
+    attach_closed_paper_trade_outcome,
+    build_ai_feature_snapshot,
+    initial_snapshot_has_no_leakage,
+)
 
 
 def fake_scored_candidate() -> dict:
@@ -158,6 +164,30 @@ def test_initial_snapshot_does_not_leak_closed_trade_outcome() -> None:
     assert all(snapshot[field] is None for field in OUTCOME_FIELDS)
     assert "paper_pnl" not in snapshot
     assert "exit_reason" not in snapshot
+
+
+def test_initial_snapshot_leakage_guard_and_identity() -> None:
+    snapshot = build_ai_feature_snapshot(
+        fake_scored_candidate(),
+        fake_market_data(),
+        fake_tv_confirmation(),
+        fake_paper_signal(),
+        fake_paper_trade("STOPPED"),
+        snapshot_time="2026-01-01T09:15:00",
+    )
+    same_sources_later = {**snapshot, "snapshot_time": "2026-01-02T09:15:00"}
+    different_sources = {
+        **snapshot,
+        "data_source_ids": {**snapshot["data_source_ids"], "scored_candidate_id": "scored-2"},
+    }
+
+    assert initial_snapshot_has_no_leakage(snapshot) is True
+    assert initial_snapshot_has_no_leakage({**snapshot, "paper_pnl": 10}) is False
+    assert initial_snapshot_has_no_leakage({**snapshot, "exit_reason": "TARGET_HIT"}) is False
+    assert initial_snapshot_has_no_leakage({**snapshot, "closed_at": "2026-01-02T09:15:00"}) is False
+    assert initial_snapshot_has_no_leakage({**snapshot, "setup_status": "STOPPED"}) is False
+    assert ai_feature_snapshot_identity(snapshot) == ai_feature_snapshot_identity(same_sources_later)
+    assert ai_feature_snapshot_identity(snapshot) != ai_feature_snapshot_identity(different_sources)
 
 
 def test_paper_outcome_attaches_only_after_trade_closes() -> None:

@@ -252,6 +252,13 @@ def add_unlinked_candidate(db: FakeDB) -> None:
     )
 
 
+def assert_no_paper_trade_writes(db: FakeDB) -> None:
+    assert db.paper_trades.update_calls == []
+    assert db.paper_trades.insert_calls == []
+    assert db.paper_trades.delete_calls == []
+    assert db.paper_trades.create_index_calls == []
+
+
 def test_ai_feature_preview_endpoint_is_read_only_and_no_outcome_leakage(monkeypatch) -> None:
     db = FakeDB()
     monkeypatch.setattr(ai_routes, "get_database", lambda: db)
@@ -265,6 +272,7 @@ def test_ai_feature_preview_endpoint_is_read_only_and_no_outcome_leakage(monkeyp
     assert payload["preview_only"] is True
     assert payload["mongo_writes_enabled"] is False
     assert payload["strategy_type"] == "momentum"
+    assert payload["source"] == "scored_candidates"
     assert payload["linked_only"] is True
     assert payload["warning"] is None
     assert payload["skipped_unlinked_count"] == 0
@@ -296,6 +304,45 @@ def test_ai_feature_preview_endpoint_is_read_only_and_no_outcome_leakage(monkeyp
     assert len(db.market_data.find_one_calls) == 1
     assert len(db.paper_signals.find_one_calls) == 1
     assert len(db.paper_trades.find_one_calls) == 1
+
+
+def test_ai_feature_preview_paper_trades_source_is_linked_without_candidate_flag_or_outcome_leakage(
+    monkeypatch,
+) -> None:
+    db = FakeDB()
+    db.scored_candidates.rows[0]["momentum_candidate"] = False
+    monkeypatch.setattr(ai_routes, "get_database", lambda: db)
+    client = TestClient(app)
+
+    response = client.get(
+        "/api/ai/features/preview?strategy_type=momentum&limit=10&timeframe=1D&source=paper_trades"
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["source"] == "paper_trades"
+    assert payload["linked_only"] is True
+    assert payload["built_count"] == 1
+    assert payload["skipped_unlinked_count"] == 0
+    assert payload["returned_count"] == 1
+    row = payload["rows"][0]
+    assert row["symbol"] == "TEST"
+    assert row["paper_trade_id"] == "trade-closed"
+    assert row["data_source_ids"]["scored_candidate_id"] == "scored-1"
+    assert row["setup_status"] == "MOMENTUM_CONFIRMED"
+    assert all(row[field] is None for field in OUTCOME_FIELDS)
+    assert "paper_pnl" not in row
+    assert "paper_pnl_percent" not in row
+    assert "exit_price" not in row
+    assert "exit_reason" not in row
+    assert db.paper_trades.find_calls == [
+        {
+            "paper_only": True,
+            "timeframe": "1D",
+            "source_signal_type": "MOMENTUM_TV_CONFIRMED",
+        }
+    ]
+    assert_no_paper_trade_writes(db)
 
 
 def test_ai_feature_preview_defaults_to_excluding_unlinked_snapshots(monkeypatch) -> None:
@@ -359,6 +406,7 @@ def test_ai_feature_save_defaults_to_dry_run_and_writes_nothing(monkeypatch) -> 
     payload = response.json()
     assert payload["dry_run"] is True
     assert payload["mongo_writes_enabled"] is False
+    assert payload["source"] == "scored_candidates"
     assert payload["linked_only"] is True
     assert payload["skipped_unlinked_count"] == 0
     assert payload["built_count"] == 1
@@ -370,6 +418,31 @@ def test_ai_feature_save_defaults_to_dry_run_and_writes_nothing(monkeypatch) -> 
     assert db.ai_feature_snapshots.insert_calls == []
     assert db.ai_feature_snapshots.update_calls == []
     assert db.ai_feature_snapshots.delete_calls == []
+
+
+def test_ai_feature_save_paper_trades_source_dry_run_writes_nothing(monkeypatch) -> None:
+    db = FakeSaveDB()
+    db.scored_candidates.rows[0]["momentum_candidate"] = False
+    monkeypatch.setattr(ai_routes, "get_database", lambda: db)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/ai/features/save?strategy_type=momentum&limit=10&timeframe=1D&source=paper_trades"
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["dry_run"] is True
+    assert payload["mongo_writes_enabled"] is False
+    assert payload["source"] == "paper_trades"
+    assert payload["linked_only"] is True
+    assert payload["would_save_count"] == 1
+    assert payload["rows"][0]["paper_trade_id"] == "trade-closed"
+    assert db.ai_feature_snapshots.create_index_calls == []
+    assert db.ai_feature_snapshots.insert_calls == []
+    assert db.ai_feature_snapshots.update_calls == []
+    assert db.ai_feature_snapshots.delete_calls == []
+    assert_no_paper_trade_writes(db)
 
 
 def test_ai_feature_save_dry_run_allows_unlinked_snapshots_only_when_explicit(monkeypatch) -> None:
@@ -434,6 +507,39 @@ def test_ai_feature_save_real_mode_saves_without_outcome_or_paper_trade_writes(m
     assert db.paper_trades.insert_calls == []
     assert db.paper_trades.delete_calls == []
     assert db.paper_trades.create_index_calls == []
+
+
+def test_ai_feature_save_paper_trades_source_saves_linked_snapshot_and_prevents_duplicate(monkeypatch) -> None:
+    db = FakeSaveDB()
+    db.scored_candidates.rows[0]["momentum_candidate"] = False
+    monkeypatch.setattr(ai_routes, "get_database", lambda: db)
+    client = TestClient(app)
+    endpoint = (
+        "/api/ai/features/save?strategy_type=momentum&limit=10&timeframe=1D"
+        "&source=paper_trades&dry_run=false"
+    )
+
+    first = client.post(endpoint)
+    duplicate = client.post(endpoint)
+
+    assert first.status_code == 200
+    assert first.json()["source"] == "paper_trades"
+    assert first.json()["saved_count"] == 1
+    assert first.json()["skipped_unlinked_count"] == 0
+    assert duplicate.status_code == 200
+    assert duplicate.json()["saved_count"] == 0
+    assert duplicate.json()["duplicate_count"] == 1
+    assert len(db.ai_feature_snapshots.rows) == 1
+    stored = db.ai_feature_snapshots.rows[0]
+    assert stored["paper_trade_id"] == "trade-closed"
+    assert all(stored[field] is None for field in OUTCOME_FIELDS)
+    assert "paper_pnl" not in stored
+    assert "paper_pnl_percent" not in stored
+    assert "exit_price" not in stored
+    assert "exit_reason" not in stored
+    assert db.ai_feature_snapshots.update_calls == []
+    assert db.ai_feature_snapshots.delete_calls == []
+    assert_no_paper_trade_writes(db)
 
 
 def test_ai_feature_save_prevents_duplicate_snapshot_inserts(monkeypatch) -> None:

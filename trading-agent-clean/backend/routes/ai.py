@@ -26,6 +26,7 @@ STRATEGY_SIGNAL_TYPES = {
 }
 RESULT_LABELS = ("WIN", "LOSS", "BREAKEVEN", "UNKNOWN")
 UNLINKED_SNAPSHOT_WARNING = "Unlinked snapshots cannot receive paper outcomes later."
+SNAPSHOT_SOURCES = ("scored_candidates", "paper_trades")
 
 
 def normalize_strategy_type(strategy_type: str) -> str:
@@ -33,6 +34,13 @@ def normalize_strategy_type(strategy_type: str) -> str:
     if strategy not in STRATEGY_SIGNAL_TYPES:
         raise HTTPException(status_code=400, detail="strategy_type must be swing or momentum")
     return strategy
+
+
+def normalize_snapshot_source(source: str) -> str:
+    clean_source = (source or "").strip().lower()
+    if clean_source not in SNAPSHOT_SOURCES:
+        raise HTTPException(status_code=400, detail="source must be scored_candidates or paper_trades")
+    return clean_source
 
 
 def _candidate_query(strategy_type: str) -> dict[str, Any]:
@@ -103,6 +111,21 @@ async def _find_market_data(db, candidate: dict) -> dict | None:
     return await _find_latest(getattr(db, "market_data", None), query)
 
 
+async def _find_scored_candidate(db, source_document: dict) -> dict | None:
+    values = _symbol_values(source_document)
+    query = _or_query(
+        [
+            {"tradingview_symbol": values["tradingview_symbol"]},
+            {"symbol": values["tradingview_symbol"]},
+            {"canonical_symbol": values["canonical"]},
+            {"symbol": values["canonical"]},
+        ]
+    )
+    if values["exchange"]:
+        query["exchange"] = values["exchange"]
+    return await _find_latest(getattr(db, "scored_candidates", None), query)
+
+
 async def _find_paper_signal(db, candidate: dict, strategy_type: str, timeframe: str) -> dict | None:
     values = _symbol_values(candidate)
     query = {
@@ -137,7 +160,7 @@ async def _find_paper_trade(db, candidate: dict, strategy_type: str, timeframe: 
     return await _find_latest(getattr(db, "paper_trades", None), query)
 
 
-async def _build_feature_snapshots(db, strategy: str, limit: int, timeframe: str) -> list[dict]:
+async def _build_candidate_feature_snapshots(db, strategy: str, limit: int, timeframe: str) -> list[dict]:
     cursor = db.scored_candidates.find(_candidate_query(strategy)).sort(_candidate_sort(strategy)).limit(limit)
     candidates = [row async for row in cursor]
     snapshot_time = utc_now_iso()
@@ -160,6 +183,49 @@ async def _build_feature_snapshots(db, strategy: str, limit: int, timeframe: str
             )
         )
     return rows
+
+
+async def _build_paper_trade_feature_snapshots(db, strategy: str, limit: int, timeframe: str) -> list[dict]:
+    query = {
+        "paper_only": True,
+        "timeframe": timeframe,
+        "source_signal_type": STRATEGY_SIGNAL_TYPES[strategy],
+    }
+    cursor = db.paper_trades.find(query).sort("updated_at", -1).limit(limit)
+    paper_trades = [row async for row in cursor]
+    snapshot_time = utc_now_iso()
+    rows = []
+
+    for paper_trade in paper_trades:
+        candidate = await _find_scored_candidate(db, paper_trade)
+        scored_candidate = {**(candidate or {}), "strategy_type": strategy}
+        lookup_document = scored_candidate if candidate else paper_trade
+        market_data = await _find_market_data(db, lookup_document)
+        paper_signal = await _find_paper_signal(db, lookup_document, strategy, timeframe)
+        rows.append(
+            build_ai_feature_snapshot(
+                scored_candidate,
+                market_data,
+                None,
+                paper_signal,
+                paper_trade,
+                snapshot_time=snapshot_time,
+                timeframe=timeframe,
+            )
+        )
+    return rows
+
+
+async def _build_feature_snapshots(
+    db,
+    strategy: str,
+    limit: int,
+    timeframe: str,
+    source: str,
+) -> list[dict]:
+    if source == "paper_trades":
+        return await _build_paper_trade_feature_snapshots(db, strategy, limit, timeframe)
+    return await _build_candidate_feature_snapshots(db, strategy, limit, timeframe)
 
 
 def _filter_linked_snapshots(snapshots: list[dict], linked_only: bool) -> tuple[list[dict], int]:
@@ -296,10 +362,12 @@ async def preview_ai_feature_snapshots(
     limit: int = Query(default=10, ge=1, le=100),
     timeframe: str = Query(default="1D"),
     linked_only: bool = Query(default=True),
+    source: str = Query(default="scored_candidates"),
 ) -> dict:
     strategy = normalize_strategy_type(strategy_type)
+    clean_source = normalize_snapshot_source(source)
     clean_timeframe = (timeframe or "1D").strip().upper()
-    built_rows = await _build_feature_snapshots(get_database(), strategy, limit, clean_timeframe)
+    built_rows = await _build_feature_snapshots(get_database(), strategy, limit, clean_timeframe, clean_source)
     rows, skipped_unlinked_count = _filter_linked_snapshots(built_rows, linked_only)
 
     return {
@@ -308,6 +376,7 @@ async def preview_ai_feature_snapshots(
         "mongo_writes_enabled": False,
         "strategy_type": strategy,
         "timeframe": clean_timeframe,
+        "source": clean_source,
         "linked_only": linked_only,
         "warning": _unlinked_snapshot_warning(linked_only),
         "built_count": len(built_rows),
@@ -325,11 +394,13 @@ async def save_ai_feature_snapshots(
     timeframe: str = Query(default="1D"),
     dry_run: bool = Query(default=True),
     linked_only: bool = Query(default=True),
+    source: str = Query(default="scored_candidates"),
 ) -> dict:
     strategy = normalize_strategy_type(strategy_type)
+    clean_source = normalize_snapshot_source(source)
     clean_timeframe = (timeframe or "1D").strip().upper()
     db = get_database()
-    built_snapshots = await _build_feature_snapshots(db, strategy, limit, clean_timeframe)
+    built_snapshots = await _build_feature_snapshots(db, strategy, limit, clean_timeframe, clean_source)
     filtered_snapshots, skipped_unlinked_count = _filter_linked_snapshots(built_snapshots, linked_only)
     snapshots = [
         _prepare_snapshot_for_save(snapshot)
@@ -347,6 +418,7 @@ async def save_ai_feature_snapshots(
             "overwrite_enabled": False,
             "strategy_type": strategy,
             "timeframe": clean_timeframe,
+            "source": clean_source,
             "linked_only": linked_only,
             "warning": _unlinked_snapshot_warning(linked_only),
             "built_count": len(built_snapshots),
@@ -379,6 +451,7 @@ async def save_ai_feature_snapshots(
         "overwrite_enabled": False,
         "strategy_type": strategy,
         "timeframe": clean_timeframe,
+        "source": clean_source,
         "linked_only": linked_only,
         "warning": _unlinked_snapshot_warning(linked_only),
         "built_count": len(built_snapshots),

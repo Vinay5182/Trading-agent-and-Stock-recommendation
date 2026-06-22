@@ -1,65 +1,109 @@
 export const API_BASE = "http://127.0.0.1:8011";
 
-async function request(path, options = {}) {
-  const response = await fetch(`${API_BASE}${path}`, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-    cache: "no-store",
-    ...options,
-  });
-  const text = await response.text();
-  let data = {};
-  try {
-    data = text ? JSON.parse(text) : {};
-  } catch {
-    data = text ? { raw: text } : {};
+export class RequestCancelledError extends Error {
+  constructor(message = "Request cancelled.") {
+    super(message);
+    this.name = "AbortError";
+    this.code = "REQUEST_CANCELLED";
+    this.cancelled = true;
   }
-  if (!response.ok) {
-    const message = [data?.message, data?.detail, data?.error].find((item) => typeof item === "string" && item) || `HTTP ${response.status}`;
-    const error = new Error(message);
-    error.status = response.status;
-    error.responseBody = data;
-    error.rawBody = text;
-    throw error;
-  }
-  return data;
 }
 
-export const getHealth = () => request("/health");
-export const getSettings = () => request("/api/settings");
-export const getAiFeatureDatasetSummary = ({ strategyType, timeframe } = {}) => {
+export const isRequestCancellation = (error) => {
+  const message = String(error?.message || error || "");
+  return Boolean(
+    error?.cancelled === true
+    || error?.code === "REQUEST_CANCELLED"
+    || error?.name === "AbortError"
+    || /^Request cancelled\.?$/i.test(message)
+  );
+};
+
+async function request(path, options = {}) {
+  const { timeoutMs = 120000, signal, ...fetchOptions } = options;
+  const controller = new AbortController();
+  const abortFromCaller = () => controller.abort();
+  if (signal?.aborted) controller.abort();
+  else signal?.addEventListener("abort", abortFromCaller, { once: true });
+  const timeoutId = globalThis.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`${API_BASE}${path}`, {
+      headers: { "Content-Type": "application/json", ...(fetchOptions.headers || {}) },
+      cache: "no-store",
+      ...fetchOptions,
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    let data = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = text ? { raw: text, parse_error: true } : {};
+    }
+    if (!response.ok) {
+      const message = [data?.message, data?.detail, data?.error].find((item) => typeof item === "string" && item) || `HTTP ${response.status}`;
+      const error = new Error(message);
+      error.status = response.status;
+      error.responseBody = data;
+      error.rawBody = text;
+      throw error;
+    }
+    return data;
+  } catch (error) {
+    if (controller.signal.aborted) {
+      if (signal?.aborted) throw new RequestCancelledError();
+      throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)} seconds.`);
+    }
+    if (isRequestCancellation(error)) throw new RequestCancelledError();
+    if (error instanceof TypeError) {
+      throw new Error("Backend request failed. Check that the API on 127.0.0.1:8011 is running.");
+    }
+    throw error;
+  } finally {
+    globalThis.clearTimeout(timeoutId);
+    signal?.removeEventListener("abort", abortFromCaller);
+  }
+}
+
+export const getHealth = (options = {}) => request("/health", options);
+export const getSettings = (options = {}) => request("/api/settings", options);
+export const getSystemRuntimeInfo = (options = {}) => request("/api/system/runtime-info", options);
+export const getAiFeatureDatasetSummary = ({ strategyType, timeframe } = {}, options = {}) => {
   const params = new URLSearchParams();
   if (strategyType) params.set("strategy_type", strategyType);
   if (timeframe) params.set("timeframe", timeframe);
   const query = params.toString();
-  return request(`/api/ai/features/summary${query ? `?${query}` : ""}`);
+  return request(`/api/ai/features/summary${query ? `?${query}` : ""}`, options);
 };
-export const getAiDataCollectionStatus = () => request("/api/ai/features/collection-status");
-export const getAiFeatureSnapshots = (limit = 50) => request(`/api/ai/features/snapshots?limit=${encodeURIComponent(limit)}`);
-export const getAiOutcomePreview = (limit = 50) => request(`/api/ai/features/outcome-preview?limit=${encodeURIComponent(limit)}`);
-export const runScan = () => request("/api/scan", {
+export const getAiDataCollectionStatus = (options = {}) => request("/api/ai/features/collection-status", options);
+export const getAiFeatureSnapshots = (limit = 50, options = {}) => request(`/api/ai/features/snapshots?limit=${encodeURIComponent(limit)}`, options);
+export const getAiOutcomePreview = (limit = 50, options = {}) => request(`/api/ai/features/outcome-preview?limit=${encodeURIComponent(limit)}`, options);
+export const runScan = (options = {}) => request("/api/scan", {
   method: "POST",
   body: JSON.stringify({ selected_index: "DEFAULT_UNIVERSE", limit: 50, force_refresh: false }),
+  ...options,
 });
-export const getScanRows = (scanRunId) => request(`/api/scan/rows${scanRunId ? `?scan_run_id=${encodeURIComponent(scanRunId)}` : ""}`);
+export const getScanRows = (scanRunId, options = {}) => request(`/api/scan/rows${scanRunId ? `?scan_run_id=${encodeURIComponent(scanRunId)}` : ""}`, options);
 export const runScoring = (indexName = "BROAD_MARKET_750") => request(`/api/score/run?index_name=${encodeURIComponent(indexName)}`, { method: "POST" });
-export const getScoreSummary = (indexName = "BROAD_MARKET_750") => request(`/api/score/summary?index_name=${encodeURIComponent(indexName)}`);
-export const getSwingSummary = (indexName = "BROAD_MARKET_750") => request(`/api/swing/summary?index_name=${encodeURIComponent(indexName)}`);
+export const getScoreSummary = (indexName = "BROAD_MARKET_750", options = {}) => request(`/api/score/summary?index_name=${encodeURIComponent(indexName)}`, options);
+export const getSwingSummary = (indexName = "BROAD_MARKET_750", options = {}) => request(`/api/swing/summary?index_name=${encodeURIComponent(indexName)}`, options);
 export const getSwingCandidates = (indexName = "BROAD_MARKET_750", limit = 100) => request(`/api/swing/candidates?index_name=${encodeURIComponent(indexName)}&limit=${encodeURIComponent(limit)}`);
-export const getSwingTvConfirmed = ({ indexName = "BROAD_MARKET_750", limit } = {}) => (
-  request(`/api/swing/tv-confirmed?index_name=${encodeURIComponent(indexName)}${limit ? `&limit=${encodeURIComponent(limit)}` : ""}`)
+export const getSwingTvConfirmed = ({ indexName = "BROAD_MARKET_750", limit } = {}, options = {}) => (
+  request(`/api/swing/tv-confirmed?index_name=${encodeURIComponent(indexName)}${limit ? `&limit=${encodeURIComponent(limit)}` : ""}`, options)
 );
-export const getMomentumSummary = (indexName = "BROAD_MARKET_750") => request(`/api/momentum/summary?index_name=${encodeURIComponent(indexName)}`);
+export const getMomentumSummary = (indexName = "BROAD_MARKET_750", options = {}) => request(`/api/momentum/summary?index_name=${encodeURIComponent(indexName)}`, options);
 export const getMomentumCandidates = (indexName = "BROAD_MARKET_750", limit = 100) => request(`/api/momentum/candidates?index_name=${encodeURIComponent(indexName)}&limit=${encodeURIComponent(limit)}`);
-export const getMarketDataSymbol = ({ exchange = "NSE", symbol }) => request(`/api/market/data/${encodeURIComponent(exchange)}/${encodeURIComponent(symbol)}`);
-export const getSwingPrecheck = ({ exchange = "NSE", symbol, indexName = "BROAD_MARKET_750" }) => (
-  request(`/api/swing/precheck/${encodeURIComponent(exchange)}/${encodeURIComponent(symbol)}?index_name=${encodeURIComponent(indexName)}`)
+export const getMarketDataSymbol = ({ exchange = "NSE", symbol }, options = {}) => request(`/api/market/data/${encodeURIComponent(exchange)}/${encodeURIComponent(symbol)}`, options);
+export const getSwingPrecheck = ({ exchange = "NSE", symbol, indexName = "BROAD_MARKET_750" }, options = {}) => (
+  request(`/api/swing/precheck/${encodeURIComponent(exchange)}/${encodeURIComponent(symbol)}?index_name=${encodeURIComponent(indexName)}`, options)
 );
-export const getMomentumPrecheck = ({ exchange = "NSE", symbol, indexName = "BROAD_MARKET_750" }) => (
-  request(`/api/momentum/precheck/${encodeURIComponent(exchange)}/${encodeURIComponent(symbol)}?index_name=${encodeURIComponent(indexName)}`)
+export const getMomentumPrecheck = ({ exchange = "NSE", symbol, indexName = "BROAD_MARKET_750" }, options = {}) => (
+  request(`/api/momentum/precheck/${encodeURIComponent(exchange)}/${encodeURIComponent(symbol)}?index_name=${encodeURIComponent(indexName)}`, options)
 );
-export const getMomentumTvConfirmed = ({ indexName = "BROAD_MARKET_750", limit } = {}) => (
-  request(`/api/momentum/tv-confirmed?index_name=${encodeURIComponent(indexName)}${limit ? `&limit=${encodeURIComponent(limit)}` : ""}`)
+export const getMomentumTvConfirmed = ({ indexName = "BROAD_MARKET_750", limit } = {}, options = {}) => (
+  request(`/api/momentum/tv-confirmed?index_name=${encodeURIComponent(indexName)}${limit ? `&limit=${encodeURIComponent(limit)}` : ""}`, options)
 );
+export const getDashboardPaperEquity = (options = {}) => request("/api/dashboard/paper-equity", options);
 export const testTvSymbol = (symbol, timeframe) => request("/api/tv/test-symbol", {
   method: "POST",
   body: JSON.stringify({ symbol, timeframe, fetch_candles: true }),
@@ -67,33 +111,17 @@ export const testTvSymbol = (symbol, timeframe) => request("/api/tv/test-symbol"
 export const buildSwingSignals = (save = false) => request(`/api/signals/build-tv-confirmed?limit=5&timeframe=1D&save=${save}`, { method: "POST" });
 export const buildMomentumSignals = (save = false) => request(`/api/signals/build-momentum-tv-confirmed?limit=5&timeframe=1D&save=${save}`, { method: "POST" });
 export const buildPaperPlans = (signalType = "SWING_TV_CONFIRMED", save = false) => request(`/api/paper/build-plans?limit=5&timeframe=1D&save=${save}&signal_type=${encodeURIComponent(signalType)}`, { method: "POST" });
-export const updatePaperPlans = (maxTrades) => request(`/api/paper/update-trades${maxTrades ? `?max_trades=${encodeURIComponent(maxTrades)}` : ""}`, { method: "POST" });
-export const runPaperUpdateDryRun = ({ maxTrades = 6, maxWrites = 1 } = {}) => request(`/api/paper/update-trades?dry_run=true&max_trades=${encodeURIComponent(maxTrades)}&max_writes=${encodeURIComponent(maxWrites)}`, { method: "POST" });
-export const approvePaperUpdateFromDryRun = ({
-  approvedDryRunId,
-  confirmationText,
-  maxTrades = 6,
-  maxWrites = 1,
-}) => request("/api/paper/update-trades/approve", {
-  method: "POST",
-  body: JSON.stringify({
-    approved_dry_run_id: approvedDryRunId,
-    confirmation_text: confirmationText,
-    max_trades: maxTrades,
-    max_writes: maxWrites,
-  }),
-});
-export const getPaperUpdateProgress = () => request("/api/paper/update-progress");
-export const getPaperUpdateRuns = (limit = 10) => request(`/api/paper/update-runs?limit=${encodeURIComponent(limit)}`);
-export const getPaperUpdateLock = () => request("/api/paper/update-lock");
-export const getPaperUpdateSchedulerStatus = () => request("/api/paper/update-scheduler/status");
-export const getPaperSummary = () => request("/api/paper/summary");
-export const getPaperEquity = () => request("/api/dashboard/paper-equity");
-export const getPaperSignals = () => request("/api/signals/paper");
-export const getPaperPlans = () => request("/api/paper/plans?source_signal_type=ALL");
-export const getActiveTrades = () => request("/api/paper/active");
-export const getAllTrades = () => request("/api/paper/trades");
-export const resetBuildPaperFromTradeReady = (dryRun = true) => request(`/api/paper/reset-build-trade-ready?index_name=BROAD_MARKET_750&dry_run=${dryRun}`, { method: "POST" });
+export const getTradingViewRuntimeStatus = (options = {}) => request("/api/tv/runtime-status", options);
+export const getTradingViewAttachableTabs = (options = {}) => request("/api/tv/attachable-tabs", options);
+export const attachTradingViewTab = (targetId, options = {}) => request(`/api/tv/attach-tab?target_id=${encodeURIComponent(targetId)}`, { method: "POST", ...options });
+export const detachTradingViewTab = (options = {}) => request("/api/tv/detach-tab", { method: "POST", ...options });
+export const getPaperUpdateProgress = (options = {}) => request("/api/paper/update-progress", options);
+export const getPaperUpdateRuns = (limit = 10, options = {}) => request(`/api/paper/update-runs?limit=${encodeURIComponent(limit)}`, options);
+export const getPaperUpdateLock = (options = {}) => request("/api/paper/update-lock", options);
+export const getPaperUpdateSchedulerStatus = (options = {}) => request("/api/paper/update-scheduler/status", options);
+export const getPaperSummary = (options = {}) => request("/api/paper/summary", options);
+export const getPaperOpenTrades = (options = {}) => request("/api/paper/open", options);
+export const getPaperHistory = (options = {}) => request("/api/paper/history", options);
 export const loadAllMarketData = (dryRun = false) => request(`/api/market/load-all?index_name=BROAD_MARKET_750&dry_run=${dryRun}`, { method: "POST" });
 export const getMarketLoadProgress = () => request("/api/market/load-progress?index_name=BROAD_MARKET_750");
 export const runPaperPipeline = ({ limit = 1, timeframe = "1D", dryRun = true, strategy = "swing" }) => (

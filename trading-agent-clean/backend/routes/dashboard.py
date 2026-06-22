@@ -2,42 +2,56 @@ from fastapi import APIRouter
 from math import floor
 
 from database import get_database
+from services.trade_journal import (
+    analytics_eligible_record,
+    analytics_pnl_value,
+    analytics_profit_percent_value,
+    build_trade_analytics,
+    is_ambiguous_trade,
+    load_trade_journal,
+    number_or_none,
+)
 
 
 router = APIRouter()
-VIRTUAL_BALANCE = 50000.0
-TRADE_CAPITAL = 5000.0
+STARTING_VIRTUAL_BALANCE = 250000.0
+MINIMUM_TRADE_CAPITAL = 5000.0
 LEVERAGE = 2.5
-WAITING_STATUSES = {"PLANNED", "NOT_TRIGGERED"}
-OPEN_STATUSES = {"ACTIVE", "TARGET_1_HIT"}
+WAITING_STATUSES = {"PLANNED", "NOT_TRIGGERED", "WAITING", "WAITING_FOR_ENTRY"}
+T1_PARTIAL_STATUS = "T1_PARTIAL"
+T2_PARTIAL_STATUS = "T2_PARTIAL"
+PARTIAL_STATUSES = {T1_PARTIAL_STATUS, T2_PARTIAL_STATUS, "TARGET_1_HIT", "TARGET_2_HIT"}
+ACTIVE_STATUSES = {"ACTIVE", *PARTIAL_STATUSES}
 TERMINAL_STATUSES = {
+    "AMBIGUOUS",
     "CLOSED",
+    "COMPLETED",
     "EXPIRED",
-    "TARGET_HIT",
-    "TARGET_1_HIT_FINAL",
-    "TARGET_2_HIT",
-    "TARGET_3_HIT",
-    "T1_HIT",
-    "T2_HIT",
-    "T3_HIT",
-    "WON_T1",
-    "WON_T2",
-    "WON_T3",
+    "LOST_SL",
+    "SL_HIT",
     "STOP_HIT",
     "STOPPED",
     "STOPPED_AFTER_T1",
-    "SL_HIT",
-    "LOST_SL",
-    "AMBIGUOUS",
-}
-TARGET_STATUSES = {
+    "T1_HIT",
+    "T2_HIT",
+    "T3_HIT",
     "TARGET_HIT",
     "TARGET_1_HIT_FINAL",
     "TARGET_2_HIT",
     "TARGET_3_HIT",
+    "WON_T1",
+    "WON_T2",
+    "WON_T3",
+}
+TARGET_STATUSES = {
+    "COMPLETED",
     "T1_HIT",
     "T2_HIT",
     "T3_HIT",
+    "TARGET_HIT",
+    "TARGET_1_HIT_FINAL",
+    "TARGET_2_HIT",
+    "TARGET_3_HIT",
     "WON_T1",
     "WON_T2",
     "WON_T3",
@@ -56,153 +70,357 @@ RR_BY_STATUS = {
 }
 
 
-def _number(value) -> float:
-    return float(value) if isinstance(value, (int, float)) else 0.0
+def _round(value, digits: int = 2) -> float:
+    return round(float(value or 0.0), digits)
+
+
+def _first_number(*values) -> float | None:
+    for value in values:
+        numeric = number_or_none(value)
+        if numeric is not None:
+            return numeric
+    return None
 
 
 def _statuses(trade: dict) -> set[str]:
-    return {str(trade.get(field) or "").upper() for field in ("status", "outcome_status")}
+    return {
+        status
+        for status in (
+            str(trade.get("status") or "").upper(),
+            str(trade.get("outcome_status") or "").upper(),
+            str(trade.get("state") or "").upper(),
+            str(trade.get("exit_reason") or "").upper(),
+        )
+        if status
+    }
 
 
 def _is_waiting_trade(trade: dict) -> bool:
     statuses = _statuses(trade)
-    if statuses & (OPEN_STATUSES | TERMINAL_STATUSES):
+    if statuses & (ACTIVE_STATUSES | TERMINAL_STATUSES):
         return False
     return bool(statuses & WAITING_STATUSES) or trade.get("entry_triggered") is False
 
 
+def _is_partial_trade(trade: dict) -> bool:
+    statuses = _statuses(trade)
+    return bool(statuses & PARTIAL_STATUSES) and not bool(statuses & TERMINAL_STATUSES)
+
+
 def _is_open_trade(trade: dict) -> bool:
     statuses = _statuses(trade)
-    return bool(statuses & OPEN_STATUSES) and not bool(statuses & TERMINAL_STATUSES)
+    return bool(statuses & ACTIVE_STATUSES) and not bool(statuses & TERMINAL_STATUSES)
 
 
-def _realized_rr(trade: dict) -> float:
+def _is_active_trade(trade: dict) -> bool:
+    return _is_open_trade(trade) and not _is_partial_trade(trade)
+
+
+def _has_sl_status(record: dict) -> bool:
+    statuses = _statuses(record)
+    return bool(record.get("SL_HIT")) or bool(statuses & LOSS_STATUSES)
+
+
+def _is_completed_trade(trade: dict) -> bool:
+    if is_ambiguous_trade(trade) or _has_sl_status(trade):
+        return False
     statuses = _statuses(trade)
-    for status in ("T3_HIT", "WON_T3", "T2_HIT", "WON_T2", "T1_HIT", "WON_T1", "SL_HIT", "LOST_SL", "AMBIGUOUS"):
-        if status in statuses:
-            return RR_BY_STATUS[status]
-    return 0
+    return bool(statuses & TARGET_STATUSES)
 
 
-def _outcome_type(trade: dict) -> str | None:
-    statuses = _statuses(trade)
-    if statuses & TARGET_STATUSES:
-        return "WIN"
-    if statuses & LOSS_STATUSES:
-        return "LOSS"
-    return None
+def _is_sl_record(record: dict) -> bool:
+    pnl = analytics_pnl_value(record)
+    return _has_sl_status(record) or (pnl is not None and pnl < 0)
+
+
+def _is_completed_record(record: dict) -> bool:
+    if is_ambiguous_trade(record) or _is_sl_record(record):
+        return False
+    statuses = _statuses(record)
+    pnl = analytics_pnl_value(record)
+    return bool(statuses & TARGET_STATUSES) or (pnl is not None and pnl >= 0)
+
+
+def _strategy_label(trade: dict) -> str:
+    text = str(trade.get("source_signal_type") or trade.get("signal_type") or trade.get("strategy_type") or "").upper()
+    if "MOMENTUM" in text:
+        return "Momentum"
+    if "SWING" in text:
+        return "Swing"
+    return text.replace("_", " ").title() if text else "Other"
+
+
+def _trade_quantity(trade: dict) -> float:
+    if _is_partial_trade(trade):
+        partial_quantity = _first_number(trade.get("quantity_remaining"))
+        if partial_quantity is not None:
+            return max(partial_quantity, 0.0)
+    quantity = _first_number(trade.get("quantity_remaining"), trade.get("quantity"))
+    return max(quantity or 0.0, 0.0)
+
+
+def _trade_margin(exposure: float) -> float:
+    if exposure <= 0:
+        return 0.0
+    leveraged_margin = exposure / LEVERAGE if LEVERAGE else exposure
+    return max(MINIMUM_TRADE_CAPITAL, leveraged_margin)
+
+
+def _open_trade_exposure(trade: dict) -> float:
+    entry = _first_number(trade.get("entry_price"), trade.get("entry"), trade.get("paper_entry_price"))
+    quantity = _trade_quantity(trade)
+    if entry is not None and quantity:
+        return max(entry * quantity, 0.0)
+    return 0.0
+
+
+def _open_trade_unrealized_pnl(trade: dict) -> float:
+    if not _is_open_trade(trade):
+        return 0.0
+    pnl = _first_number(
+        trade.get("remaining_unrealized_pnl"),
+        trade.get("unrealized_pnl"),
+        trade.get("paper_pnl"),
+        trade.get("total_trade_pnl"),
+    )
+    return pnl or 0.0
 
 
 def _paper_quantity(trade: dict) -> int:
-    entry_price = _number(trade.get("entry_price"))
-    return floor((TRADE_CAPITAL * LEVERAGE) / entry_price) if entry_price > 0 else 0
+    entry_price = _first_number(trade.get("entry_price"), trade.get("entry"), trade.get("paper_entry_price"))
+    exposure = _open_trade_exposure(trade) or (MINIMUM_TRADE_CAPITAL * LEVERAGE)
+    return floor(exposure / entry_price) if entry_price and entry_price > 0 else 0
 
 
-def _leveraged_pnl(trade: dict) -> float:
-    raw_pnl = _number(trade.get("paper_pnl"))
-    per_share_statuses = {"NOT_TRIGGERED", "ACTIVE", "T1_HIT", "T2_HIT", "T3_HIT", "SL_HIT", "AMBIGUOUS"}
-    return raw_pnl * _paper_quantity(trade) if _statuses(trade) & per_share_statuses else raw_pnl
+def _record_sort_value(record: dict) -> str:
+    return str(record.get("exit_date") or record.get("journaled_at") or record.get("created_at") or "")
 
 
-def _counts_for_pnl(trade: dict) -> bool:
-    return bool(_is_open_trade(trade) or _outcome_type(trade) or (_statuses(trade) & TERMINAL_STATUSES))
+def _open_position_rows(open_trades: list[dict], current_balance: float) -> list[dict]:
+    available_margin = current_balance
+    rows = []
+    for trade in sorted(open_trades, key=lambda row: str(row.get("entry_triggered_at") or row.get("created_at") or row.get("updated_at") or "")):
+        exposure = _open_trade_exposure(trade)
+        margin_used = _trade_margin(exposure)
+        available_margin -= margin_used
+        broker_funded = exposure - margin_used
+        rows.append(
+            {
+                "symbol": trade.get("symbol"),
+                "strategy": _strategy_label(trade),
+                "status": "Partial" if _is_partial_trade(trade) else "Active",
+                "entry_price": _first_number(trade.get("entry_price"), trade.get("entry"), trade.get("paper_entry_price")),
+                "quantity": _first_number(trade.get("quantity")),
+                "quantity_remaining": _trade_quantity(trade),
+                "current_price": _first_number(trade.get("latest_close"), trade.get("current_price")),
+                "effective_exposure": _round(exposure),
+                "actual_trade_capital": _round(margin_used),
+                "margin_used": _round(margin_used),
+                "broker_funded": _round(broker_funded),
+                "available_margin_after_trade": _round(available_margin),
+                "unrealized_pnl": _round(_open_trade_unrealized_pnl(trade)),
+                "updated_at": trade.get("updated_at") or trade.get("last_checked_at"),
+            }
+        )
+    return rows
 
 
-def _reportable_pnl(trade: dict) -> float:
-    return _leveraged_pnl(trade) if _counts_for_pnl(trade) else 0.0
+def _equity_curve(records: list[dict]) -> tuple[list[dict], float]:
+    equity = STARTING_VIRTUAL_BALANCE
+    peak = STARTING_VIRTUAL_BALANCE
+    max_drawdown = 0.0
+    points = [
+        {
+            "index": 0,
+            "date": None,
+            "symbol": "Starting Balance",
+            "value": _round(equity),
+            "realized_pnl": 0.0,
+            "drawdown_percent": 0.0,
+        }
+    ]
+    for index, record in enumerate(sorted(records, key=_record_sort_value), start=1):
+        pnl = analytics_pnl_value(record) or 0.0
+        equity += pnl
+        peak = max(peak, equity)
+        drawdown = ((peak - equity) / peak * 100) if peak else 0.0
+        max_drawdown = max(max_drawdown, drawdown)
+        points.append(
+            {
+                "index": index,
+                "date": record.get("exit_date") or record.get("journaled_at") or record.get("created_at"),
+                "symbol": record.get("symbol"),
+                "value": _round(equity),
+                "realized_pnl": _round(pnl),
+                "drawdown_percent": _round(drawdown),
+            }
+        )
+    return points, _round(max_drawdown)
+
+
+def _monthly_rows(monthly_pnl: dict) -> list[dict]:
+    return [{"month": key, "pnl": value} for key, value in sorted((monthly_pnl or {}).items())]
+
+
+def _strategy_rows(strategy_comparison: dict) -> list[dict]:
+    rows = []
+    for strategy in ("Swing", "Momentum"):
+        summary = (strategy_comparison or {}).get(strategy, {})
+        rows.append(
+            {
+                "strategy": strategy,
+                "total_trades": summary.get("total_trades", 0),
+                "win_rate": summary.get("win_rate", 0),
+                "profit_factor": summary.get("profit_factor", 0),
+                "average_rr": summary.get("average_rr", 0),
+            }
+        )
+    return rows
+
+
+def _recent_completed_rows(records: list[dict], limit: int = 10) -> list[dict]:
+    latest = sorted(records, key=_record_sort_value, reverse=True)[:limit]
+    return [
+        {
+            "symbol": record.get("symbol"),
+            "strategy": record.get("strategy_type"),
+            "exit_date": record.get("exit_date"),
+            "exit_reason": record.get("exit_reason"),
+            "realized_pnl": _round(analytics_pnl_value(record) or 0.0),
+            "profit_percent": _round(analytics_profit_percent_value(record) or 0.0),
+            "RR": _round(number_or_none(record.get("RR")) or 0.0),
+        }
+        for record in latest
+    ]
 
 
 @router.get("/paper-equity")
 async def get_paper_equity() -> dict:
-    cursor = get_database().paper_trades.find({"paper_only": True}, {"_id": 0})
+    db = get_database()
+    cursor = db.paper_trades.find({"paper_only": True}, {"_id": 0})
     trades = [trade async for trade in cursor]
-    ordered = sorted(trades, key=lambda trade: str(trade.get("updated_at") or trade.get("created_at") or ""))
-    latest = list(reversed(ordered))
+    journal_records = await load_trade_journal(db, 5000)
+    analytics = build_trade_analytics(journal_records)
+    eligible_records = [record for record in journal_records if analytics_eligible_record(record)]
+    realized_pnl = sum(analytics_pnl_value(record) or 0.0 for record in eligible_records)
+    current_balance = STARTING_VIRTUAL_BALANCE + realized_pnl
 
-    open_trades = sum(1 for trade in trades if _is_open_trade(trade))
-    cumulative_pnl = sum(_reportable_pnl(trade) for trade in trades)
-    cumulative_rr = sum(_realized_rr(trade) for trade in trades)
-    open_margin_used = TRADE_CAPITAL * open_trades
-    effective_exposure = open_margin_used * LEVERAGE
-    broker_funded = effective_exposure - open_margin_used
-    max_buying_power = VIRTUAL_BALANCE * LEVERAGE
-    available_margin = VIRTUAL_BALANCE - open_margin_used
-    available_buying_power = max_buying_power - effective_exposure
-
-    equity = VIRTUAL_BALANCE
-    peak = VIRTUAL_BALANCE
-    equity_curve = []
-    drawdown_curve = []
-    for index, trade in enumerate(ordered, start=1):
-        equity += _reportable_pnl(trade)
-        peak = max(peak, equity)
-        drawdown = ((peak - equity) / peak * 100) if peak else 0
-        point = {
-            "index": index,
-            "date": trade.get("updated_at") or trade.get("created_at"),
-            "symbol": trade.get("symbol"),
-            "value": round(equity, 2),
-        }
-        equity_curve.append(point)
-        drawdown_curve.append({**point, "value": round(drawdown, 2)})
-
-    completed_latest = [trade for trade in latest if _outcome_type(trade)]
-    latest_outcome = _outcome_type(completed_latest[0]) if completed_latest else None
-    streak = 0
-    for trade in completed_latest:
-        if _outcome_type(trade) != latest_outcome:
-            break
-        streak += 1
-
-    target_hit_count = sum(1 for trade in trades if _statuses(trade) & TARGET_STATUSES)
-    sl_hit_count = sum(1 for trade in trades if _statuses(trade) & LOSS_STATUSES)
-    ambiguous_count = sum(1 for trade in trades if "AMBIGUOUS" in _statuses(trade))
+    open_trades = [trade for trade in trades if _is_open_trade(trade)]
+    active_count = sum(1 for trade in trades if _is_active_trade(trade))
+    partial_count = sum(1 for trade in trades if _is_partial_trade(trade))
     waiting_count = sum(1 for trade in trades if _is_waiting_trade(trade))
-    active_count = sum(1 for trade in trades if _is_open_trade(trade))
-    completed_trades = target_hit_count + sl_hit_count + ambiguous_count
-    win_rate_percent = (target_hit_count / completed_trades * 100) if completed_trades else 0
-    current_drawdown = drawdown_curve[-1]["value"] if drawdown_curve else 0
+    completed_count = sum(1 for trade in trades if _is_completed_trade(trade))
+    sl_hit_count = sum(1 for trade in trades if _has_sl_status(trade))
+    ambiguous_count = sum(1 for trade in trades if is_ambiguous_trade(trade))
+    effective_exposure = sum(_open_trade_exposure(trade) for trade in open_trades)
+    open_margin_used = sum(_trade_margin(_open_trade_exposure(trade)) for trade in open_trades)
+    available_margin = current_balance - open_margin_used
+    max_buying_power = current_balance * LEVERAGE
+    available_buying_power = available_margin * LEVERAGE
+    broker_funded = effective_exposure - open_margin_used
+    usage_percent = (open_margin_used / current_balance * 100) if current_balance else 0.0
+    unrealized_pnl = sum(_open_trade_unrealized_pnl(trade) for trade in open_trades)
+    total_pnl = realized_pnl + unrealized_pnl
+    equity_curve, drawdown_percent = _equity_curve(eligible_records)
+    open_positions = _open_position_rows(open_trades, current_balance)
 
     latest_fields = (
-        "symbol", "source_signal_type", "trade_quality_grade", "status", "outcome_status",
-        "entry_price", "stop_loss", "target_1", "target_2", "target_3", "paper_pnl", "updated_at", "created_at",
+        "symbol",
+        "source_signal_type",
+        "trade_quality_grade",
+        "status",
+        "outcome_status",
+        "entry_price",
+        "stop_loss",
+        "target_1",
+        "target_2",
+        "target_3",
+        "paper_pnl",
+        "updated_at",
+        "created_at",
     )
+    latest = list(reversed(sorted(trades, key=lambda trade: str(trade.get("updated_at") or trade.get("created_at") or ""))))
     return {
-        "virtual_balance": VIRTUAL_BALANCE,
-        "trade_capital": TRADE_CAPITAL,
+        "starting_virtual_balance": _round(STARTING_VIRTUAL_BALANCE),
+        "current_virtual_balance": _round(current_balance),
+        "minimum_trade_capital": _round(MINIMUM_TRADE_CAPITAL),
         "leverage": LEVERAGE,
-        "total_trades": len(trades),
-        "open_trades": open_trades,
-        "open_margin_used": open_margin_used,
-        "effective_exposure": effective_exposure,
-        "broker_funded": broker_funded,
-        "max_buying_power": max_buying_power,
-        "available_margin": available_margin,
-        "available_buying_power": available_buying_power,
-        "buying_power_usage_percent": round(effective_exposure / max_buying_power * 100, 2),
-        "cumulative_pnl": round(cumulative_pnl, 2),
-        "cumulative_rr": cumulative_rr,
-        "virtual_return_percent": round(cumulative_pnl / VIRTUAL_BALANCE * 100, 2),
-        "drawdown_percent": current_drawdown,
-        "win_streak": streak if latest_outcome == "WIN" else 0,
-        "loss_streak": streak if latest_outcome == "LOSS" else 0,
-        "waiting_count": waiting_count,
-        "active_count": active_count,
-        "completed_trades": completed_trades,
-        "win_rate_percent": round(win_rate_percent, 2),
-        "target_hit_count": target_hit_count,
+        "open_margin_used": _round(open_margin_used),
+        "available_margin": _round(available_margin),
+        "max_buying_power": _round(max_buying_power),
+        "available_buying_power": _round(available_buying_power),
+        "effective_exposure": _round(effective_exposure),
+        "broker_funded": _round(broker_funded),
+        "buying_power_usage_percent": _round(usage_percent),
+        "realized_pnl": _round(realized_pnl),
+        "unrealized_pnl": _round(unrealized_pnl),
+        "total_pnl": _round(total_pnl),
+        "virtual_return_percent": _round((total_pnl / STARTING_VIRTUAL_BALANCE * 100) if STARTING_VIRTUAL_BALANCE else 0.0),
+        "drawdown_percent": drawdown_percent,
+        "win_rate_percent": analytics["win_rate"],
+        "profit_factor": analytics["profit_factor"],
+        "average_rr": analytics["average_rr"],
+        "status_counts": {
+            "waiting": waiting_count,
+            "active": active_count,
+            "partial": partial_count,
+            "completed": completed_count,
+            "sl_hit": sl_hit_count,
+            "ambiguous": ambiguous_count,
+        },
+        "open_position_exposure": open_positions,
+        "recent_completed_trades": _recent_completed_rows(eligible_records),
+        "equity_curve": equity_curve,
+        "monthly_pnl": analytics["monthly_pnl"],
+        "monthly_pnl_rows": _monthly_rows(analytics["monthly_pnl"]),
+        "strategy_comparison": analytics["strategy_comparison"],
+        "strategy_comparison_rows": _strategy_rows(analytics["strategy_comparison"]),
+        "journal_count": len(journal_records),
+        "open_trades": len(open_trades),
+        "paper_trade_count": len(trades),
+        "formulas": {
+            "current_balance": "starting_virtual_balance + realized_pnl",
+            "total_pnl": "realized_pnl + unrealized_pnl",
+            "virtual_return_percent": "total_pnl / starting_virtual_balance * 100",
+            "max_buying_power": "current_virtual_balance * leverage",
+            "open_exposure": "entry * remaining_quantity",
+            "margin_per_trade": "max(minimum_trade_capital, open_trade_exposure / leverage)",
+            "used_margin": "sum(max(minimum_trade_capital, open_trade_exposure / leverage))",
+            "available_margin": "current_virtual_balance - open_margin_used",
+            "effective_exposure": "sum(open_trade_exposure)",
+            "broker_funded": "effective_exposure - open_margin_used",
+            "available_buying_power": "available_margin * leverage",
+            "usage_percent": "open_margin_used / current_virtual_balance * 100",
+        },
+        # Backward-compatible keys for existing dashboard consumers.
+        "virtual_balance": _round(current_balance),
+        "trade_capital": _round(MINIMUM_TRADE_CAPITAL),
+        "cumulative_pnl": _round(total_pnl),
+        "cumulative_rr": analytics["average_rr"],
+        "completed_trades": completed_count,
+        "target_hit_count": completed_count,
         "sl_hit_count": sl_hit_count,
         "ambiguous_count": ambiguous_count,
-        "equity_curve": equity_curve,
-        "drawdown_curve": drawdown_curve,
         "latest_trades": [
             {
                 **{field: trade.get(field) for field in latest_fields},
-                "planned_capital": TRADE_CAPITAL,
-                "effective_exposure": TRADE_CAPITAL * LEVERAGE,
+                "planned_capital": _round(MINIMUM_TRADE_CAPITAL),
+                "effective_exposure": _round(_open_trade_exposure(trade)),
                 "paper_quantity": _paper_quantity(trade),
-                "leveraged_pnl": round(_reportable_pnl(trade), 2),
+                "leveraged_pnl": _round(_open_trade_unrealized_pnl(trade)),
             }
             for trade in latest[:10]
         ],
+    }
+
+
+@router.get("/trade-analytics")
+async def get_dashboard_trade_analytics() -> dict:
+    records = await load_trade_journal(get_database(), 5000)
+    analytics = build_trade_analytics(records)
+    return {
+        "cards": analytics["dashboard_cards"],
+        "analytics": analytics,
+        "journal_count": len(records),
+        "completed_trades_immutable": True,
     }

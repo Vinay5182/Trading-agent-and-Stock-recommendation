@@ -1,11 +1,17 @@
+import asyncio
 import json
 import logging
 from typing import Any
+from datetime import datetime
 from urllib.parse import quote
 from urllib.request import Request, build_opener
+from uuid import uuid4
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
+from pydantic import BaseModel, Field
 
+from database import get_database
+from services.mongo_indexes import ensure_active_indexes
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -35,6 +41,23 @@ YFINANCE_FILL_FIELDS = {
     "relative_volume",
     "thirty_day_change_percent",
 }
+
+
+class ScanRequest(BaseModel):
+    selected_index: str = Field(default="DEFAULT_UNIVERSE")
+    limit: int = Field(default=50, ge=1, le=1000)
+    force_refresh: bool = False
+
+
+class ScanResponse(BaseModel):
+    scan_run_id: str
+    selected_index: str
+    requested_limit: int
+    rows_count: int
+    inserted_count: int
+    modified_count: int
+    diagnostics: dict[str, Any]
+    rows: list[dict[str, Any]]
 
 
 def normalize_symbol(symbol: str | None) -> str:
@@ -187,3 +210,112 @@ def merge_nse_yfinance_quote(
     row["source_used"] = "NSE_WITH_YFINANCE_FIELDS" if filled else "NSE"
     row["field_sources"] = field_sources
     return row
+
+
+def clean_index_name(value: str | None) -> str:
+    clean = (value or "BROAD_MARKET_750").strip().upper()
+    if clean in {"DEFAULT", "DEFAULT_UNIVERSE", "BROAD_MARKET", "BROAD_MARKET_750"}:
+        return "BROAD_MARKET_750"
+    return clean
+
+
+def scan_row_from_quote(symbol: str, quote_row: dict[str, Any], scan_run_id: str, selected_index: str, now: str) -> dict[str, Any]:
+    row = {
+        "scan_run_id": scan_run_id,
+        "selected_index": selected_index,
+        "index_name": selected_index,
+        "exchange": "NSE",
+        "symbol": symbol,
+        "canonical_symbol": symbol,
+        "tradingview_symbol": f"NSE:{symbol}",
+        "status": "SCANNED",
+        "selected_for_tv": False,
+        "momentum_candidate": False,
+        "created_at": now,
+        "updated_at": now,
+        **quote_row,
+    }
+    row["current_price"] = row.get("current_price") or row.get("ltp")
+    return row
+
+
+async def ensure_scan_indexes(db) -> None:
+    await ensure_active_indexes(db)
+
+
+@router.post("", response_model=ScanResponse)
+@router.post("/", response_model=ScanResponse)
+async def run_scan(request: ScanRequest) -> dict:
+    db = get_database()
+    await ensure_scan_indexes(db)
+    selected_index = clean_index_name(request.selected_index)
+    now = datetime.utcnow().isoformat()
+    scan_run_id = f"scan-{uuid4().hex}"
+    if selected_index == "BROAD_MARKET_750":
+        quotes, diagnostics = await asyncio.to_thread(fetch_broad_market_nse_quotes)
+    else:
+        quotes = await asyncio.to_thread(fetch_nse_component_index_quotes, selected_index)
+        diagnostics = {"nse_component_rows_by_index": {selected_index: len(quotes)}, "nse_component_rows_total": len(quotes)}
+    rows = [
+        scan_row_from_quote(symbol, quote, scan_run_id, selected_index, now)
+        for symbol, quote in list(quotes.items())[: request.limit]
+    ]
+    result = None
+    if rows:
+        from pymongo import UpdateOne
+
+        result = await db.scan_rows.bulk_write(
+            [
+                UpdateOne(
+                    {"scan_run_id": scan_run_id, "symbol": row["symbol"]},
+                    {"$set": row, "$setOnInsert": {"created_at": now}},
+                    upsert=True,
+                )
+                for row in rows
+            ],
+            ordered=False,
+        )
+    await db.scan_runs.update_one(
+        {"scan_run_id": scan_run_id},
+        {
+            "$set": {
+                "scan_run_id": scan_run_id,
+                "selected_index": selected_index,
+                "requested_limit": request.limit,
+                "force_refresh": request.force_refresh,
+                "rows_count": len(rows),
+                "diagnostics": diagnostics,
+                "updated_at": now,
+            },
+            "$setOnInsert": {"created_at": now},
+        },
+        upsert=True,
+    )
+    return {
+        "scan_run_id": scan_run_id,
+        "selected_index": selected_index,
+        "requested_limit": request.limit,
+        "rows_count": len(rows),
+        "inserted_count": int(getattr(result, "upserted_count", 0) or 0),
+        "modified_count": int(getattr(result, "modified_count", 0) or 0),
+        "diagnostics": diagnostics,
+        "rows": rows,
+    }
+
+
+@router.get("/rows")
+async def get_scan_rows(
+    scan_run_id: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=1000),
+) -> dict:
+    db = get_database()
+    await ensure_scan_indexes(db)
+    active_scan_run_id = scan_run_id
+    if not active_scan_run_id:
+        latest = await db.scan_runs.find_one({}, {"_id": 0, "scan_run_id": 1}, sort=[("created_at", -1)])
+        active_scan_run_id = latest.get("scan_run_id") if latest else None
+    if not active_scan_run_id:
+        return {"scan_run_id": None, "count": 0, "rows": []}
+    cursor = db.scan_rows.find({"scan_run_id": active_scan_run_id}, {"_id": 0}).sort("updated_at", -1).limit(limit)
+    rows = [row async for row in cursor]
+    return {"scan_run_id": active_scan_run_id, "count": len(rows), "rows": rows}

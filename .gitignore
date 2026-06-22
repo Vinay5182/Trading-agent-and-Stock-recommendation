@@ -1,14 +1,24 @@
-.venv/
-__pycache__/
-**/__pycache__/
-*.pyc
-frontend/node_modules/
-frontend/dist/
-trading-agent-clean/frontend/node_modules/
+# Specific paths for trading-agent-clean
+trading-agent-clean/.mongo-data/
+trading-agent-clean/exports/
+trading-agent-clean/.pytest_cache/
+trading-agent-clean/.venv/
+trading-agent-clean/node_modules/
 trading-agent-clean/frontend/dist/
-.cache/
-mongo_backups/
-*.log
-.env
+
+# Generic patterns
+**/.mongo-data/
+**/exports/
+**/.pytest_cache/
+**/**pycache**/
+**/*.pyc
+**/*.pyo
+**/.venv/
+**/node_modules/
+**/frontend/dist/
+**/*.log
+**/.env
 .env.*
 .DS_Store
+.cache/
+mongo_backups/

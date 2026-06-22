@@ -132,18 +132,18 @@ Phase 24E completed.
 
 ## Run Commands
 
-Backend:
+One-click startup:
 
 ```powershell
-cd "C:\Users\Asus\OneDrive\Desktop\projects\trading-agent-clean\backend"
-..\.venv\Scripts\python.exe -m uvicorn main:app --port 8011
+cd "C:\Users\Asus\OneDrive\Documents\Trading_Strategy\trading-agent-clean"
+.\start-trading-agent.ps1
 ```
 
-Frontend:
+Stop backend/frontend:
 
 ```powershell
-cd "C:\Users\Asus\OneDrive\Desktop\projects\trading-agent-clean\frontend"
-npm.cmd run dev -- --host 127.0.0.1
+cd "C:\Users\Asus\OneDrive\Documents\Trading_Strategy\trading-agent-clean"
+.\stop-trading-agent.ps1
 ```
 
 ## Verification Commands

@@ -27,7 +27,7 @@ def make_trade(
         "paper_only": True,
         "status": status,
         "outcome_status": outcome_status or status,
-        "entry_triggered": entry_triggered if entry_triggered is not None else status not in {"NOT_TRIGGERED", "PLANNED"},
+        "entry_triggered": entry_triggered if entry_triggered is not None else status not in {"NOT_TRIGGERED", "PLANNED", "WAITING", "WAITING_FOR_ENTRY"},
         "entry_price": 100.0,
         "stop_loss": 90.0,
         "target_1": 120.0,
@@ -47,6 +47,35 @@ def make_candle(*, high: float, low: float = 95.0, close: float = 101.0) -> dict
         "low": low,
         "close": close,
         "volume": 1_000,
+    }
+
+
+def make_market_row(symbol: str, *, high: float = 100.0, low: float = 95.0, close: float = 101.0) -> dict:
+    return {
+        "exchange": "NSE",
+        "symbol": symbol,
+        "canonical_symbol": symbol,
+        "tradingview_symbol": f"NSE:{symbol}",
+        "day_high": high,
+        "day_low": low,
+        "current_price": close,
+        "updated_at": "2026-06-16T10:00:00",
+    }
+
+
+def make_snapshot_row(symbol: str, *, trade_id: str | None = None, high: float = 101.0, low: float = 101.0, close: float = 101.0) -> dict:
+    return {
+        "paper_only": True,
+        "paper_trade_id": trade_id or f"{symbol.lower()}-id",
+        "symbol": symbol,
+        "canonical_symbol": symbol,
+        "observed_at": "2026-06-16T10:00:00",
+        "observed_at_iso": "2026-06-16T10:00:00",
+        "high": high,
+        "low": low,
+        "close": close,
+        "price": close,
+        "source": "test_snapshot",
     }
 
 
@@ -107,6 +136,23 @@ class FakePaperTrades:
         return SimpleNamespace(deleted_count=1)
 
 
+class FakeMarketData:
+    def __init__(self, rows: list[dict]) -> None:
+        self.rows = rows
+
+    async def find_one(self, query: dict | None = None, *_args, **_kwargs) -> dict | None:
+        row = next((row for row in self.rows if matches_query(row, query)), None)
+        return row.copy() if row else None
+
+
+class FakePaperMarketSnapshots:
+    def __init__(self, rows: list[dict]) -> None:
+        self.rows = rows
+
+    def find(self, query: dict | None = None, *_args, **_kwargs) -> FakeCursor:
+        return FakeCursor([row.copy() for row in self.rows if matches_query(row, query)])
+
+
 class FakeTradingViewNoEntryClient:
     def connect_to_debug_port(self) -> bool:
         return True
@@ -125,9 +171,24 @@ class FakeTradingViewEntryClient(FakeTradingViewNoEntryClient):
         return [make_candle(high=100.0, close=101.0)]
 
 
-def patch_paper_database(monkeypatch, rows: list[dict]) -> FakePaperTrades:
+def patch_paper_database(monkeypatch, rows: list[dict], market_rows: list[dict] | None = None, snapshots: list[dict] | None = None) -> FakePaperTrades:
     collection = FakePaperTrades(rows)
-    monkeypatch.setattr(paper, "get_database", lambda: SimpleNamespace(paper_trades=collection))
+    effective_market_rows = market_rows if market_rows is not None else [make_market_row(row["symbol"]) for row in rows]
+    market_collection = FakeMarketData(effective_market_rows)
+    if snapshots is None:
+        snapshots = [
+            make_snapshot_row(row["symbol"], trade_id=row["_id"], high=market.get("current_price", 101.0), low=market.get("current_price", 101.0), close=market.get("current_price", 101.0))
+            for row, market in zip(rows, effective_market_rows)
+        ]
+    monkeypatch.setattr(
+        paper,
+        "get_database",
+        lambda: SimpleNamespace(
+            paper_trades=collection,
+            market_data=market_collection,
+            paper_market_snapshots=FakePaperMarketSnapshots(snapshots),
+        ),
+    )
     return collection
 
 
@@ -171,7 +232,11 @@ def test_paper_summary_counts_waiting_open_and_closed_trades(monkeypatch) -> Non
 
 
 def test_dry_run_update_endpoint_does_not_write(monkeypatch) -> None:
-    collection = patch_paper_database(monkeypatch, [make_trade("WAIT1", "NOT_TRIGGERED", entry_triggered=False)])
+    collection = patch_paper_database(
+        monkeypatch,
+        [make_trade("WAIT1", "WAITING_FOR_ENTRY", entry_triggered=False)],
+        [make_market_row("WAIT1", high=99.0, close=98.0)],
+    )
     monkeypatch.setattr(paper, "TradingViewClient", FakeTradingViewNoEntryClient)
     client = TestClient(app)
 

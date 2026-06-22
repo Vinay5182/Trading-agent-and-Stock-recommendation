@@ -1,4 +1,5 @@
 import json
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -11,14 +12,37 @@ from websockets.sync.client import connect as ws_connect
 from config import settings
 
 
+logger = logging.getLogger("uvicorn.error")
 SUPPORTED_TIMEFRAMES = {"1W": "W", "1D": "D", "4H": "240", "1H": "60"}
+MANAGED_TAB_MARKER = "trading_agent_managed=1"
+MAX_MANAGED_TABS = 1
+MANAGED_TAB_IDS: set[str] = set()
+CHART_NAVIGATION_TIMEOUT_SECONDS = 20.0
+CDP_RECV_POLL_SECONDS = 0.5
+
+
+class TradingViewTabNavigationError(RuntimeError):
+    pass
+
+
+class TradingViewTabNotAttachedError(RuntimeError):
+    pass
+
+
+class TradingViewTabDisconnectedError(RuntimeError):
+    def __init__(self, target_id: str | None = None, message: str | None = None) -> None:
+        self.target_id = target_id
+        super().__init__(message or "TV_TAB_DISCONNECTED")
 
 
 @dataclass
 class TradingViewClient:
     port: int = settings.TRADINGVIEW_DEBUG_PORT
+    attached_target_id: str | None = None
+    require_attached_tab: bool = False
 
     def __post_init__(self) -> None:
+        self.deadline_monotonic = None
         self.diagnostics = {
             "devtools_version_ok": False,
             "tabs_count": 0,
@@ -28,6 +52,14 @@ class TradingViewClient:
             "http_error_stage": None,
             "navigation_note": None,
             "navigation_method_used": None,
+            "navigation_stage": None,
+            "navigation_load_event_fired": False,
+            "navigation_location_href": None,
+            "navigation_ready_state": None,
+            "navigation_target_url": None,
+            "navigation_target_title": None,
+            "navigation_active_chart_available": False,
+            "navigation_error_message": None,
             "devtools_ws_connected": False,
             "requested_symbol": None,
             "current_tab_url": None,
@@ -39,6 +71,7 @@ class TradingViewClient:
             "active_symbol_before_set": None,
             "active_symbol_after_set": None,
             "active_symbol_after_stabilize": None,
+            "loaded_symbol": None,
             "symbol_match": None,
             "symbol_stable_check_passed": None,
             "symbol_retry_count": None,
@@ -68,18 +101,47 @@ class TradingViewClient:
             "resolution_match": None,
             "wait_seconds_used": None,
             "retry_count": None,
+            "cdp_reconnect_count": 0,
+            "cdp_last_exception": None,
+            "timeout_location": None,
+            "managed_tab_id": None,
+            "managed_tab_count": 0,
+            "attached_target_id": self.attached_target_id,
+            "attachment_required": self.require_attached_tab,
         }
+        self.owned_tab_ids: set[str] = set()
 
     @property
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
 
-    def _request_json(self, path: str) -> Any:
-        request = Request(f"{self.base_url}{path}", method="GET")
+    def set_deadline(self, timeout_seconds: int) -> None:
+        self.deadline_monotonic = time.monotonic() + timeout_seconds
+
+    def check_deadline(self, stage: str) -> None:
+        if self.deadline_monotonic is not None and time.monotonic() >= self.deadline_monotonic:
+            self.diagnostics["timeout_location"] = stage
+            raise TimeoutError(f"TradingView symbol timeout at {stage}")
+
+    def sleep(self, seconds: float, stage: str) -> None:
+        self.check_deadline(stage)
+        if self.deadline_monotonic is None:
+            time.sleep(seconds)
+        else:
+            remaining = self.deadline_monotonic - time.monotonic()
+            if remaining <= 0:
+                self.check_deadline(stage)
+            time.sleep(min(seconds, remaining))
+        self.check_deadline(stage)
+
+    def _request_json(self, path: str, method: str = "GET") -> Any:
+        self.check_deadline(f"http:{path}")
+        request = Request(f"{self.base_url}{path}", method=method)
         with urlopen(request, timeout=5) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def _request_text(self, path: str) -> str:
+        self.check_deadline(f"http:{path}")
         request = Request(f"{self.base_url}{path}", method="GET")
         with urlopen(request, timeout=5) as response:
             return response.read().decode("utf-8")
@@ -87,6 +149,7 @@ class TradingViewClient:
     def connect_to_debug_port(self) -> bool:
         self._request_json("/json/version")
         self.diagnostics["devtools_version_ok"] = True
+        logger.info("TradingView CDP connected port=%d", self.port)
         return True
 
     def list_tabs(self) -> list[dict]:
@@ -94,9 +157,145 @@ class TradingViewClient:
         tabs = tabs if isinstance(tabs, list) else []
         self.diagnostics["tabs_count"] = len(tabs)
         self.diagnostics["chart_tab_found"] = any(is_tradingview_tab(tab) for tab in tabs)
+        self.diagnostics["managed_tab_count"] = sum(1 for tab in tabs if is_app_managed_tab(tab))
         return tabs
 
+    def list_attachable_chart_targets(self) -> list[dict]:
+        attachable = []
+        for tab in self.list_tabs():
+            if not is_real_tradingview_chart_target(tab):
+                continue
+            readiness = self.read_chart_readiness(tab)
+            if not readiness.get("activeChartAvailable"):
+                continue
+            attachable.append(attachable_target_payload(tab, readiness))
+        return attachable
+
+    def read_chart_readiness(self, tab: dict) -> dict:
+        try:
+            value = self.evaluate_runtime_on_tab(tab, chart_readiness_expression())
+            return value if isinstance(value, dict) else {}
+        except Exception as exc:
+            self.diagnostics["runtime_evaluate_error"] = str(exc)
+            return {
+                "href": tab.get("url"),
+                "title": tab.get("title"),
+                "readyState": None,
+                "tradingviewApiAvailable": False,
+                "activeChartAvailable": False,
+                "error": str(exc),
+            }
+
+    def validate_attachable_target(self, target_id: str) -> dict | None:
+        for target in self.list_attachable_chart_targets():
+            if target.get("target_id") == target_id:
+                return target
+        return None
+
     def open_or_reuse_chart_tab(self) -> dict:
+        if self.require_attached_tab or self.attached_target_id:
+            return self.get_attached_chart_tab()
+        tabs = self.list_tabs()
+        managed_tabs = [tab for tab in tabs if is_app_managed_tab(tab)]
+        if len(managed_tabs) > MAX_MANAGED_TABS:
+            for stale_tab in managed_tabs[MAX_MANAGED_TABS:]:
+                self.close_managed_tab(stale_tab)
+        if managed_tabs:
+            tab = managed_tabs[0]
+            tab_id = tab.get("id")
+            if tab_id:
+                self._request_text(f"/json/activate/{tab_id}")
+                self.diagnostics["managed_tab_id"] = tab_id
+            return tab
+        tab = self.create_managed_tab()
+        tab_id = tab.get("id")
+        if tab_id:
+            self.diagnostics["managed_tab_id"] = tab_id
+        return tab
+
+    def get_attached_chart_tab(self) -> dict:
+        if not self.attached_target_id:
+            self.diagnostics["reason"] = "TV_TAB_NOT_ATTACHED"
+            self.diagnostics["error_stage"] = "attached_tab_missing"
+            raise TradingViewTabNotAttachedError("TV_TAB_NOT_ATTACHED")
+        tab = self.find_tab_by_id(self.attached_target_id, attempts=1)
+        if not tab or not tab.get("webSocketDebuggerUrl"):
+            self.diagnostics["reason"] = "TV_TAB_DISCONNECTED"
+            self.diagnostics["error_stage"] = "attached_tab_disconnected"
+            self.diagnostics["managed_tab_id"] = self.attached_target_id
+            raise TradingViewTabDisconnectedError(self.attached_target_id)
+        if not is_real_tradingview_chart_target(tab):
+            self.diagnostics["reason"] = "TV_TAB_DISCONNECTED"
+            self.diagnostics["error_stage"] = "attached_tab_not_chart"
+            self.diagnostics["managed_tab_id"] = self.attached_target_id
+            raise TradingViewTabDisconnectedError(self.attached_target_id, "TV_TAB_DISCONNECTED: attached target is not a TradingView chart")
+        self.diagnostics["managed_tab_id"] = self.attached_target_id
+        self.diagnostics["current_tab_url"] = tab.get("url")
+        self.diagnostics["current_tab_title"] = tab.get("title")
+        return tab
+
+    def create_managed_tab(self) -> dict:
+        url = managed_tradingview_url()
+        chart_url = quote(url, safe="")
+        self.diagnostics["open_url"] = url
+        self.diagnostics["json_new_method_used"] = "PUT"
+        try:
+            tab = self._request_json(f"/json/new?{chart_url}", method="PUT")
+            self.register_owned_tab(tab)
+            return tab
+        except HTTPError as exc:
+            self.diagnostics["http_error_stage"] = f"json_new_put_failed_http_{exc.code}"
+            logger.warning("TradingView /json/new PUT failed status=%s; attach an existing chart tab instead", exc.code)
+            self.diagnostics["reason"] = "TV_TAB_NOT_ATTACHED"
+            self.diagnostics["error_stage"] = "managed_tab_creation_unsupported"
+            raise TradingViewTabNotAttachedError("TV_TAB_NOT_ATTACHED") from exc
+
+    def register_owned_tab(self, tab: dict | None) -> None:
+        tab_id = tab.get("id") if isinstance(tab, dict) else None
+        if tab_id:
+            self.owned_tab_ids.add(str(tab_id))
+            self.diagnostics["managed_tab_id"] = str(tab_id)
+        register_managed_tab(tab)
+
+    def wait_for_created_tab_by_id(self, tab_id: str, attempts: int = 10, require_tradingview: bool = False) -> dict | None:
+        for _ in range(attempts):
+            tab = self.find_tab_by_id(tab_id, attempts=1)
+            if tab and tab.get("webSocketDebuggerUrl") and (not require_tradingview or is_tradingview_tab(tab)):
+                return tab
+            self.sleep(0.5, "wait_for_managed_tab_by_id")
+        return None
+
+    def close_managed_tab(self, tab: dict) -> bool:
+        if not is_app_managed_tab(tab):
+            return False
+        tab_id = tab.get("id")
+        if not tab_id:
+            return False
+        try:
+            self._request_text(f"/json/close/{tab_id}")
+            unregister_managed_tab_id(tab_id)
+            return True
+        except Exception as exc:
+            logger.warning("TradingView managed tab close failed tab_id=%s error=%s", tab_id, exc)
+            return False
+
+    def managed_tab_is_valid(self, tab: dict | None) -> bool:
+        if not tab or not is_app_managed_tab(tab):
+            return False
+        tab_id = tab.get("id")
+        if not tab_id:
+            return False
+        return any(candidate.get("id") == tab_id for candidate in self.list_tabs())
+
+    def ensure_managed_tab(self) -> dict:
+        tab = self.open_or_reuse_chart_tab()
+        if self.require_attached_tab or self.attached_target_id:
+            return tab
+        if not self.managed_tab_is_valid(tab):
+            raise RuntimeError("TradingView managed tab is missing or invalid")
+        return tab
+
+    def open_legacy_or_reuse_chart_tab(self) -> dict:
         for tab in self.list_tabs():
             if is_tradingview_tab(tab):
                 tab_id = tab.get("id")
@@ -116,7 +315,7 @@ class TradingViewClient:
 
     def open_symbol(self, tradingview_symbol: str) -> dict:
         validate_symbol(tradingview_symbol)
-        tab = self.open_or_reuse_chart_tab()
+        tab = self.ensure_managed_tab()
         interval = SUPPORTED_TIMEFRAMES["1D"]
         url = tradingview_url(tradingview_symbol, interval)
         self.diagnostics["requested_symbol"] = tradingview_symbol
@@ -124,18 +323,11 @@ class TradingViewClient:
         encoded_url = quote(url, safe="")
         self.diagnostics["json_new_method_used"] = "GET"
         self.diagnostics["open_url"] = url
-        try:
-            opened = self._request_json(f"/json/new?{encoded_url}")
-            self.diagnostics["navigation_method_used"] = "json_new"
-            return opened
-        except HTTPError as exc:
-            self.diagnostics["http_error_stage"] = None
-            self.diagnostics["navigation_note"] = f"/json/new returned HTTP {exc.code}; trying CDP Page.navigate"
-            return self.navigate_with_cdp(tab, url, "open_symbol")
+        return self.navigate_with_cdp(tab, url, "open_symbol")
 
     def set_timeframe(self, timeframe: str) -> dict:
         interval = validate_timeframe(timeframe)
-        tab = self.open_or_reuse_chart_tab()
+        tab = self.ensure_managed_tab()
         current_symbol = self.diagnostics.get("requested_tradingview_symbol") or extract_symbol_from_url(tab.get("url", "")) or "NSE:RELIANCE"
         url = tradingview_url(current_symbol, interval)
         encoded_url = quote(url, safe="")
@@ -144,27 +336,14 @@ class TradingViewClient:
         self.diagnostics["resolution_before"] = extract_interval_from_url(tab.get("url", ""))
         self.diagnostics["json_new_method_used"] = "GET"
         self.diagnostics["open_url"] = url
-        try:
-            opened = self._request_json(f"/json/new?{encoded_url}")
-            self.diagnostics["navigation_method_used"] = "json_new"
-            self.diagnostics["resolution_after"] = extract_interval_from_url(opened.get("url", ""))
-            self.diagnostics["resolution_match"] = (
-                self.diagnostics["resolution_after"] == interval
-                if self.diagnostics["resolution_after"] is not None
-                else None
-            )
-            return opened
-        except HTTPError as exc:
-            self.diagnostics["http_error_stage"] = None
-            self.diagnostics["navigation_note"] = f"/json/new returned HTTP {exc.code}; trying CDP Page.navigate"
-            opened = self.navigate_with_cdp(tab, url, "set_timeframe")
-            self.diagnostics["resolution_after"] = extract_interval_from_url(opened.get("url", ""))
-            self.diagnostics["resolution_match"] = (
-                self.diagnostics["resolution_after"] == interval
-                if self.diagnostics["resolution_after"] is not None
-                else None
-            )
-            return opened
+        opened = self.navigate_with_cdp(tab, url, "set_timeframe")
+        self.diagnostics["resolution_after"] = extract_interval_from_url(opened.get("url", ""))
+        self.diagnostics["resolution_match"] = (
+            self.diagnostics["resolution_after"] == interval
+            if self.diagnostics["resolution_after"] is not None
+            else None
+        )
+        return opened
 
     def refresh_resolution_status(self, timeframe: str) -> None:
         interval = validate_timeframe(timeframe)
@@ -229,29 +408,41 @@ class TradingViewClient:
     def load_symbol_strict(self, tradingview_symbol: str) -> bool:
         validate_symbol(tradingview_symbol)
         requested = normalize_symbol(tradingview_symbol)
-        previous = self.get_active_chart_symbol()
-        previous_is_different = bool(previous and not self.symbol_matches(previous, requested))
         self.diagnostics["requested_tradingview_symbol"] = requested
+        try:
+            previous = self.get_active_chart_symbol()
+        except (TradingViewTabNavigationError, TradingViewTabNotAttachedError, TradingViewTabDisconnectedError) as exc:
+            self.diagnostics["symbol_error_stage"] = tv_tab_error_stage(exc)
+            self.diagnostics["symbol_error_message"] = str(exc)
+            self.diagnostics["symbol_match"] = False
+            self.diagnostics["symbol_stable_check_passed"] = False
+            self.diagnostics["symbol_retry_count"] = 0
+            self.diagnostics["symbol_wait_seconds_used"] = 0
+            return False
+        previous_is_different = bool(previous and not self.symbol_matches(previous, requested))
         self.diagnostics["previous_active_symbol"] = previous
         self.diagnostics["active_symbol_before_set"] = previous
         self.diagnostics["stale_previous_symbol_warning"] = False
         wait_used = 0
         for attempt in range(1, settings.TRADINGVIEW_SYMBOL_RETRIES + 1):
             try:
+                self.check_deadline(f"symbol_load_attempt_{attempt}")
                 self.open_symbol(tradingview_symbol)
                 deadline = time.time() + settings.TRADINGVIEW_SYMBOL_WAIT_SECONDS
                 active_after_set = None
                 while time.time() <= deadline:
+                    self.check_deadline("symbol_wait")
                     active_after_set = self.get_active_chart_symbol()
                     self.diagnostics["active_symbol_after_set"] = active_after_set
                     if self.symbol_matches(active_after_set, requested) and not (previous_is_different and active_after_set == previous):
                         break
-                    time.sleep(1)
+                    self.sleep(1, "symbol_wait")
                     wait_used += 1
-                time.sleep(settings.TRADINGVIEW_SYMBOL_STABILIZE_SECONDS)
+                self.sleep(settings.TRADINGVIEW_SYMBOL_STABILIZE_SECONDS, "symbol_stabilize")
                 wait_used += settings.TRADINGVIEW_SYMBOL_STABILIZE_SECONDS
                 active_after_stabilize = self.get_active_chart_symbol()
                 self.diagnostics["active_symbol_after_stabilize"] = active_after_stabilize
+                self.diagnostics["loaded_symbol"] = active_after_stabilize
                 symbol_match = self.symbol_matches(active_after_set, requested) and self.symbol_matches(active_after_stabilize, requested)
                 stable = active_after_set == active_after_stabilize and symbol_match and not (previous_is_different and active_after_stabilize == previous)
                 self.diagnostics["symbol_match"] = symbol_match
@@ -263,13 +454,28 @@ class TradingViewClient:
                     self.diagnostics["symbol_error_stage"] = None
                     self.diagnostics["symbol_error_message"] = None
                     return True
-                self.diagnostics["symbol_error_stage"] = "SYMBOL_LOAD_FAILED_OR_STALE_PREVIOUS_SYMBOL"
-                self.diagnostics["symbol_error_message"] = f"active_symbol={active_after_stabilize}, previous_symbol={previous}"
+                if active_after_stabilize and not self.symbol_matches(active_after_stabilize, requested):
+                    self.diagnostics["symbol_error_stage"] = "SYMBOL_MISMATCH"
+                    self.diagnostics["symbol_error_message"] = f"requested_symbol={requested}, loaded_symbol={active_after_stabilize}"
+                elif previous_is_different and active_after_stabilize == previous:
+                    self.diagnostics["symbol_error_stage"] = "STALE_PREVIOUS_SYMBOL"
+                    self.diagnostics["symbol_error_message"] = f"requested_symbol={requested}, stale_previous_symbol={previous}"
+                else:
+                    self.diagnostics["symbol_error_stage"] = "SYMBOL_LOAD_FAILED"
+                    self.diagnostics["symbol_error_message"] = f"requested_symbol={requested}, loaded_symbol={active_after_stabilize}"
+            except (TradingViewTabNavigationError, TradingViewTabNotAttachedError, TradingViewTabDisconnectedError) as exc:
+                self.diagnostics["symbol_error_stage"] = tv_tab_error_stage(exc)
+                self.diagnostics["symbol_error_message"] = str(exc)
+                self.diagnostics["symbol_match"] = False
+                self.diagnostics["symbol_stable_check_passed"] = False
+                self.diagnostics["symbol_retry_count"] = attempt - 1
+                self.diagnostics["symbol_wait_seconds_used"] = wait_used
+                return False
             except Exception as exc:
-                self.diagnostics["symbol_error_stage"] = "SYMBOL_LOAD_FAILED_OR_STALE_PREVIOUS_SYMBOL"
+                self.diagnostics["symbol_error_stage"] = "SYMBOL_LOAD_FAILED"
                 self.diagnostics["symbol_error_message"] = str(exc)
             if attempt < settings.TRADINGVIEW_SYMBOL_RETRIES:
-                time.sleep(2)
+                self.sleep(2, "symbol_retry_wait")
                 wait_used += 2
         return False
 
@@ -277,49 +483,184 @@ class TradingViewClient:
         interval = validate_timeframe(timeframe)
         deadline = time.time() + timeout_seconds
         while time.time() <= deadline:
+            self.check_deadline(f"resolution_wait:{timeframe}")
             self.refresh_resolution_status(timeframe)
             if self.diagnostics.get("resolution_after") == interval:
                 self.diagnostics["resolution_match"] = True
                 return True
-            time.sleep(1)
+            self.sleep(1, f"resolution_wait:{timeframe}")
         self.refresh_resolution_status(timeframe)
         self.diagnostics["resolution_match"] = self.diagnostics.get("resolution_after") == interval
         return bool(self.diagnostics["resolution_match"])
 
     def navigate_with_cdp(self, tab: dict, url: str, stage: str) -> dict:
+        last_error = None
+        for attempt in range(2):
+            current_tab = tab if attempt == 0 else self.open_or_reuse_chart_tab()
+            try:
+                self.check_deadline(f"cdp_navigate:{stage}")
+                return self.navigate_owned_target_to_tradingview(current_tab, url, stage)
+            except TradingViewTabNavigationError:
+                raise
+            except Exception as exc:
+                last_error = exc
+            self.diagnostics["cdp_last_exception"] = str(last_error)
+            logger.warning("TradingView CDP navigation failed stage=%s attempt=%d error=%s", stage, attempt + 1, last_error)
+            if attempt == 0:
+                self.diagnostics["cdp_reconnect_count"] += 1
+        self.diagnostics["navigation_method_used"] = "reused_tab_only"
+        self.diagnostics["error_stage"] = f"{stage}:cdp_page_navigate_failed"
+        self.diagnostics["reason"] = str(last_error)
+        return tab
+
+    def navigate_owned_target_to_tradingview(self, tab: dict, url: str, stage: str) -> dict:
+        tab_id = tab.get("id")
         ws_url = tab.get("webSocketDebuggerUrl")
+        if not tab_id:
+            raise TradingViewTabNavigationError("TAB_NAVIGATION_FAILED: managed tab is missing an id")
         if not ws_url:
-            self.diagnostics["navigation_method_used"] = "reused_tab_only"
-            self.diagnostics["error_stage"] = f"{stage}:missing_websocket_debugger_url"
-            self.diagnostics["reason"] = "verification_not_implemented"
-            return tab
-        try:
-            with ws_connect(ws_url, open_timeout=5) as websocket:
-                self.diagnostics["devtools_ws_connected"] = True
-                websocket.send(json.dumps({"id": 1, "method": "Page.enable"}))
-                websocket.recv(timeout=5)
-                websocket.send(json.dumps({"id": 2, "method": "Page.navigate", "params": {"url": url}}))
-                websocket.recv(timeout=5)
-                self.diagnostics["navigation_method_used"] = "cdp_page_navigate"
-            time.sleep(2)
-            return self.find_tab_by_url(url) or tab
-        except Exception as exc:
-            self.diagnostics["navigation_method_used"] = "reused_tab_only"
-            self.diagnostics["error_stage"] = f"{stage}:cdp_page_navigate_failed"
-            self.diagnostics["reason"] = str(exc)
-            return tab
+            raise TradingViewTabNavigationError("TAB_NAVIGATION_FAILED: missing WebSocket debugger URL for managed tab")
+
+        self.diagnostics["navigation_stage"] = stage
+        self.diagnostics["navigation_method_used"] = "cdp_page_navigate"
+        self.diagnostics["navigation_load_event_fired"] = False
+        self.diagnostics["navigation_error_message"] = None
+        deadline = time.monotonic() + CHART_NAVIGATION_TIMEOUT_SECONDS
+        next_eval_at = 0.0
+        eval_call_id = None
+        next_call_id = 1
+
+        def send_command(websocket, method: str, params: dict | None = None) -> int:
+            nonlocal next_call_id
+            call_id = next_call_id
+            next_call_id += 1
+            websocket.send(json.dumps({"id": call_id, "method": method, "params": params or {}}))
+            return call_id
+
+        readiness = {}
+        with ws_connect(ws_url, open_timeout=5) as websocket:
+            self.diagnostics["devtools_ws_connected"] = True
+            logger.info("TradingView CDP websocket connected method=Page.navigate stage=%s", stage)
+            send_command(websocket, "Page.enable")
+            send_command(websocket, "Runtime.enable")
+            navigate_call_id = send_command(websocket, "Page.navigate", {"url": url})
+            while time.monotonic() <= deadline:
+                self.check_deadline(f"cdp_navigate_wait:{stage}")
+                now = time.monotonic()
+                if eval_call_id is None and now >= next_eval_at:
+                    eval_call_id = send_command(
+                        websocket,
+                        "Runtime.evaluate",
+                        {
+                            "expression": chart_readiness_expression(),
+                            "returnByValue": True,
+                            "awaitPromise": True,
+                        },
+                    )
+                    next_eval_at = now + 1
+                try:
+                    message = json.loads(websocket.recv(timeout=CDP_RECV_POLL_SECONDS))
+                except TimeoutError:
+                    message = {}
+                if message.get("method") == "Page.loadEventFired":
+                    self.diagnostics["navigation_load_event_fired"] = True
+                if message.get("id") == navigate_call_id and "error" in message:
+                    error_message = message["error"].get("message", "Page.navigate failed")
+                    self.diagnostics["navigation_error_message"] = error_message
+                    raise TradingViewTabNavigationError(f"TAB_NAVIGATION_FAILED: {error_message}")
+                if eval_call_id is not None and message.get("id") == eval_call_id:
+                    if "error" in message:
+                        self.diagnostics["runtime_evaluate_error"] = message["error"].get("message", "Runtime.evaluate failed")
+                    else:
+                        readiness = message.get("result", {}).get("result", {}).get("value") or {}
+                        self.refresh_navigation_diagnostics(readiness, tab_id)
+                        if self.chart_navigation_ready(readiness, tab_id):
+                            return self.find_tab_by_id(str(tab_id), attempts=1) or tab
+                    eval_call_id = None
+                self.refresh_navigation_diagnostics(readiness, tab_id)
+                if self.chart_navigation_ready(readiness, tab_id):
+                    return self.find_tab_by_id(str(tab_id), attempts=1) or tab
+
+        self.diagnostics["navigation_error_message"] = "TradingView chart did not become ready"
+        raise TradingViewTabNavigationError("TAB_NAVIGATION_FAILED: TradingView chart did not become ready")
+
+    def refresh_navigation_diagnostics(self, readiness: dict, tab_id: str) -> dict | None:
+        tab = self.find_tab_by_id(str(tab_id), attempts=1)
+        target_url = tab.get("url") if tab else None
+        target_title = tab.get("title") if tab else None
+        self.diagnostics["navigation_location_href"] = readiness.get("href") or self.diagnostics.get("navigation_location_href")
+        self.diagnostics["navigation_ready_state"] = readiness.get("readyState") or self.diagnostics.get("navigation_ready_state")
+        self.diagnostics["navigation_target_url"] = target_url
+        self.diagnostics["navigation_target_title"] = target_title
+        self.diagnostics["navigation_active_chart_available"] = bool(readiness.get("activeChartAvailable"))
+        return tab
+
+    def chart_navigation_ready(self, readiness: dict, tab_id: str) -> bool:
+        tab = self.find_tab_by_id(str(tab_id), attempts=1)
+        href = readiness.get("href")
+        ready_state = readiness.get("readyState")
+        target_url = tab.get("url") if tab else None
+        target_title = tab.get("title") if tab else None
+        url_or_title_is_tv = is_tradingview_location(href, readiness.get("title")) or is_tradingview_location(target_url, target_title)
+        no_longer_blank = not is_blank_url(href) or not is_blank_url(target_url)
+        return bool(no_longer_blank and url_or_title_is_tv and ready_state in {"interactive", "complete"} and readiness.get("activeChartAvailable"))
 
     def cdp_call(self, tab: dict, method: str, params: dict | None = None, call_id: int = 1) -> dict:
+        last_error = None
+        for attempt in range(2):
+            self.check_deadline(f"cdp:{method}")
+            current_tab = tab if attempt == 0 else self.open_or_reuse_chart_tab()
+            ws_url = current_tab.get("webSocketDebuggerUrl")
+            if not ws_url:
+                last_error = RuntimeError("Missing webSocketDebuggerUrl for TradingView tab")
+            else:
+                try:
+                    with ws_connect(ws_url, open_timeout=5) as websocket:
+                        self.diagnostics["devtools_ws_connected"] = True
+                        logger.info("TradingView CDP websocket connected method=%s attempt=%d", method, attempt + 1)
+                        websocket.send(json.dumps({"id": call_id, "method": method, "params": params or {}}))
+                        while True:
+                            self.check_deadline(f"cdp_recv:{method}")
+                            message = json.loads(websocket.recv(timeout=15))
+                            if message.get("id") == call_id:
+                                return message
+                except Exception as exc:
+                    last_error = exc
+            self.diagnostics["cdp_last_exception"] = str(last_error)
+            logger.warning("TradingView CDP call failed method=%s attempt=%d error=%s", method, attempt + 1, last_error)
+            if attempt == 0:
+                self.diagnostics["cdp_reconnect_count"] += 1
+        raise last_error
+
+    def cdp_call_on_tab(self, tab: dict, method: str, params: dict | None = None, call_id: int = 1) -> dict:
         ws_url = tab.get("webSocketDebuggerUrl")
         if not ws_url:
             raise RuntimeError("Missing webSocketDebuggerUrl for TradingView tab")
+        self.check_deadline(f"cdp:{method}")
         with ws_connect(ws_url, open_timeout=5) as websocket:
             self.diagnostics["devtools_ws_connected"] = True
             websocket.send(json.dumps({"id": call_id, "method": method, "params": params or {}}))
             while True:
+                self.check_deadline(f"cdp_recv:{method}")
                 message = json.loads(websocket.recv(timeout=15))
                 if message.get("id") == call_id:
                     return message
+
+    def evaluate_runtime_on_tab(self, tab: dict, expression: str) -> Any:
+        response = self.cdp_call_on_tab(
+            tab,
+            "Runtime.evaluate",
+            {
+                "expression": expression,
+                "returnByValue": True,
+                "awaitPromise": True,
+            },
+        )
+        if "exceptionDetails" in response:
+            details = response["exceptionDetails"].get("text", "Runtime.evaluate failed")
+            self.diagnostics["runtime_evaluate_error"] = details
+            raise RuntimeError(details)
+        return response.get("result", {}).get("result", {}).get("value")
 
     def evaluate_runtime(self, expression: str) -> Any:
         tab = self.open_or_reuse_chart_tab()
@@ -417,7 +758,7 @@ class TradingViewClient:
         for _ in range(max_attempts):
             wait_seconds = initial_wait_seconds if attempts == 0 else retry_wait_seconds
             if wait_seconds:
-                time.sleep(wait_seconds)
+                self.sleep(wait_seconds, "candle_extract_wait")
             attempts += 1
             result = self.evaluate_runtime(expression) or {}
             candles = result.get("candles") or []
@@ -451,6 +792,14 @@ class TradingViewClient:
         for tab in self.list_tabs():
             if tab.get("url") == url:
                 return tab
+        return None
+
+    def find_tab_by_id(self, tab_id: str, attempts: int = 5) -> dict | None:
+        for _ in range(attempts):
+            for tab in self.list_tabs():
+                if tab.get("id") == tab_id:
+                    return tab
+            self.sleep(0.5, "find_tab_by_id")
         return None
 
     def verify_symbol_loaded(self, tradingview_symbol: str) -> bool:
@@ -491,6 +840,76 @@ def is_tradingview_tab(tab: dict) -> bool:
     return "tradingview.com/chart" in url or "tradingview" in url or "tradingview" in title
 
 
+def is_tradingview_location(url: object, title: object = None) -> bool:
+    text = f"{url or ''} {title or ''}".lower()
+    return "tradingview.com/chart" in text or "tradingview" in text
+
+
+def is_real_tradingview_chart_target(tab: dict) -> bool:
+    if tab.get("type") != "page":
+        return False
+    url = tab.get("url", "")
+    if is_blank_url(url):
+        return False
+    return "tradingview.com" in str(url).lower() and is_tradingview_tab(tab)
+
+
+def is_blank_url(url: object) -> bool:
+    value = str(url or "").strip().lower()
+    return value == "" or value == "about:blank"
+
+
+def chart_readiness_expression() -> str:
+    return """
+    (() => {
+      const api = window.TradingViewApi;
+      const chart = api && typeof api.activeChart === 'function' ? api.activeChart() : null;
+      return {
+        href: String(window.location && window.location.href || ''),
+        title: String(document && document.title || ''),
+        readyState: String(document && document.readyState || ''),
+        tradingviewApiAvailable: !!api,
+        activeChartAvailable: !!chart
+      };
+    })()
+    """
+
+
+def attachable_target_payload(tab: dict, readiness: dict) -> dict:
+    return {
+        "target_id": tab.get("id"),
+        "title": tab.get("title"),
+        "url": tab.get("url"),
+        "websocket_debugger_url": tab.get("webSocketDebuggerUrl"),
+        "ready": bool(readiness.get("activeChartAvailable")),
+        "chart_readiness": readiness,
+    }
+
+
+def tv_tab_error_stage(exc: Exception) -> str:
+    if isinstance(exc, TradingViewTabNotAttachedError):
+        return "TV_TAB_NOT_ATTACHED"
+    if isinstance(exc, TradingViewTabDisconnectedError):
+        return "TV_TAB_DISCONNECTED"
+    return "TAB_NAVIGATION_FAILED"
+
+
+def register_managed_tab(tab: dict | None) -> None:
+    tab_id = tab.get("id") if isinstance(tab, dict) else None
+    if tab_id:
+        MANAGED_TAB_IDS.add(str(tab_id))
+
+
+def unregister_managed_tab_id(tab_id: object) -> None:
+    if tab_id:
+        MANAGED_TAB_IDS.discard(str(tab_id))
+
+
+def is_app_managed_tab(tab: dict) -> bool:
+    tab_id = tab.get("id")
+    return MANAGED_TAB_MARKER in str(tab.get("url", "")) or (bool(tab_id) and str(tab_id) in MANAGED_TAB_IDS)
+
+
 def validate_timeframe(timeframe: str) -> str:
     if timeframe not in SUPPORTED_TIMEFRAMES:
         raise ValueError("Unsupported timeframe. Use 1W, 1D, 4H, or 1H")
@@ -498,7 +917,11 @@ def validate_timeframe(timeframe: str) -> str:
 
 
 def tradingview_url(tradingview_symbol: str, interval: str) -> str:
-    return f"https://www.tradingview.com/chart/?symbol={quote(tradingview_symbol, safe='')}&interval={interval}"
+    return f"https://www.tradingview.com/chart/?symbol={quote(tradingview_symbol, safe='')}&interval={interval}&{MANAGED_TAB_MARKER}"
+
+
+def managed_tradingview_url() -> str:
+    return f"https://www.tradingview.com/chart/?{MANAGED_TAB_MARKER}"
 
 
 def extract_symbol_from_url(url: str) -> str | None:

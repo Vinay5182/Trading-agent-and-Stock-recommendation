@@ -1,4 +1,5 @@
 import sys
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -355,3 +356,37 @@ def test_scheduler_config_defaults_are_safe(monkeypatch) -> None:
     assert payload["dry_run_first"] is True
     assert payload["max_writes"] == 1
     assert payload["max_trades"] == 6
+
+
+def test_scheduler_status_reports_actual_automation_state() -> None:
+    payload = scheduler.build_paper_update_scheduler_status(
+        latest_run=None,
+        latest_scheduled_run=None,
+        lock_status={"held": False},
+        automation_status={
+            "task_running": True,
+            "automatic_updates_enabled": True,
+            "recurring_loop_enabled": True,
+            "health": "HEALTHY",
+            "last_started_at": "2026-06-17T09:00:00",
+            "last_completed_at": "2026-06-17T09:00:05",
+            "last_success_at": "2026-06-17T09:00:05",
+            "last_error": None,
+            "processed_count": 4,
+            "expected_interval_seconds": 60,
+            "jobs": {"sync_trade_ready": {"processed_count": 4}},
+        },
+        scheduler_settings=make_scheduler_settings(),
+        now=datetime.fromisoformat("2026-06-17T09:00:10"),
+    )
+
+    assert payload["scheduler_running"] is True
+    assert payload["automatic_updates_enabled"] is True
+    assert payload["recurring_loop_enabled"] is True
+    assert payload["health"] == "HEALTHY"
+    assert payload["last_started_at"] == "2026-06-17T09:00:00"
+    assert payload["last_completed_at"] == "2026-06-17T09:00:05"
+    assert payload["last_success_at"] == "2026-06-17T09:00:05"
+    assert payload["last_error"] is None
+    assert payload["processed_count"] == 4
+    assert payload["expected_interval_seconds"] == 60

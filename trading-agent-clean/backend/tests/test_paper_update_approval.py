@@ -34,6 +34,7 @@ def make_trade(symbol: str = "WAIT1") -> dict:
         "quantity": 10,
         "paper_pnl": 0.0,
         "updated_at": "2026-06-07T00:00:00",
+        "state_version": 1,
     }
 
 
@@ -123,6 +124,8 @@ class FakePaperTrades:
         if row is None:
             return SimpleNamespace(modified_count=0, matched_count=0)
         row.update(update.get("$set", {}))
+        for key, value in update.get("$inc", {}).items():
+            row[key] = row.get(key, 0) + value
         return SimpleNamespace(modified_count=1, matched_count=1)
 
     async def delete_one(self, *args, **kwargs) -> SimpleNamespace:

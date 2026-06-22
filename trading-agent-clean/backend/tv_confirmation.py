@@ -290,11 +290,16 @@ def _build_candle_integrity_summary(timeframes: list[str], timeframe_debug: dict
 
 
 SYMBOL_DIAGNOSTIC_FIELDS = [
+    "managed_tab_id",
+    "tab_id",
+    "requested_symbol",
     "requested_tradingview_symbol",
     "previous_active_symbol",
     "active_symbol_before_set",
     "active_symbol_after_set",
     "active_symbol_after_stabilize",
+    "loaded_symbol",
+    "resolution",
     "symbol_match",
     "symbol_stable_check_passed",
     "symbol_retry_count",
@@ -306,7 +311,29 @@ SYMBOL_DIAGNOSTIC_FIELDS = [
 
 
 def _symbol_diagnostics(client: TradingViewClient) -> dict:
-    return {field: client.diagnostics.get(field) for field in SYMBOL_DIAGNOSTIC_FIELDS}
+    diagnostics = {field: client.diagnostics.get(field) for field in SYMBOL_DIAGNOSTIC_FIELDS}
+    requested = client.diagnostics.get("requested_tradingview_symbol") or client.diagnostics.get("requested_symbol")
+    loaded = client.diagnostics.get("loaded_symbol") or client.diagnostics.get("active_symbol_after_stabilize") or client.diagnostics.get("active_symbol_after_set")
+    resolution = client.diagnostics.get("resolution_after")
+    tab_id = client.diagnostics.get("managed_tab_id")
+    diagnostics.update(
+        {
+            "tab_id": tab_id,
+            "requested_symbol": requested,
+            "loaded_symbol": loaded,
+            "resolution": resolution,
+        }
+    )
+    return diagnostics
+
+
+def _tab_creation_failed_before_symbol_validation(client: TradingViewClient, reason: str | None) -> bool:
+    return (
+        reason in {"SYMBOL_LOAD_FAILED", "TAB_NAVIGATION_FAILED", "TV_TAB_NOT_ATTACHED", "TV_TAB_DISCONNECTED"}
+        and not client.diagnostics.get("managed_tab_id")
+        and client.diagnostics.get("active_symbol_after_set") is None
+        and client.diagnostics.get("symbol_stable_check_passed") is None
+    )
 
 
 def _clean_symbol_text(value: object) -> str:
@@ -694,6 +721,89 @@ def apply_trade_quality(row: dict, strategy: str) -> dict:
     else:
         enriched.update(_classify_swing_trade_quality(enriched))
     return enriched
+
+
+def _symbols_match(left: object, right: object) -> bool:
+    active = _clean_symbol_text(left)
+    requested = _clean_symbol_text(right)
+    if not active or not requested:
+        return False
+    requested_suffix = requested.split(":", 1)[-1]
+    return active == requested or active == requested_suffix
+
+
+def _timeframe_candle_count(row: dict, timeframe: str) -> int:
+    candles_by_timeframe = row.get("candles_by_timeframe") or {}
+    value = candles_by_timeframe.get(timeframe)
+    if value is None:
+        value = (row.get("timeframe_analysis") or {}).get(timeframe, {}).get("candles_count")
+    if value is None:
+        value = (row.get("timeframe_debug") or {}).get(timeframe, {}).get("candles_count")
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _loaded_resolution(row: dict, timeframes: list[str]) -> str | None:
+    debug = row.get("timeframe_debug") or {}
+    for timeframe in reversed(timeframes):
+        resolution = (debug.get(timeframe) or {}).get("resolution_after")
+        if resolution:
+            return resolution
+    return row.get("resolution")
+
+
+def _timeframes_verified(row: dict, timeframes: list[str]) -> bool:
+    debug = row.get("timeframe_debug") or {}
+    for timeframe in timeframes:
+        frame_debug = debug.get(timeframe)
+        if not frame_debug or frame_debug.get("resolution_match") is not True:
+            return False
+    return True
+
+
+def _timeframes_have_candles(row: dict, timeframes: list[str]) -> bool:
+    return bool(timeframes) and all(_timeframe_candle_count(row, timeframe) > 0 for timeframe in timeframes)
+
+
+def _mark_safety_failure(row: dict, reason: str, error: str | None = None) -> dict:
+    failed = dict(row)
+    failed.update(
+        {
+            "unsafe_status_before_guard": row.get("tv_status"),
+            "unsafe_reason_before_guard": row.get("reason"),
+            "tv_status": "TECHNICAL_FAILED",
+            "tv_confirmed": False,
+            "confidence_score": 0,
+            "reason": reason,
+            "error": error or reason,
+            "safety_guard_reason": reason,
+            **_empty_paper_trade_plan(reason),
+            **_empty_trade_quality(reason),
+        }
+    )
+    return failed
+
+
+def enforce_tv_confirmation_safety(row: dict, strategy: str, timeframes: list[str]) -> dict:
+    checked_timeframes = row.get("timeframes_checked") or timeframes or []
+    safe_row = dict(row)
+    requested = safe_row.get("requested_symbol") or safe_row.get("requested_tradingview_symbol") or safe_row.get("tradingview_symbol")
+    loaded = safe_row.get("loaded_symbol") or safe_row.get("active_symbol_after_stabilize") or safe_row.get("active_symbol_after_set")
+    safe_row["tab_id"] = safe_row.get("tab_id") or safe_row.get("managed_tab_id")
+    safe_row["requested_symbol"] = requested
+    safe_row["loaded_symbol"] = loaded
+    safe_row["resolution"] = _loaded_resolution(safe_row, checked_timeframes)
+    if _upper(safe_row.get("tv_status")) == "TECHNICAL_FAILED":
+        return safe_row
+    if safe_row.get("symbol_match") is not True or not _symbols_match(loaded, requested):
+        return _mark_safety_failure(safe_row, "SYMBOL_MISMATCH", f"requested_symbol={requested}, loaded_symbol={loaded}")
+    if not _timeframes_verified(safe_row, checked_timeframes):
+        return _mark_safety_failure(safe_row, "TIMEFRAME_MISMATCH")
+    if not _timeframes_have_candles(safe_row, checked_timeframes):
+        return _mark_safety_failure(safe_row, "NO_CANDLES")
+    return apply_trade_quality(safe_row, strategy)
 
 
 def _price_zone_text(*values) -> str | None:
@@ -1796,13 +1906,14 @@ def _fetch_swing_timeframe_with_validation(
     min_candles = settings.TRADINGVIEW_MIN_CANDLES
     for attempt in range(1, settings.TRADINGVIEW_OHLCV_RETRIES + 1):
         try:
+            client.check_deadline(f"timeframe:{timeframe}:attempt:{attempt}")
             client.set_timeframe(timeframe)
             resolution_ok = client.wait_for_resolution(timeframe, settings.TRADINGVIEW_RESOLUTION_WAIT_SECONDS)
             total_wait += settings.TRADINGVIEW_RESOLUTION_WAIT_SECONDS
-            time.sleep(settings.TRADINGVIEW_TIMEFRAME_STABILIZE_SECONDS)
+            client.sleep(settings.TRADINGVIEW_TIMEFRAME_STABILIZE_SECONDS, f"timeframe:{timeframe}:stabilize")
             total_wait += settings.TRADINGVIEW_TIMEFRAME_STABILIZE_SECONDS
             first = client.extract_candles_from_active_chart(initial_wait_seconds=0, retry_wait_seconds=0, max_attempts=1)
-            time.sleep(settings.TRADINGVIEW_CANDLE_STABILITY_WAIT_SECONDS)
+            client.sleep(settings.TRADINGVIEW_CANDLE_STABILITY_WAIT_SECONDS, f"timeframe:{timeframe}:candle_stability")
             total_wait += settings.TRADINGVIEW_CANDLE_STABILITY_WAIT_SECONDS
             candles = client.extract_candles_from_active_chart(initial_wait_seconds=0, retry_wait_seconds=0, max_attempts=1)
             diagnostics = dict(client.diagnostics)
@@ -1814,10 +1925,13 @@ def _fetch_swing_timeframe_with_validation(
             diagnostics["error_stage"] = "TRADINGVIEW_CANDLE_LOAD_RETRY"
             diagnostics["error_message"] = str(exc)
             debug = _build_timeframe_debug(timeframe, [], diagnostics)
+            debug["timeout_location"] = diagnostics.get("timeout_location")
             debug["stale_or_merged_candle_warning"] = True
             last_debug = debug
+            if isinstance(exc, TimeoutError):
+                return [], debug
             if attempt < settings.TRADINGVIEW_OHLCV_RETRIES:
-                time.sleep(2)
+                client.sleep(2, f"timeframe:{timeframe}:retry")
                 total_wait += 2
                 continue
             return [], debug
@@ -1873,7 +1987,7 @@ def _fetch_swing_timeframe_with_validation(
             debug["retry_skipped_reason"] = "INTRADAY_CANDLES_LOADED_MOVE_TO_NEXT_TIMEFRAME"
             return candles, debug
         if attempt < settings.TRADINGVIEW_OHLCV_RETRIES:
-            time.sleep(2)
+            client.sleep(2, f"timeframe:{timeframe}:retry")
             total_wait += 2
     return last_candles, last_debug
 
@@ -1882,8 +1996,10 @@ def confirm_swing_symbol_timeframes(
     symbol: str | None,
     timeframes: list[str],
     candidate: dict | None = None,
+    attached_target_id: str | None = None,
 ) -> dict:
-    client = TradingViewClient(settings.TRADINGVIEW_DEBUG_PORT)
+    client = TradingViewClient(settings.TRADINGVIEW_DEBUG_PORT, attached_target_id=attached_target_id, require_attached_tab=True)
+    client.set_deadline(settings.TRADINGVIEW_SYMBOL_TIMEOUT_SECONDS)
     candidate = candidate or {}
     symbol_meta = _prepare_tradingview_symbol(symbol, candidate)
     requested_symbol = symbol_meta.get("requested_tradingview_symbol")
@@ -1924,6 +2040,7 @@ def confirm_swing_symbol_timeframes(
         "insufficient_history_timeframes": [],
         "reason": "TV_ERROR",
         "error": None,
+        "tab_creation_failed_before_symbol_validation": False,
         **_empty_paper_trade_plan("TV_ERROR"),
         **_empty_trade_quality("TV_ERROR"),
         **{field: None for field in SYMBOL_DIAGNOSTIC_FIELDS},
@@ -1934,12 +2051,14 @@ def confirm_swing_symbol_timeframes(
             return {**empty, "reason": "INVALID_TRADINGVIEW_SYMBOL", "error": symbol_meta.get("symbol_error_message")}
         client.connect_to_debug_port()
         if not client.load_symbol_strict(requested_symbol):
+            reason = client.diagnostics.get("symbol_error_stage") or "SYMBOL_LOAD_FAILED"
             return {
                 **empty,
                 **symbol_meta,
                 **_symbol_diagnostics(client),
-                "reason": "SYMBOL_LOAD_FAILED_OR_STALE_PREVIOUS_SYMBOL",
+                "reason": reason,
                 "error": client.diagnostics.get("symbol_error_message"),
+                "tab_creation_failed_before_symbol_validation": _tab_creation_failed_before_symbol_validation(client, reason),
             }
 
         timeframe_analysis = {}
@@ -2021,6 +2140,10 @@ def confirm_swing_symbol_timeframes(
         }
         if blocking_failed_required or not timeframe_analysis:
             reason = f"KEY_TIMEFRAME_FAILED:{','.join(blocking_failed_required or timeframes)}"
+            timeout_location = next(
+                (debug.get("timeout_location") for debug in timeframe_debug.values() if debug.get("timeout_location")),
+                None,
+            )
             return {
                 **empty,
                 "timeframes_checked": timeframes,
@@ -2031,8 +2154,9 @@ def confirm_swing_symbol_timeframes(
                 **weekly_history_diagnostics,
                 **symbol_meta,
                 **_symbol_diagnostics(client),
-                "reason": reason,
+                "reason": "SYMBOL_TIMEOUT" if timeout_location else reason,
                 "error": "; ".join(f"{tf}:{err}" for tf, err in fetch_errors.items()) or reason,
+                "timeout_location": timeout_location,
             }
 
         weekly = timeframe_analysis.get("1W")
@@ -2239,7 +2363,8 @@ def confirm_swing_symbol_timeframes(
             **paper_plan,
         }, "swing")
     except Exception as exc:
-        return {**empty, **symbol_meta, **_symbol_diagnostics(client), "reason": "TV_ERROR", "error": str(exc)}
+        reason = "SYMBOL_TIMEOUT" if isinstance(exc, TimeoutError) else "TV_ERROR"
+        return {**empty, **symbol_meta, **_symbol_diagnostics(client), "reason": reason, "error": str(exc), "timeout_location": client.diagnostics.get("timeout_location")}
 
 
 def confirm_momentum_symbol_timeframe(symbol: str, timeframe: str) -> dict:
@@ -2434,8 +2559,10 @@ def confirm_momentum_symbol_timeframes(
     symbol: str | None,
     timeframes: list[str],
     candidate: dict | None = None,
+    attached_target_id: str | None = None,
 ) -> dict:
-    client = TradingViewClient(settings.TRADINGVIEW_DEBUG_PORT)
+    client = TradingViewClient(settings.TRADINGVIEW_DEBUG_PORT, attached_target_id=attached_target_id, require_attached_tab=True)
+    client.set_deadline(settings.TRADINGVIEW_SYMBOL_TIMEOUT_SECONDS)
     candidate = candidate or {}
     symbol_meta = _prepare_tradingview_symbol(symbol, candidate)
     requested_symbol = symbol_meta.get("requested_tradingview_symbol")
@@ -2463,6 +2590,7 @@ def confirm_momentum_symbol_timeframes(
         "rejection_reason": None,
         "reason": "TV_ERROR",
         "error": None,
+        "tab_creation_failed_before_symbol_validation": False,
         **_empty_paper_trade_plan("TV_ERROR"),
         **_empty_trade_quality("TV_ERROR"),
         **{field: None for field in SYMBOL_DIAGNOSTIC_FIELDS},
@@ -2473,12 +2601,14 @@ def confirm_momentum_symbol_timeframes(
             return {**empty, "reason": "INVALID_TRADINGVIEW_SYMBOL", "error": symbol_meta.get("symbol_error_message")}
         client.connect_to_debug_port()
         if not client.load_symbol_strict(requested_symbol):
+            reason = client.diagnostics.get("symbol_error_stage") or "SYMBOL_LOAD_FAILED"
             return {
                 **empty,
                 **symbol_meta,
                 **_symbol_diagnostics(client),
-                "reason": "SYMBOL_LOAD_FAILED_OR_STALE_PREVIOUS_SYMBOL",
+                "reason": reason,
                 "error": client.diagnostics.get("symbol_error_message"),
+                "tab_creation_failed_before_symbol_validation": _tab_creation_failed_before_symbol_validation(client, reason),
             }
 
         timeframe_analysis = {}
@@ -2509,6 +2639,10 @@ def confirm_momentum_symbol_timeframes(
         failed = [timeframe for timeframe in timeframes if timeframe_analysis.get(timeframe, {}).get("technical_failed")]
         if failed or candle_integrity_summary.get("warnings") or candle_integrity_summary.get("same_last_ohlcv_pairs") or candle_integrity_summary.get("possible_stale_pairs"):
             reason = f"STALE_OR_MERGED_CANDLES:{','.join(failed or timeframes)}"
+            timeout_location = next(
+                (debug.get("timeout_location") for debug in timeframe_debug.values() if debug.get("timeout_location")),
+                None,
+            )
             return {
                 **empty,
                 "timeframes_checked": timeframes,
@@ -2518,8 +2652,9 @@ def confirm_momentum_symbol_timeframes(
                 "candle_integrity_summary": candle_integrity_summary,
                 **symbol_meta,
                 **_symbol_diagnostics(client),
-                "reason": reason,
+                "reason": "SYMBOL_TIMEOUT" if timeout_location else reason,
                 "error": "; ".join(f"{tf}:{err}" for tf, err in fetch_errors.items()) or reason,
+                "timeout_location": timeout_location,
             }
 
         weekly = timeframe_analysis.get("1W")
@@ -2630,7 +2765,8 @@ def confirm_momentum_symbol_timeframes(
             **paper_plan,
         }, "momentum")
     except Exception as exc:
-        return {**empty, **symbol_meta, **_symbol_diagnostics(client), "reason": "TV_ERROR", "error": str(exc)}
+        reason = "SYMBOL_TIMEOUT" if isinstance(exc, TimeoutError) else "TV_ERROR"
+        return {**empty, **symbol_meta, **_symbol_diagnostics(client), "reason": reason, "error": str(exc), "timeout_location": client.diagnostics.get("timeout_location")}
 
 
 def confirm_momentum_from_candles(candles: list[dict]) -> dict:

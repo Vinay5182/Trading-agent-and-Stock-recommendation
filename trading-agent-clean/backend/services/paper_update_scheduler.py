@@ -128,10 +128,12 @@ def build_paper_update_scheduler_status(
     latest_run: dict | None,
     latest_scheduled_run: dict | None = None,
     lock_status: dict,
+    automation_status: dict | None = None,
     scheduler_settings=settings,
     now: datetime | None = None,
 ) -> dict:
     config = scheduler_config(scheduler_settings)
+    automation_status = automation_status or {}
     scheduled_fields = scheduled_run_fields(latest_scheduled_run or latest_run)
     disabled_reason = None if config["enabled"] else "SCHEDULER_DISABLED"
     unsafe_reasons = scheduler_unsafe_reasons(config)
@@ -163,9 +165,18 @@ def build_paper_update_scheduler_status(
         **scheduled_fields,
         "last_block_reason": last_block_reason,
         "lock": lock_status,
-        "scheduler_running": False,
-        "automatic_updates_enabled": False,
-        "recurring_loop_enabled": False,
+        "scheduler_running": bool(automation_status.get("task_running")),
+        "automatic_updates_enabled": bool(automation_status.get("automatic_updates_enabled")),
+        "recurring_loop_enabled": bool(automation_status.get("recurring_loop_enabled")),
+        "health": automation_status.get("health", "DOWN"),
+        "automation_health": automation_status.get("health", "DOWN"),
+        "last_started_at": automation_status.get("last_started_at"),
+        "last_completed_at": automation_status.get("last_completed_at"),
+        "last_success_at": automation_status.get("last_success_at"),
+        "last_error": automation_status.get("last_error"),
+        "processed_count": automation_status.get("processed_count", 0),
+        "expected_interval_seconds": automation_status.get("expected_interval_seconds"),
+        "automatic_jobs": automation_status.get("jobs", {}),
         "blocked": unsafe_config,
         "block_reason": unsafe_reasons[0] if unsafe_reasons else None,
         "unsafe_config": unsafe_config,

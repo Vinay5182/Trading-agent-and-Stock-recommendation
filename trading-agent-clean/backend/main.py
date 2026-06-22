@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from config import settings
 from database import lifespan
 from models import SettingsResponse
-from routes import ai as ai_routes, dashboard, market, momentum, paper, scan, score, signals, swing, tv
+from routes import ai as ai_routes, dashboard, market, momentum, paper, scan, score, signals, swing, system, tv
 
 
 app = FastAPI(title="Trading Agent Clean", version="0.2.0", lifespan=lifespan)
@@ -33,6 +33,7 @@ app.include_router(dashboard.router, prefix="/api/dashboard", tags=["dashboard"]
 app.include_router(tv.router, prefix="/api/tv", tags=["tradingview"])
 app.include_router(market.router, prefix="/api/market", tags=["market"])
 app.include_router(ai_routes.router, prefix="/api/ai", tags=["ai"])
+app.include_router(system.router, prefix="/api/system", tags=["system"])
 
 
 @app.get("/health")

@@ -10,7 +10,7 @@ from main import app
 from routes import paper
 
 
-def make_trade(symbol: str, status: str = "NOT_TRIGGERED") -> dict:
+def make_trade(symbol: str, status: str = "WAITING_FOR_ENTRY") -> dict:
     return {
         "_id": f"{symbol.lower()}-id",
         "symbol": symbol,
@@ -20,7 +20,7 @@ def make_trade(symbol: str, status: str = "NOT_TRIGGERED") -> dict:
         "paper_only": True,
         "status": status,
         "outcome_status": status,
-        "entry_triggered": status not in {"NOT_TRIGGERED", "PLANNED"},
+        "entry_triggered": status not in {"NOT_TRIGGERED", "PLANNED", "WAITING", "WAITING_FOR_ENTRY"},
         "entry_price": 100.0,
         "stop_loss": 90.0,
         "target_1": 120.0,
@@ -40,6 +40,35 @@ def make_candle(high: float) -> dict:
         "low": 95.0,
         "close": 101.0,
         "volume": 1_000,
+    }
+
+
+def make_market_row(symbol: str, *, high: float = 100.0, low: float = 95.0, close: float = 101.0) -> dict:
+    return {
+        "exchange": "NSE",
+        "symbol": symbol,
+        "canonical_symbol": symbol,
+        "tradingview_symbol": f"NSE:{symbol}",
+        "day_high": high,
+        "day_low": low,
+        "current_price": close,
+        "updated_at": "2026-06-16T10:00:00",
+    }
+
+
+def make_snapshot_row(symbol: str, *, trade_id: str | None = None, high: float = 101.0, low: float = 101.0, close: float = 101.0) -> dict:
+    return {
+        "paper_only": True,
+        "paper_trade_id": trade_id or f"{symbol.lower()}-id",
+        "symbol": symbol,
+        "canonical_symbol": symbol,
+        "observed_at": "2026-06-16T10:00:00",
+        "observed_at_iso": "2026-06-16T10:00:00",
+        "high": high,
+        "low": low,
+        "close": close,
+        "price": close,
+        "source": "test_snapshot",
     }
 
 
@@ -146,6 +175,23 @@ class FakePaperUpdateRuns:
         return FakeCursor([project_row(row, projection) for row in self.rows if matches_query(row, query)])
 
 
+class FakeMarketData:
+    def __init__(self, rows: list[dict]) -> None:
+        self.rows = rows
+
+    async def find_one(self, query: dict | None = None, *_args, **_kwargs) -> dict | None:
+        row = next((row for row in self.rows if matches_query(row, query)), None)
+        return row.copy() if row else None
+
+
+class FakePaperMarketSnapshots:
+    def __init__(self, rows: list[dict]) -> None:
+        self.rows = rows
+
+    def find(self, query: dict | None = None, *_args, **_kwargs) -> FakeCursor:
+        return FakeCursor([row.copy() for row in self.rows if matches_query(row, query)])
+
+
 class FakeTradingViewNoEntryClient:
     def connect_to_debug_port(self) -> bool:
         return True
@@ -169,17 +215,25 @@ class FakeTradingViewFailureClient:
         raise RuntimeError("simulated TradingView failure")
 
 
-def patch_fake_db(monkeypatch, trades: list[dict], runs: list[dict] | None = None):
+def patch_fake_db(monkeypatch, trades: list[dict], runs: list[dict] | None = None, market_rows: list[dict] | None = None, snapshots: list[dict] | None = None):
+    effective_market_rows = market_rows if market_rows is not None else [make_market_row(row["symbol"]) for row in trades]
+    if snapshots is None:
+        snapshots = [
+            make_snapshot_row(row["symbol"], trade_id=row["_id"], high=market.get("current_price", 101.0), low=market.get("current_price", 101.0), close=market.get("current_price", 101.0))
+            for row, market in zip(trades, effective_market_rows)
+        ]
     db = SimpleNamespace(
         paper_trades=FakePaperTrades(trades),
         paper_update_runs=FakePaperUpdateRuns(runs),
+        market_data=FakeMarketData(effective_market_rows),
+        paper_market_snapshots=FakePaperMarketSnapshots(snapshots),
     )
     monkeypatch.setattr(paper, "get_database", lambda: db)
     return db
 
 
 def test_dry_run_creates_completed_paper_update_run_log(monkeypatch) -> None:
-    db = patch_fake_db(monkeypatch, [make_trade("WAIT1")])
+    db = patch_fake_db(monkeypatch, [make_trade("WAIT1")], market_rows=[make_market_row("WAIT1", high=99.0, close=98.0)])
     monkeypatch.setattr(paper, "TradingViewClient", FakeTradingViewNoEntryClient)
     client = TestClient(app)
 
@@ -254,22 +308,21 @@ def test_unbound_real_update_creates_approval_required_run_log_without_writes(mo
     assert db.paper_trades.delete_calls == []
 
 
-def test_evaluation_failure_creates_failed_run_log(monkeypatch) -> None:
-    db = patch_fake_db(monkeypatch, [make_trade("WAIT1")])
-    monkeypatch.setattr(paper, "TradingViewClient", FakeTradingViewFailureClient)
+def test_missing_market_data_creates_completed_run_log_without_transition(monkeypatch) -> None:
+    db = patch_fake_db(monkeypatch, [make_trade("WAIT1")], market_rows=[])
     client = TestClient(app)
 
     response = client.post("/api/paper/update-trades?dry_run=true&max_trades=6&max_writes=1")
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["errors_count"] == 1
+    assert payload["errors_count"] == 0
+    assert payload["proposed_write_count"] == 0
     run = db.paper_update_runs.rows[0]
-    assert run["status"] == "FAILED"
-    assert run["errors_count"] == 1
-    assert run["details"]["errors"][0]["error_message"] == "simulated TradingView failure"
-    assert run["approval_status"] == "INVALIDATED"
-    assert run["approval_expires_at"] is None
+    assert run["status"] == "COMPLETED"
+    assert run["errors_count"] == 0
+    assert run["per_trade_results"][0]["proposed_reason"] == "DATA_INSUFFICIENT"
+    assert run["approval_status"] == "AVAILABLE"
     assert db.paper_trades.update_calls == []
 
 

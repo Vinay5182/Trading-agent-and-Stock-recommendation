@@ -3,6 +3,7 @@ from datetime import datetime
 from fastapi import APIRouter, Query
 
 from database import get_database
+from services.tradingview_manager import tradingview_manager
 from tv_confirmation import PAPER_PLAN_FIELDS, confirm_momentum_symbol_timeframe, confirm_symbol_timeframe
 
 
@@ -46,7 +47,13 @@ async def build_tv_confirmed_signals(
     processed = 0
     async for row in cursor:
         processed += 1
-        confirmation = confirm_symbol_timeframe(row["tradingview_symbol"], timeframe)
+        confirmation = await tradingview_manager.run_sync(
+            "signals.confirm_symbol_timeframe",
+            confirm_symbol_timeframe,
+            row["tradingview_symbol"],
+            timeframe,
+            retries=1,
+        )
         if not confirmation["tv_confirmed"] or not confirmation.get("paper_plan_valid"):
             continue
         now = datetime.utcnow().isoformat()
@@ -155,7 +162,13 @@ async def build_momentum_tv_confirmed_signals(
     signals = []
     async for row in cursor:
         processed += 1
-        confirmation = confirm_momentum_symbol_timeframe(row["tradingview_symbol"], timeframe)
+        confirmation = await tradingview_manager.run_sync(
+            "signals.confirm_momentum_symbol_timeframe",
+            confirm_momentum_symbol_timeframe,
+            row["tradingview_symbol"],
+            timeframe,
+            retries=1,
+        )
         if not (
             confirmation.get("momentum_confirmed") is True
             and confirmation.get("reason") == "MOMENTUM_CONFIRMED"

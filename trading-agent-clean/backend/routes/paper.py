@@ -1,32 +1,55 @@
+import asyncio
 import hashlib
 import json
+import logging
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from math import floor
 from uuid import uuid4
 
 from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, StrictInt, StrictStr
 from pymongo.errors import DuplicateKeyError
 
 from config import settings
 from database import get_database
 from routes.signals import build_tv_confirmed_signals
+from services.paper_identity import apply_setup_identity, paper_trade_setup_filter
+from services.paper_migration import ensure_paper_trade_setup_index
+from services.paper_sync import sync_trade_ready
+from services.system_errors import record_system_error
 from services.paper_update_scheduler import (
     SCHEDULER_DRY_RUN_ENDPOINT_MODE,
     SCHEDULER_DRY_RUN_OWNER,
     build_paper_update_scheduler_status,
+)
+from services.tradingview_manager import tradingview_manager
+from services.trade_journal import (
+    analytics_eligible_record,
+    analytics_pnl_value,
+    get_trade_analytics,
+    is_completed_trade,
+    journal_completed_trade,
+    load_trade_journal,
+    sync_completed_trades_to_journal,
 )
 from tv_client import TradingViewClient
 from tv_confirmation import PAPER_PLAN_FIELDS, build_price_action_paper_plan_from_candles, confirm_from_candles, confirm_momentum_from_candles
 
 
 router = APIRouter()
-WAITING_STATUSES = {"NOT_TRIGGERED", "PLANNED"}
-ACTIVE_STATUSES = {"ACTIVE", "TARGET_1_HIT"}
+logger = logging.getLogger("uvicorn.error")
+WAITING_FOR_ENTRY_STATUS = "WAITING_FOR_ENTRY"
+WAITING_STATUSES = {"NOT_TRIGGERED", "PLANNED", "WAITING", WAITING_FOR_ENTRY_STATUS}
+T1_PARTIAL_STATUS = "T1_PARTIAL"
+T2_PARTIAL_STATUS = "T2_PARTIAL"
+PARTIAL_STATUSES = {T1_PARTIAL_STATUS, T2_PARTIAL_STATUS}
+ACTIVE_STATUSES = {"ACTIVE", "TARGET_1_HIT", *PARTIAL_STATUSES}
 TERMINAL_STATUSES = {
     "CLOSED",
+    "COMPLETED",
     "EXPIRED",
     "TARGET_HIT",
     "TARGET_1_HIT_FINAL",
@@ -45,10 +68,23 @@ TERMINAL_STATUSES = {
     "LOST_SL",
     "AMBIGUOUS",
 }
+PREVIOUS_DAY_LOW_FIELDS = (
+    "previous_day_low",
+    "prev_day_low",
+    "previous_low",
+    "prev_low",
+    "prior_day_low",
+    "last_day_low",
+    "yesterday_low",
+    "previous_candle_low",
+    "previous_session_low",
+)
 TRACKABLE_STATUSES = sorted(WAITING_STATUSES | ACTIVE_STATUSES)
 OPEN_STATUSES = sorted(ACTIVE_STATUSES)
 NON_TERMINAL_STATUSES = sorted(WAITING_STATUSES | ACTIVE_STATUSES)
 CLOSED_STATUSES = sorted(TERMINAL_STATUSES)
+SL_HIT_STATUSES = {"SL_HIT", "STOP_HIT", "STOPPED", "STOPPED_AFTER_T1", "LOST_SL"}
+TARGET_COMPLETED_STATUSES = TERMINAL_STATUSES - SL_HIT_STATUSES - {"AMBIGUOUS"}
 PAPER_UPDATE_LOCK_NAME = "paper_trade_outcome_update"
 PAPER_UPDATE_LOCK_TTL_SECONDS = 15 * 60
 PAPER_UPDATE_APPROVAL_TTL_SECONDS = 3 * 60
@@ -65,12 +101,42 @@ PAPER_UPDATE_APPROVED_FIELDS = {
     "exit_reason",
     "paper_pnl",
     "paper_pnl_percent",
+    "stop_loss",
+    "initial_stop_loss",
+    "current_stop_loss",
+    "quantity_remaining",
+    "partial_exit_1",
+    "partial_exit_2",
+    "partial_exit_3",
+    "stop_exit",
+    "exit_allocations",
+    "pnl_per_share",
+    "realized_pnl",
+    "remaining_unrealized_pnl",
+    "total_trade_pnl",
+    "invested_amount",
+    "profit_percent",
+    "initial_risk_amount",
+    "realized_rr",
+    "ambiguity_timestamp",
+    "ambiguity_candle_ohlc",
+    "ambiguity_timeframe",
+    "ambiguity_touched_levels",
+    "ambiguity_previous_status",
+    "ambiguity_reason",
+    "lower_timeframe_resolution_attempt",
+    "journal_status",
+    "journal_pending",
+    "completion_pending",
+    "state",
     "status",
     "outcome_status",
     "status_updated_at",
     "entry_triggered",
     "entry_triggered_at",
     "t1_hit",
+    "t2_hit",
+    "t3_hit",
 }
 PAPER_UPDATE_PROGRESS = {
     "running": False,
@@ -83,6 +149,7 @@ PAPER_UPDATE_PROGRESS = {
     "started_at": None,
     "finished_at": None,
 }
+PAPER_AUTO_OUTCOME_LOCK = asyncio.Lock()
 
 
 class PaperUpdateApprovalRequest(BaseModel):
@@ -141,6 +208,23 @@ def paper_trade_precondition_hash(trade: dict) -> str:
 
 def paper_trade_id_for_query(trade_id: str):
     return ObjectId(trade_id) if ObjectId.is_valid(trade_id) else trade_id
+
+
+def state_version_filter_for_trade(trade: dict) -> dict:
+    return {"state_version": int(trade.get("state_version", 1))}
+
+
+def atomic_trade_update_filter(trade: dict) -> dict:
+    return {
+        "_id": trade["_id"],
+        "paper_only": True,
+        "status": trade.get("status"),
+        **state_version_filter_for_trade(trade),
+    }
+
+
+def state_transition_update(update: dict) -> dict:
+    return {"$set": update, "$inc": {"state_version": 1}}
 
 
 def proposed_transition_rows(results: list[dict]) -> list[dict]:
@@ -534,11 +618,36 @@ async def get_paper_update_scheduler_status(db) -> dict:
     latest_run = await latest_paper_update_run(db)
     latest_scheduled_run = await latest_scheduled_paper_update_run(db)
     lock_status = await get_paper_update_lock_status(db)
+    from services.paper_automation import get_paper_automation_status_from_db
+
     return build_paper_update_scheduler_status(
         latest_run=latest_run,
         latest_scheduled_run=latest_scheduled_run,
         lock_status=lock_status,
+        automation_status=await get_paper_automation_status_from_db(db),
         scheduler_settings=settings,
+    )
+
+
+async def mark_trade_journal_result(db, trade: dict, journal_result: dict | None) -> None:
+    if not journal_result:
+        return
+    if not (journal_result.get("journaled") or journal_result.get("duplicate")):
+        return
+    if not (trade.get("journal_pending") or trade.get("journal_status") == "PENDING"):
+        return
+    await db.paper_trades.update_one(
+        {"_id": trade["_id"], "paper_only": True},
+        {
+            "$set": {
+                "journal_status": "JOURNALED",
+                "journal_pending": False,
+                "completion_pending": False,
+                "journaled_at": datetime.utcnow().isoformat(),
+                "journal_paper_trade_id": journal_result.get("paper_trade_id"),
+            }
+        },
+        upsert=False,
     )
 
 
@@ -573,8 +682,644 @@ def is_open_trade(trade: dict) -> bool:
     return bool(statuses & ACTIVE_STATUSES) and not bool(statuses & TERMINAL_STATUSES)
 
 
+def is_sl_hit_trade(trade: dict) -> bool:
+    return bool(trade_statuses(trade) & SL_HIT_STATUSES)
+
+
+def is_ambiguous_paper_trade(trade: dict) -> bool:
+    return "AMBIGUOUS" in trade_statuses(trade)
+
+
+def is_completed_target_trade(trade: dict) -> bool:
+    statuses = trade_statuses(trade)
+    return bool(statuses & TARGET_COMPLETED_STATUSES) and not bool(statuses & (SL_HIT_STATUSES | {"AMBIGUOUS"}))
+
+
+def parse_datetime_value(value) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def setup_timestamp_for_trade(trade: dict) -> datetime | None:
+    for field in ("created_at", "source_confirmation_created_at", "signal_created_at", "setup_created_at"):
+        parsed = parse_datetime_value(trade.get(field))
+        if parsed:
+            return parsed
+    return None
+
+
+def market_timestamp_for_row(row: dict | None) -> datetime | None:
+    if not row:
+        return None
+    for field in ("updated_at", "quote_updated_at", "history_enriched_at", "created_at"):
+        parsed = parse_datetime_value(row.get(field))
+        if parsed:
+            return parsed
+    return None
+
+
+def candle_datetime(candle: dict) -> datetime | None:
+    for key in ("time", "timestamp", "datetime", "date"):
+        parsed = parse_datetime_value(candle.get(key))
+        if parsed:
+            return parsed
+    return None
+
+
+def intraday_rows_after_setup(row: dict, setup_time: datetime | None) -> list[dict]:
+    rows = []
+    for key in ("post_setup_candles", "intraday_candles", "resolution_candles", "candles", "ohlcv"):
+        value = row.get(key)
+        if not isinstance(value, list):
+            continue
+        for candle in value:
+            if not isinstance(candle, dict):
+                continue
+            candle_time = candle_datetime(candle)
+            if setup_time and candle_time and candle_time < setup_time:
+                continue
+            if setup_time and candle_time is None:
+                continue
+            rows.append(candle)
+    return rows
+
+
+def ui_status_for_trade(trade: dict) -> str:
+    statuses = trade_statuses(trade)
+    if statuses & WAITING_STATUSES or trade.get("entry_triggered") is False:
+        if not statuses & (ACTIVE_STATUSES | TERMINAL_STATUSES):
+            return "Waiting for Entry"
+    if statuses & {T1_PARTIAL_STATUS, T2_PARTIAL_STATUS, "TARGET_1_HIT", "TARGET_2_HIT"}:
+        return "Partial"
+    if statuses & SL_HIT_STATUSES:
+        return "Stopped"
+    if "AMBIGUOUS" in statuses:
+        return "Ambiguous"
+    if statuses & TARGET_COMPLETED_STATUSES:
+        return "Completed"
+    if "ACTIVE" in statuses:
+        return "Active"
+    status = next(iter(statuses), "")
+    return status.replace("_", " ").title() if status else "-"
+
+
+def strategy_label_for_trade(trade: dict) -> str:
+    text = str(trade.get("source_signal_type") or trade.get("signal_type") or trade.get("strategy_type") or "").upper()
+    if "MOMENTUM" in text:
+        return "Momentum"
+    if "SWING" in text:
+        return "Swing"
+    return text.replace("_", " ").title() if text else "Other"
+
+
+def setup_time_value(trade: dict):
+    return (
+        trade.get("created_at")
+        or trade.get("source_confirmation_created_at")
+        or trade.get("signal_created_at")
+        or trade.get("setup_date")
+    )
+
+
+def paper_api_row(trade: dict) -> dict:
+    return {
+        "paper_trade_id": str(trade.get("_id")) if trade.get("_id") is not None else trade.get("paper_trade_id"),
+        "setup_id": trade.get("setup_id"),
+        "symbol": trade.get("symbol"),
+        "tradingview_symbol": trade.get("tradingview_symbol"),
+        "strategy": strategy_label_for_trade(trade),
+        "source_signal_type": trade.get("source_signal_type") or trade.get("signal_type"),
+        "status": trade.get("status"),
+        "outcome_status": trade.get("outcome_status"),
+        "ui_status": ui_status_for_trade(trade),
+        "entry_price": trade.get("entry_price") or trade.get("entry"),
+        "current_price": trade.get("latest_close") or trade.get("current_price"),
+        "stop_loss": trade.get("current_stop_loss") or trade.get("stop_loss") or trade.get("sl"),
+        "target_1": trade.get("target_1") or trade.get("t1"),
+        "target_2": trade.get("target_2") or trade.get("t2"),
+        "target_3": trade.get("target_3") or trade.get("t3"),
+        "paper_pnl": trade.get("paper_pnl") or trade.get("total_trade_pnl"),
+        "pnl": trade.get("paper_pnl") or trade.get("total_trade_pnl"),
+        "setup_time": setup_time_value(trade),
+        "entry_triggered_at": trade.get("entry_triggered_at"),
+        "updated_at": trade.get("updated_at"),
+        "last_checked_at": trade.get("last_checked_at"),
+        "state_version": trade.get("state_version"),
+        "partial_exit_1": trade.get("partial_exit_1"),
+        "partial_exit_2": trade.get("partial_exit_2"),
+        "partial_exit_3": trade.get("partial_exit_3"),
+        "paper_only": True,
+    }
+
+
 def tv_symbol_for_trade(trade: dict) -> str | None:
     return trade.get("tradingview_symbol") or trade.get("symbol")
+
+
+def canonical_market_symbol_for_trade(trade: dict) -> str | None:
+    for value in (
+        trade.get("canonical_symbol"),
+        trade.get("symbol"),
+        trade.get("tradingview_symbol"),
+        trade.get("requested_tradingview_symbol"),
+    ):
+        text = str(value or "").strip().upper()
+        if not text:
+            continue
+        if ":" in text:
+            text = text.split(":")[-1]
+        if "." in text:
+            text = text.split(".")[0]
+        if text:
+            return text
+    return None
+
+
+def number_or_none(value) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def first_number_from_fields(row: dict | None, fields: tuple[str, ...]) -> float | None:
+    if not row:
+        return None
+    for field in fields:
+        value = number_or_none(row.get(field))
+        if value is not None:
+            return value
+    return None
+
+
+def previous_day_low_from_candles(candles: list[dict]) -> float | None:
+    if len(candles) < 2:
+        return None
+    return number_or_none(candles[-2].get("low"))
+
+
+def is_buy_trade(plan: dict) -> bool:
+    direction = str(
+        plan.get("side")
+        or plan.get("trade_side")
+        or plan.get("trade_direction")
+        or plan.get("direction")
+        or "BUY"
+    ).upper()
+    return direction not in {"SELL", "SHORT", "BEARISH"}
+
+
+def dynamic_stop_loss_update(plan: dict, latest: dict) -> tuple[dict, float | None]:
+    existing_current = number_or_none(plan.get("current_stop_loss"))
+    existing_initial = number_or_none(plan.get("initial_stop_loss"))
+    existing_stop = number_or_none(plan.get("stop_loss"))
+    effective_stop = existing_current if existing_current is not None else existing_initial
+    if effective_stop is None:
+        effective_stop = existing_stop
+    if normalize_status(plan.get("status")) in (PARTIAL_STATUSES | {"TARGET_1_HIT"}):
+        return {}, effective_stop
+    previous_day_low = number_or_none(latest.get("previous_day_low"))
+    if previous_day_low is None or not is_buy_trade(plan):
+        return {}, effective_stop
+
+    update = {}
+    if existing_initial is None:
+        update["initial_stop_loss"] = previous_day_low
+    if existing_current != previous_day_low:
+        update["current_stop_loss"] = previous_day_low
+    if existing_stop != previous_day_low:
+        update["stop_loss"] = previous_day_low
+    return update, previous_day_low
+
+
+def total_trade_quantity(plan: dict) -> float:
+    return number_or_none(plan.get("quantity")) or 0.0
+
+
+def trade_side_multiplier(plan: dict) -> int:
+    return 1 if is_buy_trade(plan) else -1
+
+
+def exit_allocations_for_trade(plan: dict) -> dict:
+    existing = plan.get("exit_allocations")
+    if isinstance(existing, dict):
+        t1_qty = number_or_none(existing.get("t1_quantity"))
+        t2_qty = number_or_none(existing.get("t2_quantity"))
+        t3_qty = number_or_none(existing.get("t3_quantity"))
+        total_qty = number_or_none(existing.get("total_quantity")) or total_trade_quantity(plan)
+        if all(value is not None and value > 0 for value in (t1_qty, t2_qty, t3_qty)) and round(t1_qty + t2_qty + t3_qty, 8) == round(total_qty, 8):
+            return dict(existing)
+    total_qty = int(total_trade_quantity(plan))
+    t1_qty = floor(total_qty * 0.33)
+    t2_qty = floor(total_qty * 0.33)
+    t3_qty = total_qty - t1_qty - t2_qty
+    valid = total_qty > 0 and t1_qty > 0 and t2_qty > 0 and t3_qty > 0
+    return {
+        "total_quantity": total_qty,
+        "t1_quantity": t1_qty,
+        "t2_quantity": t2_qty,
+        "t3_quantity": t3_qty,
+        "valid": valid,
+    }
+
+
+def allocation_quantity(plan: dict, stage: str) -> float:
+    allocations = exit_allocations_for_trade(plan)
+    return number_or_none(allocations.get(f"{stage}_quantity")) or 0.0
+
+
+def quantity_remaining_after_stage(plan: dict, stage: int) -> float:
+    allocations = exit_allocations_for_trade(plan)
+    total = number_or_none(allocations.get("total_quantity")) or total_trade_quantity(plan)
+    if stage == 0:
+        return total
+    if stage == 1:
+        return total - (number_or_none(allocations.get("t1_quantity")) or 0)
+    if stage == 2:
+        return number_or_none(allocations.get("t3_quantity")) or 0.0
+    return 0.0
+
+
+def existing_quantity_remaining(plan: dict) -> float:
+    value = number_or_none(plan.get("quantity_remaining"))
+    return value if value is not None else total_trade_quantity(plan)
+
+
+def pnl_per_share_at_price(plan: dict, exit_price: float) -> float:
+    return (exit_price - plan["entry_price"]) * trade_side_multiplier(plan)
+
+
+def partial_exit_pnl(plan: dict, exit_price: float, quantity: float) -> float:
+    return pnl_per_share_at_price(plan, exit_price) * quantity
+
+
+def partial_exit_doc(plan: dict, target_field: str, stage: str, percent: float, now: str) -> dict:
+    exit_price = plan[target_field]
+    quantity = allocation_quantity(plan, stage)
+    return {
+        "exit_id": f"{plan.get('_id') or plan.get('setup_id') or plan.get('symbol')}:{stage.upper()}",
+        "exit_stage": stage.upper(),
+        "exit_price": exit_price,
+        "quantity": quantity,
+        "percent": percent,
+        "paper_pnl": partial_exit_pnl(plan, exit_price, quantity),
+        "exited_at": now,
+    }
+
+
+def partial_exit_doc_pnl(value) -> float:
+    if isinstance(value, dict):
+        return number_or_none(value.get("paper_pnl")) or 0.0
+    return 0.0
+
+
+def realized_partial_pnl(plan: dict, update: dict | None = None) -> float:
+    source = {**plan, **(update or {})}
+    return sum(
+        partial_exit_doc_pnl(source.get(field))
+        for field in ("partial_exit_1", "partial_exit_2", "partial_exit_3", "stop_exit")
+    )
+
+
+def invested_amount_for_trade(plan: dict) -> float:
+    return plan["entry_price"] * total_trade_quantity(plan)
+
+
+def initial_risk_amount_for_trade(plan: dict) -> float:
+    initial_stop = number_or_none(plan.get("initial_stop_loss") or plan.get("stop_loss"))
+    if initial_stop is None:
+        return 0.0
+    return abs(plan["entry_price"] - initial_stop) * total_trade_quantity(plan)
+
+
+def paper_pnl_percent_for_position(plan: dict, pnl: float) -> float:
+    denominator = invested_amount_for_trade(plan)
+    return (pnl / denominator) * 100 if denominator else 0.0
+
+
+def pnl_metric_fields(
+    plan: dict,
+    *,
+    latest_close: float,
+    quantity_remaining: float,
+    update: dict | None = None,
+) -> dict:
+    realized_pnl = realized_partial_pnl(plan, update)
+    pnl_per_share = pnl_per_share_at_price(plan, latest_close)
+    remaining_unrealized_pnl = pnl_per_share * quantity_remaining
+    total_trade_pnl = realized_pnl + remaining_unrealized_pnl
+    initial_risk_amount = initial_risk_amount_for_trade(plan)
+    profit_percent = paper_pnl_percent_for_position(plan, total_trade_pnl)
+    return {
+        "pnl_per_share": pnl_per_share,
+        "realized_pnl": realized_pnl,
+        "remaining_unrealized_pnl": remaining_unrealized_pnl,
+        "total_trade_pnl": total_trade_pnl,
+        "invested_amount": invested_amount_for_trade(plan),
+        "profit_percent": profit_percent,
+        "initial_risk_amount": initial_risk_amount,
+        "realized_rr": total_trade_pnl / initial_risk_amount if initial_risk_amount else 0.0,
+        "paper_pnl": total_trade_pnl,
+        "paper_pnl_percent": profit_percent,
+    }
+
+
+def open_trade_pnl(plan: dict, latest_close: float, quantity_remaining: float, update: dict | None = None) -> tuple[float, float]:
+    metrics = pnl_metric_fields(plan, latest_close=latest_close, quantity_remaining=quantity_remaining, update=update)
+    return metrics["total_trade_pnl"], metrics["profit_percent"]
+
+
+def close_remaining_pnl(plan: dict, exit_price: float, update: dict | None = None) -> tuple[float, float]:
+    quantity_remaining = existing_quantity_remaining({**plan, **(update or {})})
+    source_update = {**(update or {})}
+    source_update["stop_exit"] = stop_exit_doc(plan, exit_price, quantity_remaining, datetime.utcnow().isoformat())
+    metrics = pnl_metric_fields(plan, latest_close=exit_price, quantity_remaining=0, update=source_update)
+    return metrics["total_trade_pnl"], metrics["profit_percent"]
+
+
+def stop_exit_doc(plan: dict, exit_price: float, quantity: float, now: str) -> dict:
+    return {
+        "exit_id": f"{plan.get('_id') or plan.get('setup_id') or plan.get('symbol')}:SL",
+        "exit_stage": "SL",
+        "exit_price": exit_price,
+        "quantity": quantity,
+        "percent": None,
+        "paper_pnl": partial_exit_pnl(plan, exit_price, quantity),
+        "exited_at": now,
+    }
+
+
+def partial_stage(plan: dict, logic_status: str) -> int:
+    if plan.get("partial_exit_3"):
+        return 3
+    if logic_status == T2_PARTIAL_STATUS:
+        return 2
+    if logic_status in {T1_PARTIAL_STATUS, "TARGET_1_HIT"}:
+        return 1
+    if plan.get("partial_exit_2"):
+        return 2
+    if plan.get("partial_exit_1"):
+        return 1
+    return 0
+
+
+def normalized_trade_logic_status(status: str) -> str:
+    if status in WAITING_STATUSES:
+        return WAITING_FOR_ENTRY_STATUS
+    if status == "TARGET_1_HIT":
+        return T1_PARTIAL_STATUS
+    return status
+
+
+async def find_market_data_for_trade(db, trade: dict) -> dict | None:
+    collection = getattr(db, "market_data", None)
+    if collection is None:
+        return None
+    symbol = canonical_market_symbol_for_trade(trade)
+    if not symbol:
+        return None
+    row = await collection.find_one(
+        {"exchange": "NSE", "canonical_symbol": symbol},
+        {"_id": 0},
+    )
+    if row is not None:
+        return row
+    return await collection.find_one({"canonical_symbol": symbol}, {"_id": 0})
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def paper_trade_snapshot_key(trade: dict) -> str | None:
+    if trade.get("_id") is not None:
+        return str(trade["_id"])
+    if trade.get("paper_trade_id"):
+        return str(trade["paper_trade_id"])
+    if trade.get("setup_id"):
+        return str(trade["setup_id"])
+    if trade.get("symbol"):
+        return str(trade["symbol"])
+    return None
+
+
+def mongo_datetime(value) -> datetime | None:
+    parsed = parse_datetime_value(value)
+    if not parsed:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def snapshot_base_doc(trade: dict, row: dict | None, observed_at: datetime, now: datetime) -> dict:
+    canonical_symbol = canonical_market_symbol_for_trade(trade)
+    return {
+        "paper_only": True,
+        "paper_trade_id": paper_trade_snapshot_key(trade),
+        "setup_id": trade.get("setup_id"),
+        "symbol": trade.get("symbol"),
+        "canonical_symbol": canonical_symbol,
+        "tradingview_symbol": trade.get("tradingview_symbol"),
+        "source_signal_type": trade.get("source_signal_type") or trade.get("signal_type"),
+        "observed_at": observed_at,
+        "observed_at_iso": observed_at.isoformat(),
+        "setup_created_at": setup_time_value(trade),
+        "market_data_updated_at": row.get("updated_at") if row else None,
+        "source": "paper_market_snapshot",
+        "created_at": now,
+        "expires_at": now + timedelta(days=settings.PAPER_MARKET_SNAPSHOT_RETENTION_DAYS),
+    }
+
+
+def snapshot_docs_from_market_row(trade: dict, row: dict | None) -> list[dict]:
+    if not row:
+        return []
+    now = utc_now()
+    docs = []
+    seen_times = set()
+    for candle in intraday_rows_after_setup(row, None):
+        observed_at = mongo_datetime(candle_datetime(candle))
+        high = number_or_none(candle.get("high"))
+        low = number_or_none(candle.get("low"))
+        close = number_or_none(candle.get("close") or candle.get("ltp") or candle.get("current_price"))
+        if observed_at is None or high is None or low is None or close is None:
+            continue
+        seen_times.add(observed_at)
+        docs.append(
+            {
+                **snapshot_base_doc(trade, row, observed_at, now),
+                "open": number_or_none(candle.get("open")),
+                "high": high,
+                "low": low,
+                "close": close,
+                "price": close,
+                "source": "market_data_intraday_candle_snapshot",
+            }
+        )
+
+    observed_at = mongo_datetime(market_timestamp_for_row(row)) or now
+    if observed_at not in seen_times:
+        price = first_number_from_fields(
+            row,
+            ("current_price", "ltp", "last_price", "price", "close", "open_price"),
+        )
+        if price is not None:
+            docs.append(
+                {
+                    **snapshot_base_doc(trade, row, observed_at, now),
+                    "open": price,
+                    "high": price,
+                    "low": price,
+                    "close": price,
+                    "price": price,
+                    "source": "market_data_quote_snapshot",
+                }
+            )
+    previous_day_low = first_number_from_fields(row, PREVIOUS_DAY_LOW_FIELDS)
+    if previous_day_low is not None:
+        for doc in docs:
+            doc["previous_day_low"] = previous_day_low
+    return docs
+
+
+async def record_paper_market_snapshots(db, trade: dict, market_row: dict | None) -> dict:
+    collection = getattr(db, "paper_market_snapshots", None)
+    update_one = getattr(collection, "update_one", None)
+    trade_key = paper_trade_snapshot_key(trade)
+    if update_one is None or not trade_key:
+        return {"stored": 0, "skipped": True}
+    docs = [doc for doc in snapshot_docs_from_market_row(trade, market_row) if doc.get("paper_trade_id") and doc.get("observed_at")]
+    stored = 0
+    for doc in docs:
+        try:
+            result = await collection.update_one(
+                {"paper_trade_id": doc["paper_trade_id"], "observed_at": doc["observed_at"]},
+                {"$setOnInsert": doc},
+                upsert=True,
+            )
+            stored += int(getattr(result, "upserted_id", None) is not None)
+        except DuplicateKeyError:
+            continue
+    return {"stored": stored, "snapshots_count": len(docs), "skipped": False}
+
+
+async def load_paper_market_snapshots_after_setup(db, trade: dict, limit: int = 500) -> list[dict]:
+    collection = getattr(db, "paper_market_snapshots", None)
+    if collection is None:
+        return []
+    trade_key = paper_trade_snapshot_key(trade)
+    if not trade_key:
+        return []
+    query = {"paper_trade_id": trade_key}
+    setup_time = setup_timestamp_for_trade(trade)
+    if setup_time:
+        query["observed_at"] = {"$gte": setup_time}
+    cursor = collection.find(query, {"_id": 0}).sort("observed_at", 1).limit(limit)
+    rows = [row async for row in cursor]
+    rows.sort(key=lambda item: parse_datetime_value(item.get("observed_at")) or datetime.min.replace(tzinfo=timezone.utc))
+    return rows
+
+
+async def paper_market_latest_row(db, trade: dict) -> dict | None:
+    snapshots = await load_paper_market_snapshots_after_setup(db, trade)
+    if not snapshots:
+        return None
+    highs = [number_or_none(row.get("high") or row.get("price") or row.get("close")) for row in snapshots]
+    lows = [number_or_none(row.get("low") or row.get("price") or row.get("close")) for row in snapshots]
+    closes = [number_or_none(row.get("close") or row.get("price")) for row in snapshots]
+    highs = [value for value in highs if value is not None]
+    lows = [value for value in lows if value is not None]
+    closes = [value for value in closes if value is not None]
+    if not highs or not closes:
+        return None
+    latest_snapshot = snapshots[-1]
+    latest = {
+        "time": latest_snapshot.get("observed_at_iso") or latest_snapshot.get("observed_at"),
+        "high": max(highs),
+        "low": min(lows) if lows else max(highs),
+        "close": closes[-1],
+        "source": "paper_market_snapshots",
+        "setup_time": setup_time_value(trade),
+        "market_data_updated_at": latest_snapshot.get("market_data_updated_at"),
+        "post_setup_high_source": "paper_market_snapshots_after_setup",
+        "lower_timeframe_candles": [
+            {
+                "time": row.get("observed_at_iso") or row.get("observed_at"),
+                "open": number_or_none(row.get("open") or row.get("price") or row.get("close")),
+                "high": number_or_none(row.get("high") or row.get("price") or row.get("close")),
+                "low": number_or_none(row.get("low") or row.get("price") or row.get("close")),
+                "close": number_or_none(row.get("close") or row.get("price")),
+            }
+            for row in snapshots
+        ],
+    }
+    previous_day_low = first_number_from_fields(latest_snapshot, PREVIOUS_DAY_LOW_FIELDS)
+    if previous_day_low is not None:
+        latest["previous_day_low"] = previous_day_low
+    return latest
+
+
+def market_data_latest_row(row: dict | None, trade: dict | None = None) -> dict | None:
+    if not row:
+        return None
+    setup_time = setup_timestamp_for_trade(trade or {})
+    market_time = market_timestamp_for_row(row)
+    if setup_time and market_time and market_time < setup_time:
+        return None
+    intraday_rows = intraday_rows_after_setup(row, setup_time)
+    if intraday_rows:
+        highs = [number_or_none(candle.get("high")) for candle in intraday_rows]
+        lows = [number_or_none(candle.get("low")) for candle in intraday_rows]
+        closes = [number_or_none(candle.get("close") or candle.get("ltp") or candle.get("current_price")) for candle in intraday_rows]
+        highs = [value for value in highs if value is not None]
+        lows = [value for value in lows if value is not None]
+        closes = [value for value in closes if value is not None]
+        if highs:
+            latest = {
+                "time": candle_timestamp(intraday_rows[-1]) or row.get("updated_at") or row.get("history_enriched_at"),
+                "high": max(highs),
+                "low": min(lows) if lows else max(highs),
+                "close": closes[-1] if closes else max(highs),
+                "source": "market_data_intraday_after_setup",
+                "setup_time": setup_time.isoformat() if setup_time else None,
+                "market_data_updated_at": row.get("updated_at") or row.get("history_enriched_at"),
+                "post_setup_high_source": "intraday_candles",
+            }
+            previous_day_low = first_number_from_fields(row, PREVIOUS_DAY_LOW_FIELDS)
+            if previous_day_low is not None:
+                latest["previous_day_low"] = previous_day_low
+            return latest
+
+    day_high = number_or_none(row.get("day_high"))
+    day_low = number_or_none(row.get("day_low"))
+    current_price = number_or_none(row.get("current_price") or row.get("ltp"))
+    previous_day_low = first_number_from_fields(row, PREVIOUS_DAY_LOW_FIELDS)
+    if day_high is None:
+        return None
+    latest = {
+        "time": row.get("updated_at") or row.get("history_enriched_at"),
+        "high": day_high,
+        "low": day_low if day_low is not None else day_high,
+        "close": current_price if current_price is not None else day_high,
+        "source": "market_data",
+        "setup_time": setup_time.isoformat() if setup_time else None,
+        "market_data_updated_at": row.get("updated_at") or row.get("history_enriched_at"),
+        "post_setup_high_source": "day_high_snapshot_after_setup" if setup_time else "day_high_snapshot",
+    }
+    if previous_day_low is not None:
+        latest["previous_day_low"] = previous_day_low
+    return latest
 
 
 def paper_trade_proposal_context(trade: dict) -> dict:
@@ -597,6 +1342,8 @@ def proposed_update_reason(plan: dict, update: dict) -> str:
         return update["exit_reason"]
     current_status = normalize_status(plan.get("status"))
     proposed_status = normalize_status(update.get("status", plan.get("status")))
+    if current_status in WAITING_STATUSES and proposed_status == WAITING_FOR_ENTRY_STATUS:
+        return "WAITING_FOR_ENTRY"
     if current_status in WAITING_STATUSES and proposed_status in WAITING_STATUSES and not update:
         return "WAITING_FOR_ENTRY"
     return f"STATUS_CHANGE_{current_status}_TO_{proposed_status}" if proposed_status != current_status else "NO_STATUS_CHANGE"
@@ -619,7 +1366,9 @@ def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: fl
             return None
 
     entry_price = paper_plan.get("paper_entry_price")
-    stop_loss = paper_plan.get("paper_stop_loss")
+    planned_stop_loss = paper_plan.get("paper_stop_loss")
+    previous_day_low = previous_day_low_from_candles(candles)
+    stop_loss = previous_day_low if is_buy_trade(signal) and previous_day_low is not None else planned_stop_loss
     target_1 = paper_plan.get("paper_target_1")
     target_2 = paper_plan.get("paper_target_2")
     target_3 = paper_plan.get("paper_target_3")
@@ -633,17 +1382,19 @@ def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: fl
     if quantity <= 0:
         return None
     now = datetime.utcnow().isoformat()
-    return {
+    plan = {
         "symbol": signal["symbol"],
         "tradingview_symbol": signal.get("tradingview_symbol") or signal.get("symbol"),
         "timeframe": signal["timeframe"],
         "source_signal_type": signal.get("signal_type", "SWING_TV_CONFIRMED"),
         "paper_only": True,
-        "status": "NOT_TRIGGERED",
-        "outcome_status": "NOT_TRIGGERED",
+        "status": WAITING_FOR_ENTRY_STATUS,
+        "outcome_status": WAITING_FOR_ENTRY_STATUS,
         "entry_triggered": False,
         "entry_price": entry_price,
         "stop_loss": stop_loss,
+        "initial_stop_loss": stop_loss,
+        "current_stop_loss": stop_loss,
         "target_1": target_1,
         "target_2": target_2,
         "target_3": target_3,
@@ -658,77 +1409,465 @@ def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: fl
         "risk_percent": risk_percent,
         "risk_amount": risk_amount,
         "quantity": quantity,
+        "quantity_remaining": quantity,
+        "partial_exit_1": None,
+        "partial_exit_2": None,
+        "partial_exit_3": None,
         "created_at": now,
         "updated_at": now,
         "source": "tradingview",
     }
+    for field in ("source_confirmation_id", "source_collection", "source_confirmation_created_at", "setup_date"):
+        if signal.get(field) not in (None, ""):
+            plan[field] = signal[field]
+    return apply_setup_identity(plan)
+
+
+def fetch_tradingview_candles_sync(symbol: str, timeframe: str, *, min_candles: int = 1) -> dict:
+    client = TradingViewClient()
+    if hasattr(client, "set_deadline"):
+        client.set_deadline(settings.TRADINGVIEW_SYMBOL_TIMEOUT_SECONDS)
+    client.connect_to_debug_port()
+    client.open_symbol(symbol)
+    candles = client.fetch_candles(timeframe, min_candles=min_candles)
+    return {"candles": candles, "diagnostics": getattr(client, "diagnostics", {})}
+
+
+async def atomic_insert_paper_trade_plan(db, plan: dict) -> tuple[dict, bool]:
+    identity_plan = apply_setup_identity(plan)
+    identity = paper_trade_setup_filter(identity_plan)
+    try:
+        result = await db.paper_trades.update_one(
+            identity,
+            {"$setOnInsert": identity_plan},
+            upsert=True,
+        )
+    except DuplicateKeyError:
+        return identity_plan, False
+    return identity_plan, getattr(result, "upserted_id", None) is not None
 
 
 def calculate_pnl(plan: dict, latest_close: float, exit_price: float | None) -> tuple[float, float]:
     price = exit_price if exit_price is not None else latest_close
-    pnl_per_share = price - plan["entry_price"]
+    pnl_per_share = pnl_per_share_at_price(plan, price)
     return pnl_per_share * plan["quantity"], (pnl_per_share / plan["entry_price"]) * 100
 
 
+def lower_timeframe_candles(latest: dict) -> list[dict]:
+    for key in ("lower_timeframe_candles", "intraday_candles", "resolution_candles"):
+        value = latest.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def level_touched(latest: dict, price: float | None) -> bool:
+    if price is None:
+        return False
+    return latest["low"] <= price <= latest["high"]
+
+
+def target_levels_for_status(plan: dict, logic_status: str) -> list[tuple[str, float | None]]:
+    if logic_status == "ACTIVE":
+        return [
+            ("target_1", number_or_none(plan.get("target_1"))),
+            ("target_2", number_or_none(plan.get("target_2"))),
+            ("target_3", number_or_none(plan.get("target_3"))),
+        ]
+    if logic_status == T1_PARTIAL_STATUS:
+        return [
+            ("target_2", number_or_none(plan.get("target_2"))),
+            ("target_3", number_or_none(plan.get("target_3"))),
+        ]
+    if logic_status == T2_PARTIAL_STATUS:
+        return [("target_3", number_or_none(plan.get("target_3")))]
+    return []
+
+
+def touched_trade_levels(plan: dict, latest: dict, logic_status: str, effective_stop_loss: float | None) -> list[str]:
+    touched = []
+    if logic_status == WAITING_FOR_ENTRY_STATUS and level_touched(latest, number_or_none(plan.get("entry_price"))):
+        touched.append("entry")
+    if effective_stop_loss is not None and level_touched(latest, effective_stop_loss):
+        touched.append("stop_loss")
+    if logic_status == WAITING_FOR_ENTRY_STATUS:
+        targets = [
+            ("target_1", number_or_none(plan.get("target_1"))),
+            ("target_2", number_or_none(plan.get("target_2"))),
+            ("target_3", number_or_none(plan.get("target_3"))),
+        ]
+    else:
+        targets = target_levels_for_status(plan, logic_status)
+    for name, price in targets:
+        if level_touched(latest, price):
+            touched.append(name)
+    return touched
+
+
+def ambiguity_reason_for_touched(logic_status: str, touched: list[str]) -> str | None:
+    touched_set = set(touched)
+    target_hits = [level for level in touched if level.startswith("target_")]
+    if logic_status == WAITING_FOR_ENTRY_STATUS and "entry" in touched_set and "stop_loss" in touched_set:
+        return "ENTRY_AND_STOP_TOUCHED_SAME_CANDLE"
+    if logic_status == WAITING_FOR_ENTRY_STATUS and "entry" in touched_set and target_hits:
+        return "ENTRY_AND_TARGET_TOUCHED_SAME_CANDLE"
+    if "stop_loss" in touched_set and target_hits:
+        return "STOP_AND_TARGET_TOUCHED_SAME_CANDLE"
+    if len(target_hits) > 1:
+        return "MULTIPLE_TARGETS_TOUCHED_SAME_CANDLE"
+    return None
+
+
+def resolution_event_for_level(level: str) -> str:
+    if level == "entry":
+        return "entry"
+    if level == "stop_loss":
+        return "stop"
+    return level
+
+
+def resolve_ambiguity_with_lower_timeframe(
+    plan: dict,
+    latest: dict,
+    logic_status: str,
+    effective_stop_loss: float | None,
+) -> dict:
+    candles = lower_timeframe_candles(latest)
+    if not candles:
+        return {"attempted": False, "resolved": False, "reason": "NO_LOWER_TIMEFRAME_CANDLES"}
+    for candle in candles:
+        high = number_or_none(candle.get("high"))
+        low = number_or_none(candle.get("low"))
+        close = number_or_none(candle.get("close"))
+        if high is None or low is None or close is None:
+            continue
+        lower_latest = {
+            "time": candle_timestamp(candle),
+            "high": high,
+            "low": low,
+            "close": close,
+        }
+        touched = touched_trade_levels(plan, lower_latest, logic_status, effective_stop_loss)
+        reason = ambiguity_reason_for_touched(logic_status, touched)
+        if reason:
+            return {
+                "attempted": True,
+                "resolved": False,
+                "reason": f"LOWER_TIMEFRAME_{reason}",
+                "candle": lower_latest,
+                "touched_levels": touched,
+            }
+        event_levels = [
+            level for level in touched
+            if level in {"entry", "stop_loss", "target_1", "target_2", "target_3"}
+        ]
+        if event_levels:
+            return {
+                "attempted": True,
+                "resolved": True,
+                "event": resolution_event_for_level(event_levels[0]),
+                "candle": lower_latest,
+                "touched_levels": event_levels,
+            }
+    return {"attempted": True, "resolved": False, "reason": "NO_PROVEN_EVENT_ORDER"}
+
+
+def ambiguity_update(
+    plan: dict,
+    latest: dict,
+    touched: list[str],
+    reason: str,
+    resolution_attempt: dict,
+    now: str,
+) -> dict:
+    metrics = pnl_metric_fields(
+        plan,
+        latest_close=latest["close"],
+        quantity_remaining=existing_quantity_remaining(plan),
+        update=None,
+    )
+    return {
+        "latest_close": latest["close"],
+        "latest_high": latest["high"],
+        "latest_low": latest["low"],
+        "last_checked_at": now,
+        "updated_at": now,
+        "status": "AMBIGUOUS",
+        "outcome_status": "AMBIGUOUS",
+        "state": "AMBIGUOUS",
+        "status_updated_at": now,
+        "exit_price": None,
+        "exit_reason": "AMBIGUOUS",
+        "ambiguity_timestamp": now,
+        "ambiguity_candle_ohlc": {
+            "time": candle_timestamp(latest),
+            "open": latest.get("open"),
+            "high": latest["high"],
+            "low": latest["low"],
+            "close": latest["close"],
+        },
+        "ambiguity_timeframe": latest.get("timeframe") or plan.get("timeframe"),
+        "ambiguity_touched_levels": touched,
+        "ambiguity_previous_status": plan.get("status"),
+        "ambiguity_reason": reason,
+        "lower_timeframe_resolution_attempt": resolution_attempt,
+        **metrics,
+    }
+
+
 def update_plan_status(plan: dict, latest: dict) -> dict:
+    if is_terminal_trade(plan):
+        return {}
+
     latest_high = latest["high"]
     latest_low = latest["low"]
     latest_close = latest["close"]
     status = normalize_status(plan.get("status"))
-    logic_status = "PLANNED" if status == "NOT_TRIGGERED" else status
-    new_status = logic_status
-    exit_price = None
-    exit_reason = None
-
-    if logic_status == "PLANNED" and latest_high >= plan["entry_price"]:
-        new_status = "ACTIVE"
-    elif logic_status == "ACTIVE":
-        if latest_low <= plan["stop_loss"]:
-            new_status = "STOPPED"
-            exit_price = plan["stop_loss"]
-            exit_reason = "STOP_LOSS_HIT"
-        elif latest_high >= plan["target_2"]:
-            new_status = "TARGET_2_HIT"
-            exit_price = plan["target_2"]
-            exit_reason = "TARGET_2_HIT"
-        elif latest_high >= plan["target_1"]:
-            new_status = "TARGET_1_HIT"
-            exit_reason = "TARGET_1_HIT"
-    elif logic_status == "TARGET_1_HIT":
-        if latest_low <= plan["stop_loss"]:
-            new_status = "STOPPED_AFTER_T1"
-            exit_price = plan["stop_loss"]
-            exit_reason = "STOPPED_AFTER_T1"
-        elif latest_high >= plan["target_2"]:
-            new_status = "TARGET_2_HIT"
-            exit_price = plan["target_2"]
-            exit_reason = "TARGET_2_HIT"
-
-    if logic_status == "PLANNED" and new_status == logic_status:
-        return {}
-
-    paper_pnl, paper_pnl_percent = calculate_pnl(plan, latest_close, exit_price)
+    outcome_status = normalize_status(plan.get("outcome_status"))
+    logic_status = normalized_trade_logic_status(status)
+    stop_loss_update, effective_stop_loss = dynamic_stop_loss_update(plan, latest)
     now = datetime.utcnow().isoformat()
+    touched = touched_trade_levels(plan, latest, logic_status, effective_stop_loss)
+    ambiguity_reason = ambiguity_reason_for_touched(logic_status, touched)
+    forced_event = None
+    resolution_metadata = {}
+    if ambiguity_reason:
+        resolution_attempt = resolve_ambiguity_with_lower_timeframe(plan, latest, logic_status, effective_stop_loss)
+        if resolution_attempt.get("resolved"):
+            forced_event = resolution_attempt.get("event")
+            resolution_metadata = {"lower_timeframe_resolution_attempt": resolution_attempt}
+        else:
+            return ambiguity_update(plan, latest, touched, ambiguity_reason, resolution_attempt, now)
+
+    if logic_status == WAITING_FOR_ENTRY_STATUS and (forced_event == "entry" or (forced_event is None and latest_high >= plan["entry_price"])):
+        quantity_remaining = existing_quantity_remaining(plan)
+        allocations = exit_allocations_for_trade(plan)
+        if not allocations.get("valid"):
+            return ambiguity_update(
+                plan,
+                latest,
+                ["entry", "exit_allocation"],
+                "INVALID_EXIT_ALLOCATION",
+                {"attempted": False, "resolved": False, "reason": "INVALID_EXIT_ALLOCATION"},
+                now,
+            )
+        metrics = pnl_metric_fields(
+            plan,
+            latest_close=latest_close,
+            quantity_remaining=quantity_remaining,
+            update=stop_loss_update,
+        )
+        return {
+            "latest_close": latest_close,
+            "latest_high": latest_high,
+            "latest_low": latest_low,
+            "last_checked_at": now,
+            "updated_at": now,
+            "exit_price": None,
+            "exit_reason": None,
+            **resolution_metadata,
+            **metrics,
+            **stop_loss_update,
+            "exit_allocations": allocations,
+            "quantity_remaining": quantity_remaining,
+            "status": "ACTIVE",
+            "outcome_status": "ACTIVE",
+            "state": "ACTIVE",
+            "status_updated_at": now,
+            "entry_triggered": True,
+            "entry_triggered_at": now,
+        }
+
+    if logic_status == WAITING_FOR_ENTRY_STATUS:
+        if status == WAITING_FOR_ENTRY_STATUS and outcome_status == WAITING_FOR_ENTRY_STATUS and not stop_loss_update:
+            return {}
+        return {
+            "latest_close": latest_close,
+            "latest_high": latest_high,
+            "latest_low": latest_low,
+            "last_checked_at": now,
+            "updated_at": now,
+            **stop_loss_update,
+            "status": WAITING_FOR_ENTRY_STATUS,
+            "outcome_status": WAITING_FOR_ENTRY_STATUS,
+            "status_updated_at": now,
+            "entry_triggered": False,
+        }
+
+    management_update = {**stop_loss_update}
+    allocations = exit_allocations_for_trade(plan)
+    if not plan.get("exit_allocations") and allocations.get("valid"):
+        management_update["exit_allocations"] = allocations
+    quantity_remaining = existing_quantity_remaining({**plan, **management_update})
+    if plan.get("quantity_remaining") is None and quantity_remaining:
+        management_update["quantity_remaining"] = quantity_remaining
+
+    stage = partial_stage(plan, logic_status)
+    if stage >= 2 and logic_status != T2_PARTIAL_STATUS:
+        management_update["status"] = T2_PARTIAL_STATUS
+        management_update["outcome_status"] = T2_PARTIAL_STATUS
+        management_update["state"] = T2_PARTIAL_STATUS
+        management_update["status_updated_at"] = now
+        logic_status = T2_PARTIAL_STATUS
+    elif stage >= 1 and logic_status not in PARTIAL_STATUSES:
+        management_update["status"] = T1_PARTIAL_STATUS
+        management_update["outcome_status"] = T1_PARTIAL_STATUS
+        management_update["state"] = T1_PARTIAL_STATUS
+        management_update["status_updated_at"] = now
+        logic_status = T1_PARTIAL_STATUS
+
+    if logic_status == T1_PARTIAL_STATUS and status != T1_PARTIAL_STATUS:
+        management_update["status"] = T1_PARTIAL_STATUS
+        management_update["outcome_status"] = T1_PARTIAL_STATUS
+        management_update["state"] = T1_PARTIAL_STATUS
+        management_update["status_updated_at"] = now
+
+    if stage >= 1 and not plan.get("partial_exit_1") and "partial_exit_1" not in management_update:
+        management_update["partial_exit_1"] = partial_exit_doc(plan, "target_1", "t1", 33, now)
+        management_update["quantity_remaining"] = quantity_remaining_after_stage(plan, 1)
+        management_update["current_stop_loss"] = plan["entry_price"]
+        management_update["t1_hit"] = True
+    elif logic_status == T1_PARTIAL_STATUS:
+        if number_or_none(plan.get("current_stop_loss")) is None and "current_stop_loss" not in management_update:
+            management_update["current_stop_loss"] = plan["entry_price"]
+        if number_or_none(plan.get("quantity_remaining")) is None and "quantity_remaining" not in management_update:
+            management_update["quantity_remaining"] = quantity_remaining_after_stage(plan, 1)
+
+    if stage >= 2 and not plan.get("partial_exit_2") and "partial_exit_2" not in management_update:
+        management_update["partial_exit_2"] = partial_exit_doc(plan, "target_2", "t2", 33, now)
+        management_update["quantity_remaining"] = quantity_remaining_after_stage(plan, 2)
+        management_update["current_stop_loss"] = plan["target_1"]
+        management_update["t2_hit"] = True
+    elif logic_status == T2_PARTIAL_STATUS:
+        if number_or_none(plan.get("current_stop_loss")) is None and "current_stop_loss" not in management_update:
+            management_update["current_stop_loss"] = plan["target_1"]
+        if number_or_none(plan.get("quantity_remaining")) is None and "quantity_remaining" not in management_update:
+            management_update["quantity_remaining"] = quantity_remaining_after_stage(plan, 2)
+
+    effective_stop_loss = number_or_none(management_update.get("current_stop_loss"))
+    if effective_stop_loss is None:
+        effective_stop_loss = number_or_none(plan.get("current_stop_loss"))
+    if effective_stop_loss is None:
+        effective_stop_loss = number_or_none(plan.get("initial_stop_loss"))
+    if effective_stop_loss is None:
+        effective_stop_loss = number_or_none(plan.get("stop_loss"))
+
+    if effective_stop_loss is not None and (forced_event == "stop" or (forced_event is None and latest_low <= effective_stop_loss)):
+        stop_quantity = existing_quantity_remaining({**plan, **management_update})
+        management_update["stop_exit"] = stop_exit_doc(plan, effective_stop_loss, stop_quantity, now)
+        metrics = pnl_metric_fields(plan, latest_close=effective_stop_loss, quantity_remaining=0, update=management_update)
+        return {
+            "latest_close": latest_close,
+            "latest_high": latest_high,
+            "latest_low": latest_low,
+            "last_checked_at": now,
+            "updated_at": now,
+            **management_update,
+            "quantity_remaining": 0,
+            "status": "SL_HIT",
+            "outcome_status": "SL_HIT",
+            "state": "SL_HIT",
+            "status_updated_at": now,
+            "exit_price": effective_stop_loss,
+            "exit_reason": "STOP_LOSS_HIT",
+            "journal_status": "PENDING",
+            "journal_pending": True,
+            "completion_pending": True,
+            **resolution_metadata,
+            **metrics,
+        }
+
+    if logic_status == "ACTIVE" and stage < 1 and (forced_event == "target_1" or (forced_event is None and latest_high >= plan["target_1"])):
+        if not allocations.get("valid"):
+            return ambiguity_update(
+                plan,
+                latest,
+                ["target_1", "exit_allocation"],
+                "INVALID_EXIT_ALLOCATION",
+                {"attempted": False, "resolved": False, "reason": "INVALID_EXIT_ALLOCATION"},
+                now,
+            )
+        management_update["partial_exit_1"] = partial_exit_doc(plan, "target_1", "t1", 33, now)
+        management_update["quantity_remaining"] = quantity_remaining_after_stage(plan, 1)
+        management_update["current_stop_loss"] = plan["entry_price"]
+        management_update["status"] = T1_PARTIAL_STATUS
+        management_update["outcome_status"] = T1_PARTIAL_STATUS
+        management_update["state"] = T1_PARTIAL_STATUS
+        management_update["status_updated_at"] = now
+        management_update["t1_hit"] = True
+        management_update["exit_reason"] = T1_PARTIAL_STATUS
+        stage = 1
+
+    elif logic_status == T1_PARTIAL_STATUS and stage < 2 and (forced_event == "target_2" or (forced_event is None and latest_high >= plan["target_2"])):
+        if not allocations.get("valid"):
+            return ambiguity_update(
+                plan,
+                latest,
+                ["target_2", "exit_allocation"],
+                "INVALID_EXIT_ALLOCATION",
+                {"attempted": False, "resolved": False, "reason": "INVALID_EXIT_ALLOCATION"},
+                now,
+            )
+        management_update["partial_exit_2"] = partial_exit_doc(plan, "target_2", "t2", 33, now)
+        management_update["quantity_remaining"] = quantity_remaining_after_stage(plan, 2)
+        management_update["current_stop_loss"] = plan["target_1"]
+        management_update["status"] = T2_PARTIAL_STATUS
+        management_update["outcome_status"] = T2_PARTIAL_STATUS
+        management_update["state"] = T2_PARTIAL_STATUS
+        management_update["status_updated_at"] = now
+        management_update["t2_hit"] = True
+        management_update["exit_reason"] = T2_PARTIAL_STATUS
+        stage = 2
+
+    elif logic_status == T2_PARTIAL_STATUS and stage < 3 and (forced_event == "target_3" or (forced_event is None and latest_high >= plan["target_3"])):
+        if not allocations.get("valid"):
+            return ambiguity_update(
+                plan,
+                latest,
+                ["target_3", "exit_allocation"],
+                "INVALID_EXIT_ALLOCATION",
+                {"attempted": False, "resolved": False, "reason": "INVALID_EXIT_ALLOCATION"},
+                now,
+            )
+        management_update["partial_exit_3"] = partial_exit_doc(plan, "target_3", "t3", 34, now)
+        management_update["quantity_remaining"] = 0
+        management_update["status"] = "COMPLETED"
+        management_update["outcome_status"] = "T3_HIT"
+        management_update["state"] = "T3_HIT"
+        management_update["status_updated_at"] = now
+        management_update["exit_price"] = plan["target_3"]
+        management_update["exit_reason"] = "T3_HIT"
+        management_update["t3_hit"] = True
+        management_update["journal_status"] = "PENDING"
+        management_update["journal_pending"] = True
+        management_update["completion_pending"] = True
+        stage = 3
+
+    if stage == 3:
+        metrics = pnl_metric_fields(plan, latest_close=latest_close, quantity_remaining=0, update=management_update)
+    else:
+        quantity_remaining = number_or_none(management_update.get("quantity_remaining"))
+        if quantity_remaining is None:
+            quantity_remaining = existing_quantity_remaining(plan)
+        metrics = pnl_metric_fields(
+            plan,
+            latest_close=latest_close,
+            quantity_remaining=quantity_remaining,
+            update=management_update,
+        )
+
     update = {
         "latest_close": latest_close,
         "latest_high": latest_high,
         "latest_low": latest_low,
         "last_checked_at": now,
         "updated_at": now,
-        "exit_price": exit_price,
-        "exit_reason": exit_reason,
-        "paper_pnl": paper_pnl,
-        "paper_pnl_percent": paper_pnl_percent,
+        "exit_price": management_update.pop("exit_price", None),
+        "exit_reason": management_update.pop("exit_reason", None),
+        **resolution_metadata,
+        **metrics,
+        **management_update,
     }
-    if new_status != logic_status:
-        update["status"] = new_status
-        update["outcome_status"] = new_status
-        update["status_updated_at"] = now
-        if new_status == "ACTIVE":
-            update["entry_triggered"] = True
-            update["entry_triggered_at"] = now
-        if new_status == "TARGET_1_HIT":
-            update["t1_hit"] = True
     return update
 
 
@@ -763,10 +1902,16 @@ async def build_paper_plans(
     processed = 0
     async for signal in cursor:
         processed += 1
-        client = TradingViewClient()
-        client.connect_to_debug_port()
-        client.open_symbol(signal["symbol"])
-        candles = client.fetch_candles(timeframe, min_candles=1)
+        tv_result = await tradingview_manager.run_sync(
+            "paper.build_paper_plans.fetch_candles",
+            fetch_tradingview_candles_sync,
+            signal["symbol"],
+            timeframe,
+            min_candles=1,
+            timeout_seconds=settings.TRADINGVIEW_SYMBOL_TIMEOUT_SECONDS,
+            retries=1,
+        )
+        candles = tv_result["candles"]
         plan = build_plan_from_candles(signal, candles, paper_capital, risk_percent)
         if plan:
             plans.append(plan)
@@ -774,28 +1919,13 @@ async def build_paper_plans(
     upserted_count = 0
     modified_count = 0
     if save and plans:
-        await db.paper_trades.create_index(
-            [("symbol", 1), ("timeframe", 1), ("source_signal_type", 1), ("paper_only", 1), ("status", 1)],
-            unique=True,
-        )
+        await ensure_paper_trade_setup_index(db)
+        saved_plans = []
         for plan in plans:
-            identity = {
-                "symbol": plan["symbol"],
-                "timeframe": plan["timeframe"],
-                "source_signal_type": plan["source_signal_type"],
-                "paper_only": plan["paper_only"],
-                "status": plan["status"],
-            }
-            created_at = plan["created_at"]
-            update_doc = plan.copy()
-            update_doc.pop("created_at", None)
-            result = await db.paper_trades.update_one(
-                identity,
-                {"$set": update_doc, "$setOnInsert": {"created_at": created_at}},
-                upsert=True,
-            )
-            upserted_count += 1 if result.upserted_id is not None else 0
-            modified_count += result.modified_count
+            identity_plan, inserted = await atomic_insert_paper_trade_plan(db, plan)
+            saved_plans.append(identity_plan)
+            upserted_count += int(inserted)
+        plans = saved_plans
 
     return {
         "processed": processed,
@@ -1016,8 +2146,6 @@ async def run_paper_trade_update(
     lock_release_result = {"released": False, "lock": None, "lock_required": lock_result.get("lock_required", False)}
     try:
         async for plan in cursor:
-            symbol = plan.get("symbol")
-            tradingview_symbol = tv_symbol_for_trade(plan)
             if is_terminal_trade(plan):
                 results.append(
                     {
@@ -1034,16 +2162,18 @@ async def run_paper_trade_update(
                         "write_attempted": False,
                         "reason": "TERMINAL_STATUS",
                     }
-                )
+                    )
                 continue
             processed += 1
             PAPER_UPDATE_PROGRESS["processed"] = processed
             try:
-                client = TradingViewClient()
-                client.connect_to_debug_port()
-                client.open_symbol(tradingview_symbol)
-                candles = client.fetch_candles(timeframe, min_candles=1)
-                if not candles:
+                market_row = await find_market_data_for_trade(db, plan)
+                if is_waiting_trade(plan):
+                    latest = await paper_market_latest_row(db, plan)
+                else:
+                    latest = market_data_latest_row(market_row, plan) or await paper_market_latest_row(db, plan)
+                if not latest:
+                    reason = audit_reason_for_market_data(plan, market_row, latest)
                     results.append(
                         {
                             **paper_trade_proposal_context(plan),
@@ -1053,15 +2183,15 @@ async def run_paper_trade_update(
                             "proposed_new_status": None,
                             "proposed_new_outcome_status": None,
                             "proposed_pnl": None,
-                            "proposed_reason": "NO_CANDLES",
+                            "proposed_reason": reason,
                             "updated": False,
                             "would_write": False,
                             "write_attempted": False,
-                            "reason": "NO_CANDLES",
+                            "reason": reason,
                         }
                     )
                     continue
-                update = update_plan_status(plan, candles[-1])
+                update = update_plan_status(plan, latest)
                 would_write = bool(update)
                 would_update_count += 1 if would_write else 0
                 PAPER_UPDATE_PROGRESS["would_update_count"] = would_update_count
@@ -1072,7 +2202,7 @@ async def run_paper_trade_update(
                     "status": update.get("status", plan.get("status")),
                     "previous_outcome_status": plan.get("outcome_status"),
                     "outcome_status": update.get("outcome_status", plan.get("outcome_status")),
-                    "latest_candle_timestamp": candle_timestamp(candles[-1]),
+                    "latest_candle_timestamp": candle_timestamp(latest),
                     "proposed_new_status": update.get("status", plan.get("status")),
                     "proposed_new_outcome_status": update.get("outcome_status", plan.get("outcome_status")),
                     "proposed_pnl": update.get("paper_pnl", plan.get("paper_pnl", 0)),
@@ -1081,9 +2211,10 @@ async def run_paper_trade_update(
                     "would_write": would_write,
                     "write_attempted": False,
                     "dry_run": dry_run,
-                    "latest_close": update.get("latest_close", candles[-1].get("close")),
-                    "latest_high": update.get("latest_high", candles[-1].get("high")),
-                    "latest_low": update.get("latest_low", candles[-1].get("low")),
+                    "latest_close": update.get("latest_close", latest.get("close")),
+                    "latest_high": update.get("latest_high", latest.get("high")),
+                    "latest_low": update.get("latest_low", latest.get("low")),
+                    "market_data_updated_at": market_row.get("updated_at") if market_row else None,
                     "exit_reason": update.get("exit_reason"),
                     "paper_pnl": update.get("paper_pnl", plan.get("paper_pnl", 0)),
                     "paper_pnl_percent": update.get("paper_pnl_percent", plan.get("paper_pnl_percent", 0)),
@@ -1128,34 +2259,13 @@ async def run_paper_trade_update(
             for plan, update, proposal_result in proposals:
                 proposal_result["write_attempted"] = True
                 try:
-                    result = await db.paper_trades.update_one({"_id": plan["_id"]}, {"$set": update})
+                    result = await db.paper_trades.update_one(
+                        atomic_trade_update_filter(plan),
+                        state_transition_update(update),
+                        upsert=False,
+                    )
                     modified = result.modified_count
                     successful_updates_count += 1
-                except DuplicateKeyError:
-                    try:
-                        merged_status = update.get("status", plan.get("status"))
-                        identity = {
-                            "symbol": plan["symbol"],
-                            "timeframe": plan["timeframe"],
-                            "source_signal_type": plan["source_signal_type"],
-                            "paper_only": plan["paper_only"],
-                            "status": merged_status,
-                        }
-                        await db.paper_trades.update_one(identity, {"$set": update})
-                        await db.paper_trades.delete_one({"_id": plan["_id"]})
-                        modified = 1
-                        successful_updates_count += 1
-                    except Exception as exc:
-                        modified = 0
-                        message = str(exc)
-                        error = {
-                            **paper_trade_proposal_context(plan),
-                            "error_message": message,
-                            "error_stage": "AFTER_WRITE_ATTEMPT",
-                            "write_attempted": True,
-                        }
-                        errors.append(error)
-                        proposal_result.update({"error": message, **error})
                 except Exception as exc:
                     modified = 0
                     message = str(exc)
@@ -1168,6 +2278,21 @@ async def run_paper_trade_update(
                     errors.append(error)
                     proposal_result.update({"error": message, **error})
                 updated_count += modified
+                if modified > 0 and is_completed_trade({**plan, **update}):
+                    try:
+                        merged_trade = {**plan, **update}
+                        proposal_result["journal"] = await journal_completed_trade(db, merged_trade)
+                        await mark_trade_journal_result(db, merged_trade, proposal_result["journal"])
+                    except Exception as exc:
+                        message = str(exc)
+                        error = {
+                            **paper_trade_proposal_context(plan),
+                            "error_message": message,
+                            "error_stage": "JOURNAL_INSERT",
+                            "write_attempted": True,
+                        }
+                        errors.append(error)
+                        proposal_result.update({"error": message, **error})
                 proposal_result["updated"] = modified > 0
         for result in results:
             result["write_blocked"] = bool(blocked and result.get("would_write"))
@@ -1503,6 +2628,7 @@ async def approve_paper_trade_update(request: PaperUpdateApprovalRequest) -> dic
 
         results = []
         updated_count = 0
+        journal_errors = []
         for transition in approved_transitions:
             trade_id = transition["trade_id"]
             proposed_update = transition.get("proposed_update")
@@ -1521,8 +2647,8 @@ async def approve_paper_trade_update(request: PaperUpdateApprovalRequest) -> dic
                 return await reject("TRANSITION_HASH_CHANGED", {"trade_id": trade_id})
             try:
                 result = await db.paper_trades.update_one(
-                    {"_id": paper_trade_id_for_query(trade_id), "paper_only": True},
-                    {"$set": proposed_update},
+                    atomic_trade_update_filter(current_trades[trade_id]),
+                    state_transition_update(proposed_update),
                     upsert=False,
                 )
             except Exception as exc:
@@ -1548,6 +2674,20 @@ async def approve_paper_trade_update(request: PaperUpdateApprovalRequest) -> dic
                 )
                 return await reject("TARGET_TRADE_CHANGED", {"trade_id": trade_id})
             updated_count += modified_count
+            journal_result = None
+            merged_trade = {**current_trades[trade_id], **proposed_update}
+            if is_completed_trade(merged_trade):
+                try:
+                    journal_result = await journal_completed_trade(db, merged_trade)
+                    await mark_trade_journal_result(db, merged_trade, journal_result)
+                except Exception as exc:
+                    journal_result = {
+                        "journaled": False,
+                        "duplicate": False,
+                        "reason": "JOURNAL_INSERT_FAILED",
+                        "error": str(exc),
+                    }
+                    journal_errors.append({"trade_id": trade_id, "error": str(exc)})
             results.append(
                 {
                     "trade_id": trade_id,
@@ -1555,6 +2695,7 @@ async def approve_paper_trade_update(request: PaperUpdateApprovalRequest) -> dic
                     "updated": True,
                     "write_attempted": True,
                     "applied_update": proposed_update,
+                    "journal": journal_result,
                 }
             )
 
@@ -1566,6 +2707,10 @@ async def approve_paper_trade_update(request: PaperUpdateApprovalRequest) -> dic
         )
         finished_at = datetime.utcnow().isoformat()
         post_snapshot = await capture_paper_update_snapshot(db)
+        errors = [
+            {"trade_id": error["trade_id"], "error": error["error"], "reason": "JOURNAL_INSERT_FAILED"}
+            for error in journal_errors
+        ]
         response = {
             "run_id": run_id,
             "approved_dry_run_id": dry_run_id,
@@ -1581,11 +2726,11 @@ async def approve_paper_trade_update(request: PaperUpdateApprovalRequest) -> dic
             "proposed_write_count": len(approved_transitions),
             "updated_count": updated_count,
             "would_update_count": len(approved_transitions),
-            "successful_updates_count": updated_count,
-            "errors_count": 0,
+            "successful_updates_count": updated_count if not journal_errors else 0,
+            "errors_count": len(errors),
             "blocked": False,
             "block_reason": None,
-            "errors": [],
+            "errors": errors,
             "results": results,
             "changed_trade_ids": [result["trade_id"] for result in results],
             "started_at": started_at,
@@ -1596,7 +2741,7 @@ async def approve_paper_trade_update(request: PaperUpdateApprovalRequest) -> dic
             run_id,
             {
                 **response,
-                "status": "COMPLETED",
+                "status": "COMPLETED" if not journal_errors else "COMPLETED_WITH_JOURNAL_ERRORS",
                 "mode": "REAL_APPROVAL",
                 "endpoint_mode": "update-trades-approve",
                 "owner": "MANUAL_APPROVAL_ENDPOINT",
@@ -1674,6 +2819,60 @@ async def get_paper_update_scheduler_status_endpoint() -> dict:
     return await get_paper_update_scheduler_status(get_database())
 
 
+async def load_paper_trade_rows(db, limit: int = 500) -> list[dict]:
+    cursor = db.paper_trades.find({"paper_only": True}, {"_id": 0}).sort("updated_at", -1).limit(limit)
+    return [row async for row in cursor]
+
+
+@router.get("/open")
+async def get_open_paper_trades(limit: int = Query(default=100, ge=1, le=500)) -> dict:
+    trades = await load_paper_trade_rows(get_database(), limit=500)
+    waiting = [paper_api_row(trade) for trade in trades if is_waiting_trade(trade)][:limit]
+    active_partial = [paper_api_row(trade) for trade in trades if is_open_trade(trade)][:limit]
+    return {
+        "paper_only": True,
+        "count": len(waiting) + len(active_partial),
+        "waiting_count": len(waiting),
+        "active_partial_count": len(active_partial),
+        "waiting_for_entry": waiting,
+        "active_partial": active_partial,
+    }
+
+
+@router.get("/history")
+async def get_paper_trade_history(limit: int = Query(default=100, ge=1, le=500)) -> dict:
+    trades = await load_paper_trade_rows(get_database(), limit=1000)
+    completed = [paper_api_row(trade) for trade in trades if is_completed_target_trade(trade)][:limit]
+    sl_hit = [paper_api_row(trade) for trade in trades if is_sl_hit_trade(trade)][:limit]
+    ambiguous = [paper_api_row(trade) for trade in trades if is_ambiguous_paper_trade(trade)][:limit]
+    return {
+        "paper_only": True,
+        "count": len(completed) + len(sl_hit) + len(ambiguous),
+        "completed_count": len(completed),
+        "sl_hit_count": len(sl_hit),
+        "ambiguous_count": len(ambiguous),
+        "completed": completed,
+        "sl_hit": sl_hit,
+        "ambiguous": ambiguous,
+    }
+
+
+@router.get("/pipeline-details")
+async def get_paper_pipeline_details(limit: int = Query(default=100, ge=1, le=500)) -> dict:
+    db = get_database()
+    signal_cursor = db.paper_signals.find({"paper_only": True}, {"_id": 0}).sort("updated_at", -1).limit(limit)
+    plan_cursor = db.paper_trades.find({"paper_only": True}, {"_id": 0}).sort("updated_at", -1).limit(limit)
+    signals = [paper_api_row(row) for row in [row async for row in signal_cursor]]
+    plans = [paper_api_row(row) for row in [row async for row in plan_cursor]]
+    return {
+        "paper_only": True,
+        "signals_count": len(signals),
+        "plans_count": len(plans),
+        "paper_signals": signals,
+        "paper_plans": plans,
+    }
+
+
 @router.get("/trades")
 async def get_paper_trades(limit: int = Query(default=100, ge=1, le=500)) -> dict:
     cursor = get_database().paper_trades.find({"paper_only": True}, {"_id": 0}).sort("updated_at", -1).limit(limit)
@@ -1688,15 +2887,20 @@ async def get_paper_summary() -> dict:
     waiting = [trade for trade in trades if is_waiting_trade(trade)]
     active = [trade for trade in trades if is_open_trade(trade)]
     closed = [trade for trade in trades if is_terminal_trade(trade)]
-    pnl_trades = active + closed
-    total_pnl = sum(trade.get("paper_pnl") or 0 for trade in pnl_trades)
-    winning = [trade for trade in closed if (trade.get("paper_pnl") or 0) > 0]
-    losing = [trade for trade in closed if (trade.get("paper_pnl") or 0) < 0]
+    eligible_closed = [trade for trade in closed if analytics_eligible_record(trade)]
+    pnl_trades = active + eligible_closed
+    total_pnl = sum(analytics_pnl_value(trade) or 0 for trade in pnl_trades)
+    winning = [trade for trade in eligible_closed if (analytics_pnl_value(trade) or 0) > 0]
+    losing = [trade for trade in eligible_closed if (analytics_pnl_value(trade) or 0) < 0]
+    target_hit_statuses = {"TARGET_HIT", "TARGET_1_HIT", "TARGET_1_HIT_FINAL", "TARGET_2_HIT", "TARGET_3_HIT", "T1_HIT", "T2_HIT", "T3_HIT", "WON_T1", "WON_T2", "WON_T3"}
+    sl_hit_statuses = {"SL_HIT", "LOST_SL", "STOP_HIT", "STOPPED", "STOPPED_AFTER_T1"}
     return {
         "total_trades": len(trades),
         "waiting_trades": len(waiting),
+        "waiting_for_entry": len(waiting),
         "planned": sum(1 for trade in trades if normalize_status(trade.get("status")) == "PLANNED"),
         "not_triggered": sum(1 for trade in trades if normalize_status(trade.get("status")) == "NOT_TRIGGERED"),
+        "waiting_for_entry_status": sum(1 for trade in trades if normalize_status(trade.get("status")) == WAITING_FOR_ENTRY_STATUS),
         "active": sum(1 for trade in trades if normalize_status(trade.get("status")) == "ACTIVE"),
         "target_1_hit": sum(1 for trade in trades if normalize_status(trade.get("status")) == "TARGET_1_HIT"),
         "target_2_hit": sum(1 for trade in trades if normalize_status(trade.get("status")) == "TARGET_2_HIT"),
@@ -1708,7 +2912,10 @@ async def get_paper_summary() -> dict:
         "average_paper_pnl": total_pnl / len(pnl_trades) if pnl_trades else 0,
         "winning_trades": len(winning),
         "losing_trades": len(losing),
-        "win_rate_percent": (len(winning) / len(closed) * 100) if closed else 0,
+        "win_rate_percent": (len(winning) / len(eligible_closed) * 100) if eligible_closed else 0,
+        "target_hit_count": sum(1 for trade in trades if trade_statuses(trade) & target_hit_statuses),
+        "sl_hit_count": sum(1 for trade in trades if trade_statuses(trade) & sl_hit_statuses),
+        "ambiguous_count": sum(1 for trade in trades if "AMBIGUOUS" in trade_statuses(trade)),
         "symbols": sorted({trade.get("symbol") for trade in trades if trade.get("symbol")}),
     }
 
@@ -1719,6 +2926,444 @@ async def get_active_paper_trades(limit: int = Query(default=100, ge=1, le=500))
     trades = [row async for row in cursor if is_open_trade(row)]
     trades = trades[:limit]
     return {"count": len(trades), "trades": trades}
+
+
+@router.post("/journal/sync")
+async def sync_paper_trade_journal(limit: int = Query(default=1000, ge=1, le=5000)) -> dict:
+    result = await sync_completed_trades_to_journal(get_database(), limit)
+    return {
+        **result,
+        "paper_only": True,
+        "completed_trades_immutable": True,
+    }
+
+
+@router.get("/journal")
+async def get_paper_trade_journal(
+    limit: int = Query(default=1000, ge=1, le=5000),
+    sync_missing: bool = Query(default=True),
+) -> dict:
+    sync_result = await sync_completed_trades_to_journal(get_database(), limit) if sync_missing else None
+    records = await load_trade_journal(get_database(), limit)
+    return {
+        "count": len(records),
+        "sync_result": sync_result,
+        "completed_trades_immutable": True,
+        "journal": records,
+    }
+
+
+@router.get("/analytics")
+async def get_paper_trade_analytics(
+    limit: int = Query(default=1000, ge=1, le=5000),
+    sync_missing: bool = Query(default=True),
+) -> dict:
+    return await get_trade_analytics(get_database(), limit, sync_missing=sync_missing)
+
+
+@router.post("/sync-trade-ready")
+async def sync_trade_ready_to_paper(index_name: str = Query(default="BROAD_MARKET_750")) -> dict:
+    try:
+        return await sync_trade_ready(index_name)
+    except Exception as exc:
+        logger.exception("Manual Trade Ready paper sync failed")
+        try:
+            await record_system_error(
+                get_database(),
+                component="paper_sync",
+                operation="manual_sync_trade_ready_endpoint",
+                exception=exc,
+            )
+        except Exception:
+            logger.exception("Failed to persist manual Trade Ready sync endpoint error")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "ok": False,
+                "error": "SYNC_TRADE_READY_FAILED",
+                "message": "Trade Ready paper sync failed. Automatic scheduler will retry.",
+                "paper_only": True,
+                "live_trading": False,
+                "broker_orders": False,
+            },
+        )
+
+
+async def fetch_trade_market_latest(db, trade: dict) -> tuple[dict | None, dict | None]:
+    market_row = await find_market_data_for_trade(db, trade)
+    await record_paper_market_snapshots(db, trade, market_row)
+    snapshot_latest = await paper_market_latest_row(db, trade)
+    if is_waiting_trade(trade):
+        return market_row, snapshot_latest
+    return market_row, market_data_latest_row(market_row, trade) or snapshot_latest
+
+
+async def ensure_state_version_on_paper_trades(db) -> int:
+    collection = getattr(db, "paper_trades", None)
+    update_many = getattr(collection, "update_many", None)
+    if update_many is None:
+        return 0
+    result = await update_many(
+        {"paper_only": True, "state_version": {"$exists": False}},
+        {"$set": {"state_version": 1, "state_version_initialized_at": datetime.utcnow().isoformat()}},
+        upsert=False,
+    )
+    return int(getattr(result, "modified_count", 0))
+
+
+def audit_reason_for_market_data(trade: dict, market_row: dict | None, latest: dict | None) -> str:
+    if latest:
+        return "MARKET_DATA_AFTER_SETUP"
+    if is_waiting_trade(trade):
+        return "DATA_INSUFFICIENT"
+    if not market_row:
+        return "NO_MARKET_DATA"
+    setup_time = setup_timestamp_for_trade(trade)
+    market_time = market_timestamp_for_row(market_row)
+    if setup_time and market_time and market_time < setup_time:
+        return "MARKET_DATA_BEFORE_SETUP"
+    return "NO_USABLE_MARKET_HIGH"
+
+
+async def audit_and_fix_waiting_trades(db, *, apply: bool = False, limit: int = 5000) -> dict:
+    state_versions_initialized = await ensure_state_version_on_paper_trades(db) if apply else 0
+    cursor = db.paper_trades.find({"paper_only": True}).sort("updated_at", -1).limit(limit)
+    audited = 0
+    would_update = 0
+    updated_count = 0
+    errors = []
+    rows = []
+    affected_trades = []
+    scheduler_status = None
+    try:
+        scheduler_status = await get_paper_update_scheduler_status(db)
+    except Exception as exc:
+        scheduler_status = {"error": str(exc)}
+
+    async for trade in cursor:
+        if not is_waiting_trade(trade):
+            continue
+        audited += 1
+        try:
+            market_row, latest = await fetch_trade_market_latest(db, trade)
+            update = update_plan_status(trade, latest) if latest else {}
+            proposed_status = update.get("status", trade.get("status"))
+            proposed_ui_status = ui_status_for_trade({**trade, **update})
+            should_update = bool(update)
+            would_update += int(should_update)
+            modified = 0
+            journal_result = None
+            if apply and should_update:
+                result = await db.paper_trades.update_one(
+                    atomic_trade_update_filter(trade),
+                    state_transition_update(update),
+                    upsert=False,
+                )
+                modified = int(getattr(result, "modified_count", 0))
+                updated_count += modified
+                if modified > 0 and is_completed_trade({**trade, **update}):
+                    merged_trade = {**trade, **update}
+                    journal_result = await journal_completed_trade(db, merged_trade)
+                    await mark_trade_journal_result(db, merged_trade, journal_result)
+            audit_row = {
+                "trade_id": str(trade.get("_id")) if trade.get("_id") is not None else None,
+                "setup_id": trade.get("setup_id"),
+                "symbol": trade.get("symbol"),
+                "strategy": strategy_label_for_trade(trade),
+                "current_status": trade.get("status"),
+                "current_ui_status": ui_status_for_trade(trade),
+                "proposed_status": proposed_status,
+                "proposed_ui_status": proposed_ui_status,
+                "entry_price": trade.get("entry_price"),
+                "setup_time": setup_time_value(trade),
+                "market_data_updated_at": market_row.get("updated_at") if market_row else None,
+                "post_setup_high": latest.get("high") if latest else None,
+                "current_price": latest.get("close") if latest else None,
+                "post_setup_high_source": latest.get("post_setup_high_source") if latest else None,
+                "scheduler_state": scheduler_status.get("status") if isinstance(scheduler_status, dict) else None,
+                "would_update": should_update,
+                "updated": modified > 0,
+                "reason": proposed_update_reason(trade, update) if update else audit_reason_for_market_data(trade, market_row, latest),
+                "journal": journal_result,
+            }
+            rows.append(audit_row)
+            if modified > 0:
+                affected_trades.append(audit_row)
+        except Exception as exc:
+            logger.exception("Waiting trade audit failed for symbol=%s", trade.get("symbol"))
+            errors.append({"symbol": trade.get("symbol"), "trade_id": str(trade.get("_id")), "error": str(exc)})
+            await record_system_error(
+                db,
+                component="paper_waiting_trade_audit",
+                operation="audit_and_fix_waiting_trades",
+                trade=trade,
+                exception=exc,
+            )
+    return {
+        "ok": not errors,
+        "paper_only": True,
+        "apply": apply,
+        "audited_count": audited,
+        "would_update_count": would_update,
+        "updated_count": updated_count,
+        "state_versions_initialized": state_versions_initialized,
+        "affected_count": len(affected_trades),
+        "errors_count": len(errors),
+        "errors": errors,
+        "affected_trades": affected_trades,
+        "rows": rows,
+    }
+
+
+def is_plain_active_entry_trade(trade: dict) -> bool:
+    status = normalize_status(trade.get("status"))
+    return status == "ACTIVE" and not is_terminal_trade(trade) and not (trade_statuses(trade) & PARTIAL_STATUSES)
+
+
+def active_entry_evidence_reason(trade: dict, latest: dict | None) -> str:
+    if not latest:
+        return "DATA_INSUFFICIENT"
+    entry_price = number_or_none(trade.get("entry_price"))
+    latest_high = number_or_none(latest.get("high"))
+    if entry_price is not None and latest_high is not None and latest_high >= entry_price:
+        return "ENTRY_CONFIRMED_BY_SNAPSHOT"
+    return "NO_RECORDED_ENTRY_TOUCH"
+
+
+async def reaudit_active_entry_evidence(
+    db,
+    *,
+    apply: bool = False,
+    limit: int = 5000,
+    symbols: list[str] | None = None,
+) -> dict:
+    state_versions_initialized = await ensure_state_version_on_paper_trades(db) if apply else 0
+    query = {"paper_only": True, "status": "ACTIVE", "entry_triggered": True}
+    if symbols:
+        query["symbol"] = {"$in": symbols}
+    cursor = db.paper_trades.find(query).sort("updated_at", -1).limit(limit)
+    audited = 0
+    updated_count = 0
+    rows = []
+    affected_trades = []
+    errors = []
+    for_update_now = datetime.utcnow().isoformat()
+    async for trade in cursor:
+        if not is_plain_active_entry_trade(trade):
+            continue
+        audited += 1
+        try:
+            market_row = await find_market_data_for_trade(db, trade)
+            await record_paper_market_snapshots(db, trade, market_row)
+            latest = await paper_market_latest_row(db, trade)
+            reason = active_entry_evidence_reason(trade, latest)
+            should_revert = reason != "ENTRY_CONFIRMED_BY_SNAPSHOT"
+            modified = 0
+            if apply and should_revert:
+                update = {
+                    "latest_close": latest.get("close") if latest else trade.get("latest_close"),
+                    "latest_high": latest.get("high") if latest else trade.get("latest_high"),
+                    "latest_low": latest.get("low") if latest else trade.get("latest_low"),
+                    "last_checked_at": for_update_now,
+                    "updated_at": for_update_now,
+                    "status": WAITING_FOR_ENTRY_STATUS,
+                    "outcome_status": WAITING_FOR_ENTRY_STATUS,
+                    "state": WAITING_FOR_ENTRY_STATUS,
+                    "status_updated_at": for_update_now,
+                    "entry_triggered": False,
+                    "entry_reaudit_status": reason,
+                    "entry_reaudit_at": for_update_now,
+                    "invalid_entry_previous_status": trade.get("status"),
+                    "invalid_entry_triggered_at": trade.get("entry_triggered_at"),
+                    "invalid_entry_reason": "ENTRY_NOT_PROVEN_BY_POST_SETUP_SNAPSHOT",
+                }
+                result = await db.paper_trades.update_one(
+                    atomic_trade_update_filter(trade),
+                    state_transition_update(update),
+                    upsert=False,
+                )
+                modified = int(getattr(result, "modified_count", 0))
+                updated_count += modified
+            row = {
+                "trade_id": str(trade.get("_id")) if trade.get("_id") is not None else None,
+                "setup_id": trade.get("setup_id"),
+                "symbol": trade.get("symbol"),
+                "strategy": strategy_label_for_trade(trade),
+                "current_status": trade.get("status"),
+                "entry_price": trade.get("entry_price"),
+                "setup_time": setup_time_value(trade),
+                "post_setup_high": latest.get("high") if latest else None,
+                "current_price": latest.get("close") if latest else None,
+                "post_setup_high_source": latest.get("post_setup_high_source") if latest else None,
+                "reason": reason,
+                "would_revert": should_revert,
+                "updated": modified > 0,
+            }
+            rows.append(row)
+            if modified > 0:
+                affected_trades.append(row)
+        except Exception as exc:
+            logger.exception("Active entry evidence audit failed for symbol=%s", trade.get("symbol"))
+            errors.append({"symbol": trade.get("symbol"), "trade_id": str(trade.get("_id")), "error": str(exc)})
+            await record_system_error(
+                db,
+                component="paper_active_entry_reaudit",
+                operation="reaudit_active_entry_evidence",
+                trade=trade,
+                exception=exc,
+            )
+    return {
+        "ok": not errors,
+        "paper_only": True,
+        "apply": apply,
+        "audited_count": audited,
+        "updated_count": updated_count,
+        "state_versions_initialized": state_versions_initialized,
+        "affected_count": len(affected_trades),
+        "errors_count": len(errors),
+        "errors": errors,
+        "affected_trades": affected_trades,
+        "rows": rows,
+    }
+
+
+async def run_automatic_outcome_update(
+    limit: int = 100,
+    timeframe: str = "1D",
+    *,
+    db_override=None,
+) -> dict:
+    if PAPER_AUTO_OUTCOME_LOCK.locked():
+        return {
+            "ok": True,
+            "skipped_concurrent": True,
+            "paper_only": True,
+            "live_trading": False,
+            "broker_orders": False,
+            "processed": 0,
+            "updated_count": 0,
+            "completed_protected": 0,
+            "errors": [],
+        }
+
+    async with PAPER_AUTO_OUTCOME_LOCK:
+        db = db_override or get_database()
+        run_id = f"auto-outcome-{uuid4().hex}"
+        lock_result = await acquire_paper_update_lock(db, run_id, owner="AUTO_OUTCOME_UPDATE", ttl_seconds=30 * 60)
+        if not lock_result.get("acquired"):
+            return {
+                "ok": True,
+                "skipped_concurrent": True,
+                "paper_only": True,
+                "live_trading": False,
+                "broker_orders": False,
+                "processed": 0,
+                "updated_count": 0,
+                "completed_protected": 0,
+                "errors": [],
+                "lock": lock_result.get("lock"),
+            }
+
+        processed = updated_count = completed_protected = 0
+        errors = []
+        results = []
+        try:
+            cursor = db.paper_trades.find(
+                {"paper_only": True, "status": {"$in": TRACKABLE_STATUSES}},
+            ).sort("updated_at", -1).limit(limit)
+            async for trade in cursor:
+                if is_terminal_trade(trade):
+                    completed_protected += 1
+                    continue
+                processed += 1
+                try:
+                    market_row, latest = await fetch_trade_market_latest(db, trade)
+                    if not latest:
+                        results.append(
+                            {
+                                "symbol": trade.get("symbol"),
+                                "updated": False,
+                                "reason": audit_reason_for_market_data(trade, market_row, latest),
+                            }
+                        )
+                        continue
+                    update = update_plan_status(trade, latest)
+                    if not update:
+                        results.append({"symbol": trade.get("symbol"), "updated": False, "reason": "NO_STATUS_CHANGE"})
+                        continue
+                    result = await db.paper_trades.update_one(
+                        atomic_trade_update_filter(trade),
+                        state_transition_update(update),
+                        upsert=False,
+                    )
+                    modified = int(getattr(result, "modified_count", 0))
+                    updated_count += modified
+                    journal_result = None
+                    if modified > 0 and is_completed_trade({**trade, **update}):
+                        merged_trade = {**trade, **update}
+                        journal_result = await journal_completed_trade(db, merged_trade)
+                        await mark_trade_journal_result(db, merged_trade, journal_result)
+                    results.append(
+                        {
+                            "symbol": trade.get("symbol"),
+                            "previous_status": trade.get("status"),
+                            "status": update.get("status", trade.get("status")),
+                            "updated": modified > 0,
+                            "reason": proposed_update_reason(trade, update),
+                            "market_data_updated_at": market_row.get("updated_at") if market_row else None,
+                            "journal": journal_result,
+                        }
+                    )
+                except Exception as exc:
+                    logger.exception("Automatic outcome update failed for symbol=%s", trade.get("symbol"))
+                    await record_system_error(
+                        db,
+                        component="paper_outcome_engine",
+                        operation="run_automatic_outcome_update",
+                        trade=trade,
+                        exception=exc,
+                    )
+                    errors.append(
+                        {
+                            "trade_id": str(trade.get("_id")),
+                            "symbol": trade.get("symbol"),
+                            "status": trade.get("status"),
+                            "error": str(exc),
+                        }
+                    )
+        finally:
+            lock_release = await release_paper_update_lock(db, run_id)
+
+        return {
+            "ok": not errors,
+            "skipped_concurrent": False,
+            "paper_only": True,
+            "live_trading": False,
+            "broker_orders": False,
+            "processed": processed,
+            "updated_count": updated_count,
+            "completed_protected": completed_protected,
+            "errors_count": len(errors),
+            "errors": errors,
+            "results": results,
+            "lock_released": lock_release.get("released", False),
+        }
+
+
+@router.post("/auto-update-outcomes")
+async def auto_update_paper_outcomes(
+    limit: int = Query(default=100, ge=1, le=500),
+    timeframe: str = Query(default="1D"),
+) -> dict:
+    return await run_automatic_outcome_update(limit, timeframe)
+
+
+@router.post("/audit-waiting")
+async def audit_waiting_paper_trades(
+    apply: bool = Query(default=False),
+    limit: int = Query(default=5000, ge=1, le=10000),
+) -> dict:
+    return await audit_and_fix_waiting_trades(get_database(), apply=apply, limit=limit)
 
 
 @router.post("/run-pipeline")
@@ -1770,18 +3415,24 @@ async def run_paper_pipeline(
         response["error"] = f"invalid_strategy: {strategy}"
         return finish_pipeline_response(response, started)
 
-    def get_cached_candles(symbol: str) -> list[dict]:
+    async def get_cached_candles(symbol: str) -> list[dict]:
         key = f"{symbol}|{timeframe}"
         if key in tv_cache:
             response["tv_cache_hits"] += 1
             return tv_cache[key]["candles"]
         response["tv_cache_misses"] += 1
         response["tv_fetch_count"] += 1
-        client = TradingViewClient()
-        client.connect_to_debug_port()
-        client.open_symbol(symbol)
-        candles = client.fetch_candles(timeframe, min_candles=1)
-        tv_cache[key] = {"candles": candles, "diagnostics": client.diagnostics}
+        tv_result = await tradingview_manager.run_sync(
+            "paper.pipeline.fetch_candles",
+            fetch_tradingview_candles_sync,
+            symbol,
+            timeframe,
+            min_candles=1,
+            timeout_seconds=settings.TRADINGVIEW_SYMBOL_TIMEOUT_SECONDS,
+            retries=1,
+        )
+        candles = tv_result["candles"]
+        tv_cache[key] = {"candles": candles, "diagnostics": tv_result.get("diagnostics")}
         response["cached_symbols"] = sorted(tv_cache.keys())
         return candles
 
@@ -1875,7 +3526,7 @@ async def build_pipeline_signals(limit: int, timeframe: str, get_candles, save: 
     signals = []
     async for row in cursor:
         processed += 1
-        candles = get_candles(row["tradingview_symbol"])
+        candles = await get_candles(row["tradingview_symbol"])
         confirmation = confirm_from_candles(candles)
         paper_plan = build_price_action_paper_plan_from_candles(candles, "swing", "CONFIRMED_SIGNAL", timeframe) if confirmation["tv_confirmed"] else {}
         if confirmation["tv_confirmed"] and paper_plan.get("paper_plan_valid"):
@@ -1917,7 +3568,7 @@ async def build_pipeline_momentum_signals(limit: int, timeframe: str, get_candle
     signals = []
     async for row in cursor:
         processed += 1
-        candles = get_candles(row["tradingview_symbol"])
+        candles = await get_candles(row["tradingview_symbol"])
         confirmation = confirm_momentum_from_candles(candles)
         paper_plan = build_price_action_paper_plan_from_candles(candles, "momentum", "MOMENTUM_CONFIRMED", timeframe) if confirmation.get("momentum_confirmed") else {}
         if not (
@@ -1996,7 +3647,7 @@ async def build_pipeline_plans(
         cursor = db.paper_signals.find(signal_query, {"_id": 0}).sort("updated_at", -1).limit(limit)
         source_signals = [signal async for signal in cursor]
     for signal in source_signals[:limit]:
-        plan = build_plan_from_candles(signal, get_candles(signal["symbol"]), 100000, 1)
+        plan = build_plan_from_candles(signal, await get_candles(signal["symbol"]), 100000, 1)
         if plan:
             plans.append(plan)
     upserted_count, modified_count = await upsert_paper_plans(plans) if save else (0, 0)
@@ -2015,35 +3666,10 @@ async def upsert_paper_plans(plans: list[dict]) -> tuple[int, int]:
     modified_count = 0
     if not plans:
         return 0, 0
-    await db.paper_trades.create_index(
-        [("symbol", 1), ("timeframe", 1), ("source_signal_type", 1), ("paper_only", 1), ("status", 1)],
-        unique=True,
-    )
+    await ensure_paper_trade_setup_index(db)
     for plan in plans:
-        existing_open = await db.paper_trades.find_one(
-            {
-                "symbol": plan["symbol"],
-                "timeframe": plan["timeframe"],
-                "source_signal_type": plan["source_signal_type"],
-                "paper_only": plan["paper_only"],
-                "status": {"$in": NON_TERMINAL_STATUSES},
-            },
-            {"_id": 1},
-        )
-        if existing_open:
-            result = await db.paper_trades.update_one(
-                {"_id": existing_open["_id"]},
-                {"$set": {"updated_at": plan["updated_at"]}},
-            )
-            modified_count += result.modified_count
-            continue
-        identity = {key: plan[key] for key in ("symbol", "timeframe", "source_signal_type", "paper_only", "status")}
-        created_at = plan["created_at"]
-        update_doc = plan.copy()
-        update_doc.pop("created_at", None)
-        result = await db.paper_trades.update_one(identity, {"$set": update_doc, "$setOnInsert": {"created_at": created_at}}, upsert=True)
-        upserted_count += 1 if result.upserted_id is not None else 0
-        modified_count += result.modified_count
+        _identity_plan, inserted = await atomic_insert_paper_trade_plan(db, plan)
+        upserted_count += int(inserted)
     return upserted_count, modified_count
 
 
@@ -2072,28 +3698,49 @@ async def update_pipeline_plans(
         if is_terminal_trade(plan):
             results.append({"symbol": plan["symbol"], "status": plan.get("status"), "updated": False, "reason": "TERMINAL_STATUS"})
             continue
-        candles = get_candles(tv_symbol_for_trade(plan))
-        if not candles:
-            results.append({"symbol": plan["symbol"], "status": plan["status"], "updated": False, "reason": "NO_CANDLES"})
+        if save:
+            market_row, latest = await fetch_trade_market_latest(db, plan)
+        else:
+            market_row = await find_market_data_for_trade(db, plan)
+            if is_waiting_trade(plan):
+                latest = await paper_market_latest_row(db, plan)
+            else:
+                latest = market_data_latest_row(market_row, plan) or await paper_market_latest_row(db, plan)
+        if not latest:
+            results.append({
+                "symbol": plan["symbol"],
+                "status": plan["status"],
+                "updated": False,
+                "reason": audit_reason_for_market_data(plan, market_row, latest),
+            })
             continue
-        update = update_plan_status(plan, candles[-1])
+        update = update_plan_status(plan, latest)
         modified = 0
         if save and update:
             try:
-                result = await db.paper_trades.update_one({"_id": plan["_id"]}, {"$set": update})
+                result = await db.paper_trades.update_one(
+                    atomic_trade_update_filter(plan),
+                    state_transition_update(update),
+                    upsert=False,
+                )
                 modified = result.modified_count
-            except DuplicateKeyError:
-                merged_status = update.get("status", plan["status"])
-                identity = {
-                    "symbol": plan["symbol"],
-                    "timeframe": plan["timeframe"],
-                    "source_signal_type": plan["source_signal_type"],
-                    "paper_only": plan["paper_only"],
-                    "status": merged_status,
-                }
-                await db.paper_trades.update_one(identity, {"$set": update})
-                await db.paper_trades.delete_one({"_id": plan["_id"]})
-                modified = 1
+            except Exception as exc:
+                results.append({"symbol": plan["symbol"], "status": plan["status"], "updated": False, "reason": str(exc)})
+                continue
             updated_count += modified
-        results.append({"symbol": plan["symbol"], "status": update.get("status", plan["status"]), "updated": bool(modified)})
+        journal_result = None
+        if modified > 0 and is_completed_trade({**plan, **update}):
+            try:
+                merged_trade = {**plan, **update}
+                journal_result = await journal_completed_trade(db, merged_trade)
+                await mark_trade_journal_result(db, merged_trade, journal_result)
+            except Exception as exc:
+                results.append({"symbol": plan["symbol"], "status": update.get("status", plan["status"]), "updated": True, "journal_error": str(exc)})
+                continue
+        results.append({
+            "symbol": plan["symbol"],
+            "status": update.get("status", plan["status"]),
+            "updated": bool(modified),
+            "journal": journal_result,
+        })
     return {"processed": processed, "updated_count": updated_count, "results": results}

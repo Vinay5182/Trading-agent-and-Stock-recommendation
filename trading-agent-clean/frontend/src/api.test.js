@@ -2,12 +2,40 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-import { approvePaperUpdateFromDryRun, getAiDataCollectionStatus, getAiFeatureDatasetSummary, getAiFeatureSnapshots, getAiOutcomePreview } from "./api.js";
+import {
+  getAiDataCollectionStatus,
+  getAiFeatureDatasetSummary,
+  getAiFeatureSnapshots,
+  getAiOutcomePreview,
+  getDashboardPaperEquity,
+  getPaperHistory,
+  getPaperOpenTrades,
+  getPaperSummary,
+  getScanRows,
+  getSystemRuntimeInfo,
+  getTradingViewRuntimeStatus,
+  isRequestCancellation,
+  runScan,
+} from "./api.js";
 import { aiDataCollectionChecklist, aiOutcomeSkippedRows, aiSnapshotDisplayRows } from "./aiDataset.js";
 
-const CONFIRMATION_TEXT = "I understand this will write to paper_trades only and will not place broker orders";
+test("frontend source does not expose manual paper update endpoints", () => {
+  const source = readFileSync(new URL("./api.js", import.meta.url), "utf8");
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+  const combined = `${source}\n${appSource}`;
+  const forbiddenPaths = [
+    ["sync", "trade", "ready"],
+    ["update", "trades"],
+    ["update", "plans"],
+    ["auto", "update", "outcomes"],
+  ].map((parts) => `/api/paper/${parts.join("-")}`);
 
-test("approvePaperUpdateFromDryRun posts only to the bound approval endpoint", async (t) => {
+  for (const path of forbiddenPaths) {
+    assert.equal(combined.includes(path), false);
+  }
+});
+
+test("paper page read helpers use grouped paper APIs", async (t) => {
   const originalFetch = globalThis.fetch;
   const calls = [];
   t.after(() => {
@@ -15,40 +43,258 @@ test("approvePaperUpdateFromDryRun posts only to the bound approval endpoint", a
   });
   globalThis.fetch = async (url, options = {}) => {
     calls.push({ url, options });
-    return {
-      ok: true,
-      status: 200,
-      text: async () => JSON.stringify({ blocked: false, approved_dry_run_id: "dry-run-1" }),
-    };
+    return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true }) };
   };
 
-  const result = await approvePaperUpdateFromDryRun({
-    approvedDryRunId: "dry-run-1",
-    confirmationText: CONFIRMATION_TEXT,
-  });
+  await getPaperOpenTrades();
+  await getPaperHistory();
+  await getPaperSummary();
 
-  assert.deepEqual(result, { blocked: false, approved_dry_run_id: "dry-run-1" });
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].url, "http://127.0.0.1:8011/api/paper/update-trades/approve");
-  assert.equal(calls[0].options.method, "POST");
-  assert.deepEqual(JSON.parse(calls[0].options.body), {
-    approved_dry_run_id: "dry-run-1",
-    confirmation_text: CONFIRMATION_TEXT,
-    max_trades: 6,
-    max_writes: 1,
-  });
-  assert.equal(calls[0].options.body.includes("dry_run=false"), false);
+  assert.deepEqual(calls.map((call) => call.url), [
+    "http://127.0.0.1:8011/api/paper/open",
+    "http://127.0.0.1:8011/api/paper/history",
+    "http://127.0.0.1:8011/api/paper/summary",
+  ]);
+  assert.equal(calls.some((call) => call.url.endsWith("/api/paper/trades")), false);
+  assert.equal(calls.some((call) => call.url.endsWith("/api/paper/active")), false);
+  assert.equal(calls.some((call) => call.url.endsWith(`/api/paper/${["pipeline", "details"].join("-")}`)), false);
+
+  const source = readFileSync(new URL("./api.js", import.meta.url), "utf8");
+  assert.equal(source.includes("getAllTrades"), false);
+  assert.equal(source.includes("getActiveTrades"), false);
+  assert.equal(source.includes(["getPaperPipeline", "Details"].join("")), false);
 });
 
-test("api source does not add an unbound dry_run=false paper update helper", () => {
-  const source = readFileSync(new URL("./api.js", import.meta.url), "utf8");
-  const helperStart = source.indexOf("approvePaperUpdateFromDryRun");
-  const helperEnd = source.indexOf("export const getPaperUpdateProgress");
-  const helperSource = source.slice(helperStart, helperEnd);
+test("scan helpers match active backend routes", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url, options });
+    return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true }) };
+  };
 
-  assert.ok(helperSource.includes('"/api/paper/update-trades/approve"'));
-  assert.equal(helperSource.includes("/api/paper/update-trades?"), false);
-  assert.equal(source.includes("/api/paper/update-trades?dry_run=false"), false);
+  await runScan();
+  await getScanRows("scan-1");
+  await getTradingViewRuntimeStatus();
+
+  assert.equal(calls[0].url, "http://127.0.0.1:8011/api/scan");
+  assert.equal(calls[0].options.method, "POST");
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    selected_index: "DEFAULT_UNIVERSE",
+    limit: 50,
+    force_refresh: false,
+  });
+  assert.equal(calls[1].url, "http://127.0.0.1:8011/api/scan/rows?scan_run_id=scan-1");
+  assert.equal(calls[2].url, "http://127.0.0.1:8011/api/tv/runtime-status");
+});
+
+test("request cancellation is typed and not a display error", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = async (url, options = {}) => new Promise((resolve, reject) => {
+    options.signal?.addEventListener("abort", () => {
+      const error = new Error("The operation was aborted.");
+      error.name = "AbortError";
+      reject(error);
+    }, { once: true });
+  });
+
+  const controller = new AbortController();
+  const requestPromise = getTradingViewRuntimeStatus({ signal: controller.signal });
+  controller.abort();
+
+  await assert.rejects(requestPromise, (err) => {
+    assert.equal(isRequestCancellation(err), true);
+    assert.equal(err.name, "AbortError");
+    assert.equal(err.message, "Request cancelled.");
+    return true;
+  });
+  assert.equal(isRequestCancellation(new Error("Request cancelled.")), true);
+});
+
+test("dashboard paper equity helper reads the dashboard endpoint", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url, options });
+    return { ok: true, status: 200, text: async () => JSON.stringify({ starting_virtual_balance: 250000 }) };
+  };
+
+  const result = await getDashboardPaperEquity();
+
+  assert.deepEqual(result, { starting_virtual_balance: 250000 });
+  assert.equal(calls[0].url, "http://127.0.0.1:8011/api/dashboard/paper-equity");
+  assert.equal(calls[0].options.method, undefined);
+});
+
+test("system runtime helper reads the backend identity endpoint", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const runtime = {
+    project_root: "C:\\Users\\Asus\\OneDrive\\Documents\\Trading_Strategy\\trading-agent-clean",
+    backend_pid: 1234,
+    git_commit: "abcdef",
+    started_at: "2026-06-21T00:00:00+00:00",
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url, options });
+    return { ok: true, status: 200, text: async () => JSON.stringify(runtime) };
+  };
+
+  const result = await getSystemRuntimeInfo();
+
+  assert.deepEqual(result, runtime);
+  assert.equal(calls[0].url, "http://127.0.0.1:8011/api/system/runtime-info");
+  assert.equal(calls[0].options.method, undefined);
+});
+
+test("obsolete reset-build-trade-ready frontend call is removed", () => {
+  const source = readFileSync(new URL("./api.js", import.meta.url), "utf8");
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  assert.equal(source.includes("resetBuildPaperFromTradeReady"), false);
+  assert.equal(source.includes("/api/paper/reset-build-trade-ready"), false);
+  assert.equal(appSource.includes("resetBuildPaperFromTradeReady"), false);
+  assert.equal(appSource.includes("reset-build-trade-ready"), false);
+});
+
+test("Paper Trades is live without manual load or update buttons", () => {
+  const source = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+  const start = source.indexOf("function PaperTrades");
+  const end = source.indexOf("function Settings", start);
+  const paperTradesSource = source.slice(start, end);
+
+  assert.ok(source.includes("const PAPER_TRADES_REFRESH_MS = 60000;"));
+  assert.ok(source.includes("}, PAPER_TRADES_REFRESH_MS);"));
+  assert.ok(source.includes("paperLiveCycleRef.current"));
+  assert.ok(source.includes("function paperStrategyText"));
+  assert.ok(source.includes("PAPER_TABLE_COLUMNS"));
+  assert.ok(source.includes("PAPER_TRADE_FILTERS"));
+  assert.ok(source.includes("PAPER_WAITING_STATUSES"));
+  assert.ok(paperTradesSource.includes("paperSearch"));
+  assert.ok(paperTradesSource.includes("strategyFilter"));
+  assert.ok(source.includes("Waiting for Entry"));
+  assert.ok(source.includes("Active Trades"));
+  assert.ok(source.includes("Completed / Stopped"));
+  assert.ok(source.includes("All Trades"));
+  assert.ok(paperTradesSource.includes("PaperTradeTable rows={filteredRows}"));
+  assert.ok(source.includes("Loading paper trades..."));
+  assert.ok(paperTradesSource.includes("No paper trades match the current filters."));
+  assert.equal(paperTradesSource.includes(["Pipeline", "Details"].join(" ")), false);
+  assert.equal(paperTradesSource.includes(["Paper", "Signals"].join(" ")), false);
+  assert.equal(paperTradesSource.includes(["Paper", "Plans"].join(" ")), false);
+  assert.equal(paperTradesSource.includes("Open Trades"), false);
+  assert.equal(paperTradesSource.includes("Trade History"), false);
+  assert.equal(paperTradesSource.includes("getAllTrades"), false);
+  assert.equal(paperTradesSource.includes("getActiveTrades"), false);
+  assert.equal(paperTradesSource.includes(["Load Paper", "Signals"].join(" ")), false);
+  assert.equal(paperTradesSource.includes(["Update Paper", "Trades"].join(" ")), false);
+});
+
+test("stock detail requests cancel stale responses and abort on unmount", () => {
+  const source = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  assert.ok(source.includes("stockDetailRequestRef"));
+  assert.ok(source.includes("stockDetailAbortRef.current?.abort()"));
+  assert.ok(source.includes("controller.signal.aborted || stockDetailRequestRef.current !== requestId"));
+  assert.ok(source.includes("return () => {"));
+  assert.ok(source.includes("controller.abort();"));
+});
+
+test("polling requests have overlap guards and abort cleanup", () => {
+  const source = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  assert.ok(source.includes("dashboardRefreshCycleRef.current"));
+  assert.ok(source.includes("dashboardRefreshAbortRef.current?.abort()"));
+  assert.ok(source.includes("globalStatusCycleRef.current"));
+  assert.ok(source.includes("globalStatusAbortRef.current?.abort()"));
+  assert.ok(source.includes("paperLiveCycleRef.current"));
+  assert.ok(source.includes("paperSafetyCycleRef.current"));
+  assert.ok(source.includes("paperLiveAbortRef.current?.abort()"));
+  assert.ok(source.includes("paperSafetyAbortRef.current?.abort()"));
+  assert.ok(source.includes("tvRuntimeCycleRef.current"));
+  assert.ok(source.includes("tvRuntimeAbortRef.current?.abort()"));
+  assert.ok(source.includes("DASHBOARD_REFRESH_MS"));
+  assert.ok(source.includes("BATCH_TV_RUNTIME_REFRESH_MS"));
+  assert.ok(source.includes("GLOBAL_HEALTH_REFRESH_MS"));
+});
+
+test("dashboard renders virtual balance portfolio without manual refresh controls", () => {
+  const source = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+  const portfolioStart = source.indexOf("function DashboardPortfolio");
+  const dashboardEnd = source.indexOf("function SummaryCards", portfolioStart);
+  const dashboardSource = source.slice(portfolioStart, dashboardEnd);
+
+  assert.ok(source.includes("getDashboardPaperEquity"));
+  assert.ok(source.includes("refreshDashboardSnapshot"));
+  assert.ok(dashboardSource.includes("Starting Balance"));
+  assert.ok(dashboardSource.includes("Current Virtual Balance"));
+  assert.ok(dashboardSource.includes("Open Margin Used"));
+  assert.ok(dashboardSource.includes("Available Margin"));
+  assert.ok(dashboardSource.includes("Maximum Buying Power"));
+  assert.ok(dashboardSource.includes("Effective Exposure"));
+  assert.ok(dashboardSource.includes("Broker Funded Amount"));
+  assert.ok(dashboardSource.includes("Buying Power Usage %"));
+  assert.ok(dashboardSource.includes("Realized P&L"));
+  assert.ok(dashboardSource.includes("Unrealized P&L"));
+  assert.ok(dashboardSource.includes("Total P&L"));
+  assert.ok(dashboardSource.includes("Virtual Return %"));
+  assert.ok(dashboardSource.includes("Drawdown"));
+  assert.ok(dashboardSource.includes("Profit Factor"));
+  assert.ok(dashboardSource.includes("Average RR"));
+  assert.ok(dashboardSource.includes("Open-Position Exposure"));
+  assert.ok(dashboardSource.includes("Swing vs Momentum"));
+  assert.ok(dashboardSource.includes("Recent Completed Trades"));
+  assert.ok(source.includes("Scheduler and TradingView Health"));
+  assert.equal(dashboardSource.includes('?? "--"'), false);
+  assert.equal(source.includes('statusCounts.waiting ?? "--"'), false);
+  assert.equal(source.includes('summary?.total_trades ?? "--"'), false);
+  assert.equal(dashboardSource.includes("Refresh Portfolio"), false);
+});
+
+test("page-specific status reads are scoped to their pages", () => {
+  const source = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  assert.ok(source.includes('if (activePage !== "Dashboard") return undefined;'));
+  assert.ok(source.includes('if (activePage !== "Paper Trades") return undefined;'));
+  assert.ok(source.includes('if (activePage !== "Stock Detail" || !searched.symbol)'));
+  assert.ok(source.includes("!isRequestCancellation(err)"));
+  assert.equal(source.includes('act("status"'), false);
+});
+
+test("header displays backend TradingView runtime health", () => {
+  const source = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  assert.ok(source.includes("tradingViewBadge(tvRuntimeStatus)"));
+  assert.ok(source.includes("getTradingViewRuntimeStatus"));
+  assert.equal(source.includes('<Badge tone="green">TradingView Desktop</Badge>'), false);
+});
+
+test("settings renders backend runtime identity", () => {
+  const source = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+  const settingsStart = source.indexOf("function Settings");
+  const settingsEnd = source.indexOf("export default function App", settingsStart);
+  const settingsSource = source.slice(settingsStart, settingsEnd);
+
+  assert.ok(source.includes("getSystemRuntimeInfo"));
+  assert.ok(source.includes("systemRuntimeInfo"));
+  assert.ok(source.includes('if (activePage !== "Settings") return undefined;'));
+  assert.ok(settingsSource.includes("Running Project Identity"));
+  assert.ok(settingsSource.includes("project_root"));
+  assert.ok(settingsSource.includes("backend_pid"));
+  assert.ok(settingsSource.includes("git_commit"));
+  assert.ok(settingsSource.includes("started_at"));
 });
 
 test("getAiFeatureDatasetSummary uses the read-only summary endpoint and optional filters", async (t) => {

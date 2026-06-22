@@ -1,13 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
-  API_BASE, approvePaperUpdateFromDryRun, buildMomentumSignals, buildPaperPlans, buildSwingSignals, getActiveTrades,
-  getAiDataCollectionStatus, getAiFeatureDatasetSummary, getAiFeatureSnapshots, getAiOutcomePreview, getAllTrades, getHealth, getMarketDataSymbol, getMarketLoadProgress, getMomentumCandidates, getMomentumPrecheck, getPaperPlans, getPaperSignals,
-  getMomentumSummary, getMomentumTvConfirmed, getPaperEquity, getPaperSummary, getPaperUpdateLock, getPaperUpdateProgress, getPaperUpdateRuns, getPaperUpdateSchedulerStatus, getScanRows, getScoreSummary, getSettings, getSwingCandidates,
-  getSwingPrecheck, getSwingSummary, getSwingTvConfirmed, momentumTvConfirm, loadAllMarketData, runPaperPipeline, runScan, runScoring,
-  runPaperUpdateDryRun, swingTvConfirm, testTvSymbol, updatePaperPlans,
+  API_BASE, attachTradingViewTab, buildMomentumSignals, buildPaperPlans, buildSwingSignals, detachTradingViewTab,
+  getAiDataCollectionStatus, getAiFeatureDatasetSummary, getAiFeatureSnapshots, getAiOutcomePreview, getDashboardPaperEquity, getHealth, getMarketDataSymbol, getMarketLoadProgress, getMomentumCandidates, getMomentumPrecheck,
+  getMomentumSummary, getMomentumTvConfirmed, getPaperHistory, getPaperOpenTrades, getPaperSummary, getPaperUpdateLock, getPaperUpdateProgress, getPaperUpdateRuns, getPaperUpdateSchedulerStatus, getScanRows, getScoreSummary, getSettings, getSwingCandidates, getSystemRuntimeInfo,
+  getSwingPrecheck, getSwingSummary, getSwingTvConfirmed, getTradingViewAttachableTabs, getTradingViewRuntimeStatus, isRequestCancellation, momentumTvConfirm, loadAllMarketData, runPaperPipeline, runScan, runScoring,
+  swingTvConfirm, testTvSymbol,
 } from "./api";
 import { aiDataCollectionChecklist, aiOutcomeEligibleRows, aiOutcomeSkippedRows, aiSnapshotDisplayRows } from "./aiDataset";
-import { canApprovePaperRealUpdate } from "./paperRealUpdateApproval";
 
 const NAV_ITEMS = [
   { label: "Dashboard", icon: "◆" },
@@ -50,6 +49,8 @@ const val = (value) => {
   return String(value);
 };
 const fmt = (value) => Number.isFinite(Number(value)) ? Number(value).toLocaleString("en-IN", { maximumFractionDigits: 2 }) : val(value);
+const money = (value) => Number.isFinite(Number(value)) ? `₹${Number(value).toLocaleString("en-IN", { maximumFractionDigits: 2 })}` : val(value);
+const pct = (value) => Number.isFinite(Number(value)) ? `${Number(value).toLocaleString("en-IN", { maximumFractionDigits: 2 })}%` : val(value);
 const num = (value) => Number.isFinite(Number(value)) ? Number(value) : null;
 const countValue = (value) => Math.max(0, Number(value) || 0);
 const positiveCount = (value) => Math.max(1, Number(value) || 1);
@@ -62,6 +63,13 @@ const statusTone = (status = "") => {
   if (text.includes("CONFIRMED_SIGNAL") || text.includes("CONFIRMED") || text.includes("TARGET") || text.includes("ACTIVE") || text.includes("READY") || text.includes("VALID") || text.includes("BULLISH") || text === "LOW") return "green";
   if (text.includes("WAIT") || text.includes("PLAN") || text.includes("WATCH") || text.includes("NEUTRAL") || text === "MEDIUM") return "yellow";
   return "green";
+};
+const tradingViewBadge = (status) => {
+  if (!status) return { tone: "gray", label: "TradingView Unknown" };
+  if (status.last_error) return { tone: "red", label: "TradingView Error" };
+  if (status.worker_running) return { tone: "yellow", label: "TradingView Busy" };
+  if (status.connected) return { tone: "green", label: "TradingView Connected" };
+  return { tone: "gray", label: "TradingView Idle" };
 };
 const normalizeTradeQualityGrade = (grade = "") => {
   const text = String(grade || "").trim().toUpperCase().replace(/[\s-]+/g, "_");
@@ -133,6 +141,64 @@ function MiniTable({ rows = [], columns = ["symbol", "score", "status"] }) {
       return <td key={c}>{fmt(value)}</td>;
     })}</tr>) : <tr><td colSpan={columns.length}>No data loaded yet.</td></tr>}
   </tbody></table></div>;
+}
+
+function MiniLineChart({ points = [], valueKey = "value" }) {
+  const rows = (Array.isArray(points) ? points : []).filter((row) => Number.isFinite(Number(row?.[valueKey])));
+  if (!rows.length) return <div className="noCandlesPanel">No chart data available.</div>;
+  const width = 760;
+  const height = 230;
+  const pad = 28;
+  const values = rows.map((row) => Number(row[valueKey]));
+  const minValue = Math.min(...values);
+  const maxValue = Math.max(...values);
+  const span = Math.max(maxValue - minValue, 1);
+  const xFor = (index) => rows.length === 1 ? width / 2 : pad + (index * (width - pad * 2)) / (rows.length - 1);
+  const yFor = (value) => pad + ((maxValue - value) / span) * (height - pad * 2);
+  const polyline = rows.map((row, index) => `${xFor(index)},${yFor(Number(row[valueKey]))}`).join(" ");
+  const last = rows[rows.length - 1];
+  return <div className="chartFrame dashboardChartFrame">
+    <svg className="dashboardChart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Equity curve">
+      {[0, 1, 2, 3].map((step) => {
+        const y = pad + (step * (height - pad * 2)) / 3;
+        return <line className="gridLine" key={step} x1={pad} x2={width - pad} y1={y} y2={y} />;
+      })}
+      <polyline className="dashboardLine" points={polyline} />
+      {rows.map((row, index) => <circle className="dashboardPoint" key={`${row?.symbol || index}-${index}`} cx={xFor(index)} cy={yFor(Number(row[valueKey]))} r={index === rows.length - 1 ? 4 : 2.5} />)}
+      <text className="chartLabel" x={pad} y={18}>{money(maxValue)}</text>
+      <text className="chartLabel" x={pad} y={height - 6}>{money(minValue)}</text>
+    </svg>
+    <p className="chartMeta">Latest: {money(last?.[valueKey])} {last?.date ? `on ${last.date}` : ""}</p>
+  </div>;
+}
+
+function MiniBarChart({ rows = [] }) {
+  const safeRows = (Array.isArray(rows) ? rows : []).filter((row) => Number.isFinite(Number(row?.pnl)));
+  if (!safeRows.length) return <div className="noCandlesPanel">No monthly P&L data available.</div>;
+  const width = 760;
+  const height = 230;
+  const pad = 28;
+  const values = safeRows.map((row) => Number(row.pnl));
+  const maxAbs = Math.max(...values.map((value) => Math.abs(value)), 1);
+  const zeroY = height / 2;
+  const barStep = (width - pad * 2) / safeRows.length;
+  const barWidth = Math.max(10, barStep * 0.56);
+  return <div className="chartFrame dashboardChartFrame">
+    <svg className="dashboardChart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Monthly P&L">
+      <line className="gridLine" x1={pad} x2={width - pad} y1={zeroY} y2={zeroY} />
+      {safeRows.map((row, index) => {
+        const value = Number(row.pnl);
+        const barHeight = Math.abs(value) / maxAbs * (height / 2 - pad);
+        const x = pad + index * barStep + (barStep - barWidth) / 2;
+        const y = value >= 0 ? zeroY - barHeight : zeroY;
+        return <g key={`${row.month}-${index}`} className={value >= 0 ? "dashboardBarUp" : "dashboardBarDown"}>
+          <rect x={x} y={y} width={barWidth} height={Math.max(2, barHeight)} rx="3" />
+          <text className="chartLabel" x={x} y={height - 8}>{String(row.month || "").slice(2)}</text>
+        </g>;
+      })}
+    </svg>
+    <p className="chartMeta">Latest month: {money(safeRows[safeRows.length - 1]?.pnl)}</p>
+  </div>;
 }
 
 function normalizeCandles(candles) {
@@ -235,229 +301,15 @@ const boolTone = (value, safeWhenFalse = false) => {
 function SafetyMetric({ label, value, tone = "green" }) {
   return <div><span>{label}</span><strong>{val(value)}</strong>{tone && <Badge tone={tone}>{val(value)}</Badge>}</div>;
 }
-const paperUpdateProposalRows = (result) => {
-  const directKeys = ["results", "per_trade_results", "proposals", "trades"];
-  for (const key of directKeys) {
-    if (Array.isArray(result?.[key])) return result[key];
-  }
-  const details = result?.details;
-  for (const key of directKeys) {
-    if (Array.isArray(details?.[key])) return details[key];
-  }
-  return [];
-};
-const normalizeDryRunForApproval = (dryRunResult, progress, runs) => {
-  if (dryRunResult === null || typeof dryRunResult !== "object") return dryRunResult;
-  const runId = dryRunResult.run_id;
-  const runRows = Array.isArray(runs) ? runs : [];
-  const matchingProgress = runId && progress?.run_id === runId ? progress : null;
-  const matchingRun = runRows.find((run) => run?.run_id === runId) || null;
-  const fallback = matchingRun || matchingProgress || {};
-  return {
-    ...dryRunResult,
-    status: dryRunResult.status ?? fallback.status,
-    dry_run: dryRunResult.dry_run ?? fallback.dry_run,
-    mongo_writes_enabled: dryRunResult.mongo_writes_enabled ?? fallback.mongo_writes_enabled,
-    paper_only: dryRunResult.paper_only ?? fallback.paper_only,
-    live_trading: dryRunResult.live_trading ?? fallback.live_trading,
-    broker_orders: dryRunResult.broker_orders ?? fallback.broker_orders,
-    errors_count: dryRunResult.errors_count ?? fallback.errors_count,
-    blocked: dryRunResult.blocked ?? fallback.blocked,
-    proposed_write_count: dryRunResult.proposed_write_count ?? fallback.proposed_write_count,
-    max_trades: dryRunResult.max_trades ?? fallback.max_trades,
-    max_writes: dryRunResult.max_writes ?? fallback.max_writes,
-    finished_at: dryRunResult.finished_at ?? fallback.finished_at,
-  };
-};
-const paperUpdateChangedTradeIds = (result) => {
-  if (Array.isArray(result?.changed_trade_ids)) return result.changed_trade_ids;
-  if (Array.isArray(result?.details?.changed_trade_ids)) return result.details.changed_trade_ids;
-  return [];
-};
-const paperUpdateApprovalRejectionReason = (result) => (
-  result?.block_reason
-  || result?.rejection_code
-  || result?.code
-  || result?.details?.block_reason
-  || result?.details?.rejection_code
-  || result?.details?.reason
-  || result?.error
-  || result?.message
-  || "-"
-);
-function PaperUpdateDryRunWarnings({ result }) {
-  if (!result) return null;
-  const warnings = [];
-  const maxWrites = Number(result?.max_writes ?? 1);
-  const proposedWrites = Number(result?.proposed_write_count ?? 0);
-  const errorsCount = Number(result?.errors_count ?? (Array.isArray(result?.errors) ? result.errors.length : 0));
-  if (result?.mongo_writes_enabled !== false) warnings.push("UNSAFE: mongo_writes_enabled is not false during dry-run.");
-  if (result?.live_trading === true) warnings.push("UNSAFE: live_trading is true.");
-  if (result?.broker_orders === true) warnings.push("UNSAFE: broker_orders is true.");
-  if (proposedWrites > maxWrites) warnings.push(`Blocked warning: proposed_write_count ${proposedWrites} exceeds max_writes ${maxWrites}.`);
-  if (errorsCount > 0) warnings.push(`Error warning: dry-run reported ${errorsCount} error(s).`);
-  if (!warnings.length) return <div className="safeNotice">Dry-run safety flags are safe: no Mongo writes, no live trading, no broker orders.</div>;
-  return <div className="safetyWarningList">{warnings.map((warning) => <div key={warning}>{warning}</div>)}</div>;
-}
-function PaperUpdateDryRunResult({ result }) {
-  if (!result) return null;
-  const rows = paperUpdateProposalRows(result);
-  const summaryItems = [
-    ["processed", result?.processed],
-    ["proposed_write_count", result?.proposed_write_count],
-    ["updated_count", result?.updated_count],
-    ["errors_count", result?.errors_count],
-    ["blocked", boolLabel(result?.blocked)],
-    ["block_reason", result?.block_reason || "-"],
-    ["max_trades", result?.max_trades],
-    ["max_writes", result?.max_writes],
-    ["mongo_writes_enabled", boolLabel(result?.mongo_writes_enabled)],
-    ["paper_only", boolLabel(result?.paper_only)],
-    ["live_trading", boolLabel(result?.live_trading)],
-    ["broker_orders", boolLabel(result?.broker_orders)],
-  ];
-  const columns = ["symbol", "current status", "proposed status", "current outcome", "proposed outcome", "proposed P&L", "reason", "would_write", "write_attempted"];
-  return <div className="paperUpdateResultPanel">
-    <h3>Latest Manual Dry-Run Result</h3>
-    <PaperUpdateDryRunWarnings result={result} />
-    <div className="safetyGrid">
-      {summaryItems.map(([label, value]) => <SafetyMetric key={label} label={label} value={value ?? "-"} tone={label.includes("enabled") || label.includes("live") || label.includes("broker") ? boolTone(value === "true", true) : "gray"} />)}
-    </div>
-    <div className="tableShell results-table-wrap"><table><thead><tr>{columns.map((column) => <th key={column}>{column}</th>)}</tr></thead><tbody>
-      {rows.length ? rows.map((row, index) => {
-        const values = {
-          symbol: row?.symbol || row?.tradingview_symbol || row?.canonical_symbol || "-",
-          "current status": row?.previous_status ?? row?.current_status ?? row?.status,
-          "proposed status": row?.proposed_new_status ?? row?.proposed_status ?? row?.status,
-          "current outcome": row?.previous_outcome_status ?? row?.current_outcome_status ?? row?.outcome_status,
-          "proposed outcome": row?.proposed_new_outcome_status ?? row?.proposed_outcome_status ?? row?.outcome_status,
-          "proposed P&L": row?.proposed_pnl ?? row?.paper_pnl,
-          reason: row?.proposed_reason ?? row?.reason ?? row?.error_message,
-          would_write: boolLabel(row?.would_write),
-          write_attempted: boolLabel(row?.write_attempted),
-        };
-        return <tr key={`${values.symbol}-${index}`}>{columns.map((column) => (
-          <td key={column} className={column === "reason" ? "wideText" : ""}>{fmt(values[column])}</td>
-        ))}</tr>;
-      }) : <tr><td colSpan={columns.length}>No per-trade dry-run proposals returned.</td></tr>}
-    </tbody></table></div>
-  </div>;
-}
-function PaperUpdateApprovalResult({ result, error }) {
-  if (!result && !error) return null;
-  const rows = paperUpdateProposalRows(result);
-  const changedTradeIds = paperUpdateChangedTradeIds(result);
-  const rejectionReason = paperUpdateApprovalRejectionReason(result);
-  const summaryItems = [
-    ["approved_dry_run_id", result?.approved_dry_run_id],
-    ["real_run_id", result?.real_run_id ?? result?.run_id],
-    ["updated_count", result?.updated_count],
-    ["successful_updates_count", result?.successful_updates_count],
-    ["errors_count", result?.errors_count],
-    ["blocked", boolLabel(result?.blocked)],
-    ["block_reason / rejection code", rejectionReason],
-    ["paper_only", boolLabel(result?.paper_only)],
-    ["live_trading", boolLabel(result?.live_trading)],
-    ["broker_orders", boolLabel(result?.broker_orders)],
-  ];
-  const columns = ["trade_id", "symbol", "updated", "write_attempted", "status", "outcome_status", "applied_update", "error"];
-  return <div className="paperUpdateResultPanel">
-    <h3>Latest Approval Result</h3>
-    {error && <div className="safetyWarningList"><div>{error}</div></div>}
-    {result?.blocked && <div className="safetyWarningList"><div>Approval rejected: {rejectionReason}. Run a fresh dry-run before trying approval again.</div></div>}
-    {result && <div className="safetyGrid">
-      {summaryItems.map(([label, value]) => <SafetyMetric key={label} label={label} value={value ?? "-"} tone={label.includes("live") || label.includes("broker") ? boolTone(value === "true", true) : result?.blocked ? "yellow" : "gray"} />)}
-    </div>}
-    {result && <div className="approvalChangedIds">
-      <span>changed trade IDs</span>
-      <strong>{changedTradeIds.length ? changedTradeIds.join(", ") : "-"}</strong>
-    </div>}
-    {result && <div className="tableShell results-table-wrap"><table><thead><tr>{columns.map((column) => <th key={column}>{column}</th>)}</tr></thead><tbody>
-      {rows.length ? rows.map((row, index) => {
-        const values = {
-          trade_id: row?.trade_id ?? row?.id ?? "-",
-          symbol: row?.symbol || row?.tradingview_symbol || row?.canonical_symbol || "-",
-          updated: boolLabel(row?.updated),
-          write_attempted: boolLabel(row?.write_attempted),
-          status: row?.status ?? row?.applied_update?.status ?? row?.proposed_new_status ?? row?.proposed_status,
-          outcome_status: row?.outcome_status ?? row?.applied_update?.outcome_status ?? row?.proposed_new_outcome_status ?? row?.proposed_outcome_status,
-          applied_update: row?.applied_update ?? row?.proposed_update,
-          error: row?.error || row?.error_message || row?.reason || row?.proposed_reason,
-        };
-        return <tr key={`${values.trade_id}-${values.symbol}-${index}`}>{columns.map((column) => (
-          <td key={column} className={column === "applied_update" || column === "error" ? "wideText" : ""}>{fmt(values[column])}</td>
-        ))}</tr>;
-      }) : <tr><td colSpan={columns.length}>No per-trade approval results returned.</td></tr>}
-    </tbody></table></div>}
-  </div>;
-}
-function PaperUpdateApprovalPanel({
-  approvalDryRun,
-  lockStatus,
-  schedulerStatus,
-  confirmationText,
-  onConfirmationTextChange,
-  onApprove,
-  approvalLoading,
-  approvalResult,
-  approvalError,
-  actionDisabled,
-}) {
-  const gate = useMemo(() => canApprovePaperRealUpdate({
-    latestDryRun: approvalDryRun,
-    lockStatus,
-    schedulerStatus,
-  }), [approvalDryRun, lockStatus, schedulerStatus]);
-  const confirmationMatches = confirmationText === PAPER_UPDATE_APPROVAL_CONFIRMATION_TEXT;
-  const canApprove = gate.allowed && confirmationMatches;
-  const handleConfirmationKeyDown = (event) => {
-    if (event.key === "Enter") event.preventDefault();
-  };
-  return <div className="approvalPanel">
-    <div className="approvalHeader">
-      <div><span>manual bound approval</span><h3>Approve One Paper Update</h3></div>
-      <Badge tone={gate.allowed ? "green" : "yellow"}>{gate.allowed ? "gate passed" : "gate blocked"}</Badge>
-    </div>
-    <p className="muted">This button can only call the backend approval binding for the latest approved dry-run ID. It does not call unbound real update paths.</p>
-    {gate.reasons.length ? <div className="safetyWarningList">{gate.reasons.map((reason) => <div key={reason}>{reason}</div>)}</div> : <div className="safeNotice">Approval gate passed. Exact typed confirmation is still required.</div>}
-    <label className="approvalConfirmLabel">
-      <span>Type this exact confirmation before approval:</span>
-      <code>{PAPER_UPDATE_APPROVAL_CONFIRMATION_TEXT}</code>
-      <textarea
-        rows={2}
-        value={confirmationText}
-        onChange={(event) => onConfirmationTextChange(event.target.value)}
-        onKeyDown={handleConfirmationKeyDown}
-        placeholder={PAPER_UPDATE_APPROVAL_CONFIRMATION_TEXT}
-        spellCheck="false"
-      />
-    </label>
-    {!confirmationMatches && <p className="approvalHint">Approval stays disabled until the confirmation text matches exactly. Pressing Enter in this box is ignored; approval requires a click.</p>}
-    <ActionButton onClick={onApprove} disabled={actionDisabled || approvalLoading || !canApprove}>Approve One Paper Update</ActionButton>
-    <PaperUpdateApprovalResult result={approvalResult} error={approvalError} />
-  </div>;
-}
-function PaperUpdateSafety({
+function PaperAutomationStatus({
   progress,
   schedulerStatus,
   lockStatus,
-  dryRunResult,
-  updateRuns,
-  onRunDryRun,
-  dryRunLoading,
-  onApproveDryRun,
-  approvalLoading,
-  approvalText,
-  onApprovalTextChange,
-  approvalResult,
-  approvalError,
-  actionDisabled,
 }) {
   const lock = lockStatus || schedulerStatus?.lock || {};
   const schedulerEnabled = schedulerStatus?.enabled;
   const schedulerRunning = schedulerStatus?.scheduler_running;
   const autoEnabled = schedulerStatus?.automatic_updates_enabled;
-  const approvalDryRun = normalizeDryRunForApproval(dryRunResult, progress, updateRuns);
   const schedulerWarnings = [
     schedulerStatus?.unsafe_warning,
     schedulerStatus?.emergency_warning && schedulerStatus?.emergency_warning !== schedulerStatus?.unsafe_warning
@@ -465,11 +317,7 @@ function PaperUpdateSafety({
       : null,
   ].filter(Boolean);
   const unsafeReasons = Array.isArray(schedulerStatus?.unsafe_reasons) ? schedulerStatus.unsafe_reasons : [];
-  return <Card title="Paper Update Safety / Automation Status" eyebrow="read-only">
-    <div className="safetyActions">
-      <ActionButton onClick={onRunDryRun} disabled={actionDisabled || dryRunLoading}>{dryRunLoading ? "Running Paper Update Dry-Run..." : "Run Paper Update Dry-Run"}</ActionButton>
-      <p className="muted">Dry-run only. It evaluates existing paper trades and must not write to MongoDB, place orders, run scans, scoring, market loading, pipeline generation, or TV confirmation.</p>
-    </div>
+  return <Card title="Paper Automation Status" eyebrow="read-only scheduler">
     {schedulerWarnings.length ? <div className="safetyWarningList">{schedulerWarnings.map((warning) => <div key={warning}>{warning}</div>)}</div> : null}
     {unsafeReasons.length ? <div className="safetyWarningList">{unsafeReasons.map((reason) => <div key={reason}>Unsafe scheduler config: {reason}</div>)}</div> : null}
     <div className="safetyGrid">
@@ -500,19 +348,6 @@ function PaperUpdateSafety({
       <SafetyMetric label="live_trading" value={boolLabel(schedulerStatus?.live_trading ?? progress?.live_trading)} tone={boolTone(schedulerStatus?.live_trading ?? progress?.live_trading, true)} />
       <SafetyMetric label="broker_orders" value={boolLabel(schedulerStatus?.broker_orders ?? progress?.broker_orders)} tone={boolTone(schedulerStatus?.broker_orders ?? progress?.broker_orders, true)} />
     </div>
-    <PaperUpdateDryRunResult result={dryRunResult} />
-    <PaperUpdateApprovalPanel
-      approvalDryRun={approvalDryRun}
-      lockStatus={lockStatus}
-      schedulerStatus={schedulerStatus}
-      confirmationText={approvalText}
-      onConfirmationTextChange={onApprovalTextChange}
-      onApprove={onApproveDryRun}
-      approvalLoading={approvalLoading}
-      approvalResult={approvalResult}
-      approvalError={approvalError}
-      actionDisabled={actionDisabled}
-    />
   </Card>;
 }
 function PaperUpdateRunHistory({ runs = [] }) {
@@ -627,11 +462,106 @@ function AiDatasetSummary({ summary, snapshots, outcomePreview, collectionStatus
   </Card>;
 }
 
+function DashboardHealthPanel({ health, tradingViewStatus, schedulerStatus }) {
+  const tvBadge = tradingViewBadge(tradingViewStatus);
+  const schedulerBlocked = schedulerStatus?.blocked || schedulerStatus?.unsafe_warning || schedulerStatus?.last_block_reason;
+  return <Card title="Scheduler and TradingView Health" eyebrow="automatic status">
+    <div className="safetyGrid">
+      <div><span>Backend</span><strong>{health?.status || "unknown"}</strong><Badge tone={health?.online ? "green" : "red"}>{health?.online ? "online" : "offline"}</Badge></div>
+      <div><span>TradingView</span><strong>{tvBadge.label.replace("TradingView ", "")}</strong><Badge tone={tvBadge.tone}>{tradingViewStatus?.connected ? "connected" : "not connected"}</Badge></div>
+      <div><span>TV Worker</span><strong>{tradingViewStatus?.worker_running ? "Busy" : "Idle"}</strong><Badge tone={tradingViewStatus?.worker_running ? "yellow" : "green"}>{tradingViewStatus?.worker_running ? "running" : "clear"}</Badge></div>
+      <div><span>Scheduler</span><strong>{schedulerStatus?.scheduler_running ? "Running" : "Idle"}</strong><Badge tone={schedulerBlocked ? "yellow" : "green"}>{schedulerBlocked ? "blocked" : "safe"}</Badge></div>
+      <div><span>Next Run</span><strong>{schedulerStatus?.next_run_at || "disabled"}</strong><Badge tone={schedulerStatus?.next_run_at ? "yellow" : "gray"}>{schedulerStatus?.mode || "dry-run"}</Badge></div>
+      <div><span>Latest Run</span><strong>{schedulerStatus?.last_run_status || "-"}</strong><Badge tone={statusTone(schedulerStatus?.last_run_status)}>{schedulerStatus?.last_run_id || "-"}</Badge></div>
+    </div>
+  </Card>;
+}
+
+function DashboardPortfolio({ data }) {
+  const statusCounts = data?.status_counts || {};
+  const numberField = (key) => Number.isFinite(Number(data?.[key])) ? Number(data[key]) : 0;
+  const countField = (key) => Number.isFinite(Number(statusCounts?.[key])) ? Number(statusCounts[key]) : 0;
+  const rowNumber = (row, key) => Number.isFinite(Number(row?.[key])) ? Number(row[key]) : 0;
+  const strategyRows = Array.isArray(data?.strategy_comparison_rows) ? data.strategy_comparison_rows : [];
+  const monthlyRows = Array.isArray(data?.monthly_pnl_rows) ? data.monthly_pnl_rows : [];
+  const completedRows = Array.isArray(data?.recent_completed_trades) ? data.recent_completed_trades : [];
+  const exposureRows = Array.isArray(data?.open_position_exposure) ? data.open_position_exposure : [];
+  const comparisonRows = strategyRows.map((row) => ({
+    Strategy: row.strategy || "",
+    Trades: rowNumber(row, "total_trades"),
+    "Win %": pct(rowNumber(row, "win_rate")),
+    "Profit Factor": rowNumber(row, "profit_factor"),
+    "Average RR": rowNumber(row, "average_rr"),
+  }));
+  const recentRows = completedRows.map((row) => ({
+    Symbol: row.symbol || "",
+    Strategy: row.strategy || "",
+    "Exit Date": row.exit_date || "",
+    Reason: row.exit_reason || "",
+    "Realized P&L": money(rowNumber(row, "realized_pnl")),
+    "Profit %": pct(rowNumber(row, "profit_percent")),
+    RR: rowNumber(row, "RR"),
+  }));
+  const openRows = exposureRows.map((row) => ({
+    Symbol: row.symbol || "",
+    Strategy: row.strategy || "",
+    Status: row.status || "",
+    Entry: rowNumber(row, "entry_price"),
+    Qty: rowNumber(row, "quantity_remaining"),
+    Exposure: money(rowNumber(row, "effective_exposure")),
+    Margin: money(rowNumber(row, "margin_used")),
+    "Broker Funded": money(rowNumber(row, "broker_funded")),
+    "Available After": money(rowNumber(row, "available_margin_after_trade")),
+    "Unrealized P&L": money(rowNumber(row, "unrealized_pnl")),
+  }));
+  return <>
+    <div className="statsGrid dashboardPortfolioGrid">
+      <StatCard label="Starting Balance" value={money(numberField("starting_virtual_balance"))} />
+      <StatCard label="Current Virtual Balance" value={money(numberField("current_virtual_balance"))} />
+      <StatCard label="Open Margin Used" value={money(numberField("open_margin_used"))} tone="yellow" />
+      <StatCard label="Available Margin" value={money(numberField("available_margin"))} />
+      <StatCard label="Maximum Buying Power" value={money(numberField("max_buying_power"))} />
+      <StatCard label="Available Buying Power" value={money(numberField("available_buying_power"))} />
+      <StatCard label="Effective Exposure" value={money(numberField("effective_exposure"))} tone="yellow" />
+      <StatCard label="Broker Funded Amount" value={money(numberField("broker_funded"))} tone="yellow" />
+      <StatCard label="Buying Power Usage %" value={pct(numberField("buying_power_usage_percent"))} tone="yellow" />
+      <StatCard label="Realized P&L" value={money(numberField("realized_pnl"))} />
+      <StatCard label="Unrealized P&L" value={money(numberField("unrealized_pnl"))} tone="yellow" />
+      <StatCard label="Total P&L" value={money(numberField("total_pnl"))} />
+      <StatCard label="Virtual Return %" value={pct(numberField("virtual_return_percent"))} />
+      <StatCard label="Drawdown" value={pct(numberField("drawdown_percent"))} tone={numberField("drawdown_percent") > 0 ? "red" : "green"} />
+      <StatCard label="Win Rate" value={pct(numberField("win_rate_percent"))} tone="yellow" />
+      <StatCard label="Profit Factor" value={fmt(numberField("profit_factor"))} />
+      <StatCard label="Average RR" value={fmt(numberField("average_rr"))} />
+      <StatCard label="Waiting" value={countField("waiting")} />
+      <StatCard label="Active" value={countField("active")} />
+      <StatCard label="Partial" value={countField("partial")} tone="yellow" />
+      <StatCard label="Completed" value={countField("completed")} />
+      <StatCard label="SL Hit" value={countField("sl_hit")} tone="red" />
+      <StatCard label="Ambiguous" value={countField("ambiguous")} tone="yellow" />
+    </div>
+    <div className="twoGrid">
+      <Card title="Equity Curve" eyebrow="trade_journal"><MiniLineChart points={data?.equity_curve} /></Card>
+      <Card title="Monthly P&L" eyebrow="trade_journal"><MiniBarChart rows={monthlyRows} /></Card>
+    </div>
+    <div className="twoGrid">
+      <Card title="Swing vs Momentum" eyebrow="completed performance"><MiniTable rows={comparisonRows} columns={["Strategy", "Trades", "Win %", "Profit Factor", "Average RR"]} /></Card>
+      <Card title="Recent Completed Trades" eyebrow="trade_journal"><MiniTable rows={recentRows} columns={["Symbol", "Strategy", "Exit Date", "Reason", "Realized P&L", "Profit %", "RR"]} /></Card>
+    </div>
+    <Card title="Open-Position Exposure" eyebrow="paper_trades">
+      <MiniTable rows={openRows} columns={["Symbol", "Strategy", "Status", "Entry", "Qty", "Exposure", "Margin", "Broker Funded", "Available After", "Unrealized P&L"]} />
+    </Card>
+  </>;
+}
+
 function Dashboard({
   summary,
   scoreSummary,
   swingSummary,
   momentumSummary,
+  dashboardEquity,
+  health,
+  tvRuntimeStatus,
   aiDatasetSummary,
   aiFeatureSnapshots,
   aiOutcomePreview,
@@ -641,21 +571,12 @@ function Dashboard({
   paperUpdateRuns,
   paperUpdateLock,
   paperUpdateScheduler,
-  paperUpdateDryRunResult,
-  paperUpdateApprovalText,
-  paperUpdateApprovalResult,
-  paperUpdateApprovalError,
   onSummary,
   onDryRun,
   onSaveRun,
-  onPaperUpdateDryRun,
-  onPaperUpdateApprove,
-  onPaperUpdateApprovalTextChange,
   onAiDatasetFiltersChange,
   onAiDatasetRefresh,
   aiDatasetLoading,
-  paperUpdateDryRunLoading,
-  paperUpdateApprovalLoading,
   loading,
 }) {
   return <div className="pageStack">
@@ -664,35 +585,26 @@ function Dashboard({
       <div className="heroActions"><ActionButton onClick={onSummary} disabled={loading}>Load Summary</ActionButton><ActionButton onClick={onDryRun} disabled={loading}>Pipeline Dry Run</ActionButton><ActionButton onClick={onSaveRun} disabled={loading}>Save Paper Run</ActionButton></div>
     </section>
     <div className="warningText">Save mode updates PAPER records only. No broker orders. No live trading.</div>
+    <DashboardPortfolio data={dashboardEquity} />
+    <DashboardHealthPanel health={health} tradingViewStatus={tvRuntimeStatus} schedulerStatus={paperUpdateScheduler} />
     <div className="statsGrid">
-      <StatCard label="Total Paper Trades" value={summary?.total_trades ?? "--"} />
-      <StatCard label="Open Trades" value={summary?.open_trades ?? "--"} />
-      <StatCard label="Closed Trades" value={summary?.closed_trades ?? "--"} tone="yellow" />
-      <StatCard label="Total Paper P&L" value={summary?.total_paper_pnl ?? "--"} />
-      <StatCard label="Win Rate" value={summary?.win_rate_percent ?? "--"} tone="yellow" />
-      <StatCard label="Active Symbols" value={Array.isArray(summary?.symbols) ? summary.symbols.length : "--"} />
+      <StatCard label="Total Paper Trades" value={summary?.total_trades ?? 0} />
+      <StatCard label="Open Trades" value={summary?.open_trades ?? 0} />
+      <StatCard label="Closed Trades" value={summary?.closed_trades ?? 0} tone="yellow" />
+      <StatCard label="Total Paper P&L" value={summary?.total_paper_pnl ?? 0} />
+      <StatCard label="Win Rate" value={summary?.win_rate_percent ?? 0} tone="yellow" />
+      <StatCard label="Active Symbols" value={Array.isArray(summary?.symbols) ? summary.symbols.length : 0} />
     </div>
     <div className="statsGrid compact">
-      <StatCard label="Scored Rows" value={scoreSummary?.total_scored ?? "--"} />
-      <StatCard label="Swing Candidates" value={swingSummary?.swing_candidates_count ?? scoreSummary?.swing_candidates_count ?? "--"} tone="yellow" />
-      <StatCard label="Momentum Candidates" value={momentumSummary?.momentum_candidates_count ?? scoreSummary?.momentum_candidates_count ?? "--"} />
+      <StatCard label="Scored Rows" value={scoreSummary?.total_scored ?? 0} />
+      <StatCard label="Swing Candidates" value={swingSummary?.swing_candidates_count ?? scoreSummary?.swing_candidates_count ?? 0} tone="yellow" />
+      <StatCard label="Momentum Candidates" value={momentumSummary?.momentum_candidates_count ?? scoreSummary?.momentum_candidates_count ?? 0} />
     </div>
     <AiDatasetSummary summary={aiDatasetSummary} snapshots={aiFeatureSnapshots} outcomePreview={aiOutcomePreview} collectionStatus={aiDataCollectionStatus} filters={aiDatasetFilters} onFiltersChange={onAiDatasetFiltersChange} onRefresh={onAiDatasetRefresh} loading={aiDatasetLoading} />
-    <PaperUpdateSafety
+    <PaperAutomationStatus
       progress={paperUpdateProgress}
       schedulerStatus={paperUpdateScheduler}
       lockStatus={paperUpdateLock}
-      dryRunResult={paperUpdateDryRunResult}
-      updateRuns={paperUpdateRuns}
-      onRunDryRun={onPaperUpdateDryRun}
-      dryRunLoading={paperUpdateDryRunLoading}
-      onApproveDryRun={onPaperUpdateApprove}
-      approvalLoading={paperUpdateApprovalLoading}
-      approvalText={paperUpdateApprovalText}
-      onApprovalTextChange={onPaperUpdateApprovalTextChange}
-      approvalResult={paperUpdateApprovalResult}
-      approvalError={paperUpdateApprovalError}
-      actionDisabled={loading}
     />
     <PaperUpdateRunHistory runs={paperUpdateRuns} />
     <div className="threeGrid">
@@ -713,19 +625,12 @@ const SCAN_SCORE_WARNING = "Market data updated. Please run Score Market Data be
 const SCORE_REFRESH_MESSAGE = "Score Market Data completed. Now load Swing/Momentum candidates.";
 const MOMENTUM_SCORE_STALE_MESSAGE = "Market data is newer than scored candidates. Rerun Score Market Data before Momentum TV Confirm.";
 const TRADINGVIEW_ERROR_HINT = "If this is a TradingView connection issue, make sure TradingView Desktop/debug access and the backend on 127.0.0.1:8011 are running.";
-const PAPER_UPDATE_DRY_RUN_CONFIRM = [
-  "Run Paper Update Dry-Run?",
-  "",
-  "This calls dry_run=true only.",
-  "It will not write to paper_trades or MongoDB.",
-  "It will not place broker/live orders.",
-  "It will not run scan, scoring, market loading, paper pipeline generation, or TradingView confirmation endpoints.",
-].join("\n");
-const PAPER_UPDATE_APPROVAL_CONFIRMATION_TEXT = "I understand this will write to paper_trades only and will not place broker orders";
-const PAPER_UPDATE_APPROVAL_MAX_TRADES = 6;
-const PAPER_UPDATE_APPROVAL_MAX_WRITES = 1;
+const DASHBOARD_REFRESH_MS = 30000;
+const GLOBAL_HEALTH_REFRESH_MS = 30000;
+const BATCH_TV_RUNTIME_REFRESH_MS = 2000;
 
 function formatActionError(err, actionName = "request") {
+  if (isRequestCancellation(err)) return "";
   const status = err?.status ? `HTTP ${err.status}` : "HTTP status unavailable";
   const message = err?.message || String(err);
   const body = err?.responseBody ? JSON.stringify(err.responseBody, null, 2) : err?.rawBody || "";
@@ -773,8 +678,8 @@ function firstRow(data) {
 
 const SWING_MTF_TIMEFRAMES = "1W,1D,4H,1H";
 const MOMENTUM_MTF_TIMEFRAMES = "1D,4H,1H";
-const SWING_TV_BATCH_SIZE = 10;
-const MOMENTUM_TV_BATCH_SIZE = 10;
+const SWING_TV_BATCH_SIZE = 1;
+const MOMENTUM_TV_BATCH_SIZE = 1;
 const SWING_CONFIRMED_STATUSES = new Set(["CONFIRMED_SIGNAL"]);
 const SWING_WAIT_WATCH_STATUSES = new Set(["WAIT_FOR_RETEST", "WATCH_FOR_PULLBACK", "WATCH_FOR_BREAKOUT"]);
 const MOMENTUM_CONFIRMED_STATUSES = new Set(["MOMENTUM_CONFIRMED"]);
@@ -1733,16 +1638,240 @@ function StockDetailPage({
   </div>;
 }
 
-function PaperTrades({ signals, plans, activeTrades, allTrades, onSignals, onPlans, onActive, onAll, onUpdate, loading }) {
+const PAPER_TRADES_REFRESH_MS = 60000;
+const PAPER_TABLE_COLUMNS = [
+  { key: "symbol", label: "Symbol" },
+  { key: "strategy", label: "Strategy", type: "strategy" },
+  { key: "status", label: "Status", type: "status" },
+  { key: "entry", label: "Entry" },
+  { key: "current_price", label: "Current Price" },
+  { key: "stop_loss", label: "Stop Loss" },
+  { key: "target_1", label: "T1" },
+  { key: "target_2", label: "T2" },
+  { key: "target_3", label: "T3" },
+  { key: "pnl", label: "P&L", type: "pnl" },
+  { key: "setup_time", label: "Setup Time" },
+];
+const PAPER_TRADE_FILTERS = [
+  { key: "waiting", label: "Waiting for Entry", groups: new Set(["waiting"]) },
+  { key: "active", label: "Active Trades", groups: new Set(["active"]) },
+  { key: "completed", label: "Completed / Stopped", groups: new Set(["completed", "stopped", "ambiguous"]) },
+  { key: "all", label: "All Trades", groups: null },
+];
+const PAPER_WAITING_STATUSES = new Set(["PLANNED", "NOT_TRIGGERED", "WAITING", "WAITING_FOR_ENTRY"]);
+const PAPER_PARTIAL_STATUSES = new Set(["T1_PARTIAL", "T2_PARTIAL"]);
+const PAPER_ACTIVE_STATUSES = new Set(["ACTIVE"]);
+const PAPER_COMPLETED_STATUSES = new Set(["T3_HIT", "TARGET_3_HIT", "COMPLETED", "CLOSED", "TARGET_HIT", "TARGET_1_HIT_FINAL", "TARGET_2_HIT", "T1_HIT", "T2_HIT", "WON_T1", "WON_T2", "WON_T3"]);
+const PAPER_STOPPED_STATUSES = new Set(["SL_HIT", "STOPPED", "STOP_HIT", "STOPPED_AFTER_T1", "LOST_SL"]);
+const PAPER_AMBIGUOUS_STATUSES = new Set(["AMBIGUOUS"]);
+
+function paperTradeIdentity(trade, fallback = 0) {
+  return trade?.paper_trade_id || trade?.trade_id || trade?.setup_id || trade?._id || `${trade?.symbol || "trade"}-${fallback}`;
+}
+function dedupePaperTrades(rows) {
+  const seen = new Set();
+  return (Array.isArray(rows) ? rows : []).filter((trade, index) => {
+    const key = paperTradeIdentity(trade, index);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+function paperStrategyText(trade) {
+  const raw = trade?.strategy || trade?.source_signal_type || trade?.strategy_type || trade?.source || "";
+  const text = String(raw).toUpperCase();
+  if (text.includes("MOMENTUM")) return "Momentum";
+  if (text.includes("SWING")) return "Swing";
+  return raw ? String(raw).replace(/_/g, " ") : "Other";
+}
+function paperStrategyTone(trade) {
+  const text = paperStrategyText(trade).toUpperCase();
+  if (text.includes("MOMENTUM")) return "yellow";
+  if (text.includes("SWING")) return "green";
+  return "gray";
+}
+function normalizePaperStatus(value) {
+  return String(value || "").trim().toUpperCase().replace(/[\s-]+/g, "_");
+}
+function paperStatusSet(trade) {
+  return new Set([trade?.status, trade?.outcome_status, trade?.ui_status].map(normalizePaperStatus).filter(Boolean));
+}
+function hasAnyPaperStatus(statuses, candidates) {
+  for (const status of candidates) {
+    if (statuses.has(status)) return true;
+  }
+  return false;
+}
+function paperDisplayStatus(trade) {
+  const statuses = paperStatusSet(trade);
+  if (hasAnyPaperStatus(statuses, PAPER_WAITING_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_ACTIVE_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_PARTIAL_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_COMPLETED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_STOPPED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_AMBIGUOUS_STATUSES)) return "Waiting for Entry";
+  if (hasAnyPaperStatus(statuses, PAPER_PARTIAL_STATUSES)) return "Partial";
+  if (hasAnyPaperStatus(statuses, PAPER_COMPLETED_STATUSES)) return "Completed";
+  if (hasAnyPaperStatus(statuses, PAPER_STOPPED_STATUSES)) return "Stopped";
+  if (hasAnyPaperStatus(statuses, PAPER_AMBIGUOUS_STATUSES)) return "Ambiguous";
+  if (hasAnyPaperStatus(statuses, PAPER_ACTIVE_STATUSES)) return "Active";
+  return trade?.ui_status || trade?.status || trade?.outcome_status || "-";
+}
+function paperStatusToneFromLabel(status) {
+  const label = String(status || "").toLowerCase();
+  if (label.includes("stopped") || label.includes("sl")) return "red";
+  if (label.includes("waiting") || label.includes("partial") || label.includes("ambiguous")) return "yellow";
+  if (label.includes("active") || label.includes("completed")) return "green";
+  return "gray";
+}
+function paperTradeMatchesFilters(trade, searchText, strategyFilter) {
+  const strategy = paperStrategyText(trade);
+  const searchable = [
+    trade?.symbol,
+    trade?.tradingview_symbol,
+    trade?.source_signal_type,
+    trade?.strategy_type,
+    trade?.status,
+    trade?.ui_status,
+    trade?.outcome_status,
+    trade?.setup_id,
+    paperDisplayStatus(trade),
+  ].join(" ").toLowerCase();
+  const cleanSearch = searchText.trim().toLowerCase();
+  const searchMatch = !cleanSearch || searchable.includes(cleanSearch);
+  const strategyMatch = strategyFilter === "ALL" || strategy.toUpperCase().includes(strategyFilter);
+  return searchMatch && strategyMatch;
+}
+function paperCellValue(row, column) {
+  if (column.key === "strategy") return paperStrategyText(row);
+  if (column.key === "status") return paperDisplayStatus(row);
+  if (column.key === "entry") return row?.entry_price ?? row?.entry;
+  if (column.key === "current_price") return row?.current_price ?? row?.latest_close;
+  if (column.key === "stop_loss") return row?.current_stop_loss ?? row?.current_sl ?? row?.stop_loss ?? row?.sl;
+  if (column.key === "target_1") return row?.target_1 ?? row?.t1;
+  if (column.key === "target_2") return row?.target_2 ?? row?.t2;
+  if (column.key === "target_3") return row?.target_3 ?? row?.t3;
+  if (column.key === "pnl") return row?.paper_pnl ?? row?.pnl;
+  if (column.key === "setup_time") return row?.setup_time ?? row?.created_at ?? row?.source_confirmation_created_at;
+  return row?.[column.key];
+}
+function paperPnlClass(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric === 0) return "neutral";
+  return numeric > 0 ? "positive" : "negative";
+}
+function withPaperGroup(rows, group) {
+  return (Array.isArray(rows) ? rows : []).map((trade) => ({ ...trade, paper_group: group }));
+}
+function PaperTradeTable({ rows, loading, emptyMessage }) {
+  const safeRows = Array.isArray(rows) ? rows : [];
+  return <div className="tableShell results-table-wrap paperTableShell"><table className="paperCompactTable"><thead><tr>{PAPER_TABLE_COLUMNS.map((column) => <th key={column.key}>{column.label}</th>)}</tr></thead><tbody>
+    {loading ? <tr><td colSpan={PAPER_TABLE_COLUMNS.length}>Loading paper trades...</td></tr> : safeRows.length ? safeRows.map((row, index) => <tr key={paperTradeIdentity(row, index)}>{PAPER_TABLE_COLUMNS.map((column) => {
+      const value = paperCellValue(row, column);
+      if (column.type === "strategy") return <td key={column.key}><Badge tone={paperStrategyTone(row)}>{paperStrategyText(row)}</Badge></td>;
+      if (column.type === "status") return <td key={column.key}><Badge tone={paperStatusToneFromLabel(value)}>{val(value)}</Badge></td>;
+      if (column.type === "pnl") return <td key={column.key}><span className={`paperPnl ${paperPnlClass(value)}`}>{fmt(value)}</span></td>;
+      return <td key={column.key}>{fmt(value)}</td>;
+    })}</tr>) : <tr><td colSpan={PAPER_TABLE_COLUMNS.length}>{emptyMessage}</td></tr>}
+  </tbody></table></div>;
+}
+
+function PaperTrades({ openTrades, history, summary, liveStatus }) {
+  const [paperSearch, setPaperSearch] = useState("");
+  const [strategyFilter, setStrategyFilter] = useState("ALL");
+  const [activeTradeFilter, setActiveTradeFilter] = useState("waiting");
+  const waitingTrades = withPaperGroup(arr(openTrades, ["waiting_for_entry"]), "waiting");
+  const activeTrades = withPaperGroup(arr(openTrades, ["active_partial"]), "active");
+  const completedTrades = withPaperGroup(arr(history, ["completed"]), "completed");
+  const stoppedTrades = withPaperGroup(arr(history, ["sl_hit"]), "stopped");
+  const ambiguousTrades = withPaperGroup(arr(history, ["ambiguous"]), "ambiguous");
+  const allRows = dedupePaperTrades([...waitingTrades, ...activeTrades, ...completedTrades, ...stoppedTrades, ...ambiguousTrades]);
+  const selectedFilter = PAPER_TRADE_FILTERS.find((filter) => filter.key === activeTradeFilter) || PAPER_TRADE_FILTERS[0];
+  const tabRows = selectedFilter.groups ? allRows.filter((trade) => selectedFilter.groups.has(trade.paper_group)) : allRows;
+  const filteredRows = tabRows.filter((trade) => paperTradeMatchesFilters(trade, paperSearch, strategyFilter));
+  const initialLoading = liveStatus?.running && !liveStatus?.hasLoaded;
+  const emptyMessage = liveStatus?.hasLoaded ? "No paper trades match the current filters." : "No paper trades loaded yet.";
+  const waitingCount = summary?.waiting_for_entry ?? summary?.waiting_trades ?? openTrades?.waiting_count ?? waitingTrades.length;
+  const activeCount = summary?.open_trades ?? openTrades?.active_partial_count ?? activeTrades.length;
+  const targetHitCount = summary?.target_hit_count ?? completedTrades.length;
+  const slHitCount = summary?.sl_hit_count ?? history?.sl_hit_count ?? stoppedTrades.length;
+  const ambiguousCount = summary?.ambiguous_count ?? history?.ambiguous_count ?? ambiguousTrades.length;
   return <div className="pageStack">
-    <div className="buttonRow"><ActionButton onClick={onSignals} disabled={loading}>Load Paper Signals</ActionButton><ActionButton onClick={onPlans} disabled={loading}>Load Paper Plans</ActionButton><ActionButton onClick={onActive} disabled={loading}>Load Active Trades</ActionButton><ActionButton onClick={onAll} disabled={loading}>Load All Trades</ActionButton><ActionButton onClick={onUpdate} disabled={loading}>Update Paper Trades</ActionButton></div>
-    <div className="paperTabs"><Badge tone="green">Signals</Badge><Badge tone="yellow">Plans</Badge><Badge tone="green">Active</Badge><Badge tone="red">Stopped</Badge></div>
-    <div className="twoGrid"><Card title="Paper Signals"><MiniTable rows={signals} columns={["symbol", "status", "entry", "sl", "t1", "rr", "next_action"]} /></Card><Card title="Paper Plans"><MiniTable rows={plans} columns={["symbol", "source_signal_type", "status", "entry_price", "stop_loss", "target_1", "target_2", "target_3", "risk_reward_1", "next_action_for_paper_trade"]} /></Card><Card title="Active Trades"><MiniTable rows={activeTrades} columns={["symbol", "source_signal_type", "status", "paper_pnl"]} /></Card><Card title="All Trades"><MiniTable rows={allTrades} columns={["symbol", "source_signal_type", "status", "paper_pnl"]} /></Card></div>
+    {liveStatus?.error && <div className="errorPanel paperInlineState">{liveStatus.error}</div>}
+    <div className="statsGrid compact">
+      <StatCard label="Waiting for Entry" value={waitingCount} tone="yellow" />
+      <StatCard label="Active" value={activeCount} />
+      <StatCard label="Target Hit" value={targetHitCount} />
+      <StatCard label="SL Hit" value={slHitCount} tone="red" />
+      <StatCard label="Ambiguous" value={ambiguousCount} tone="yellow" />
+    </div>
+    <div className="paperTradeToolbar">
+      <input value={paperSearch} onChange={(event) => setPaperSearch(event.target.value)} placeholder="Search by symbol" />
+      <select value={strategyFilter} onChange={(event) => setStrategyFilter(event.target.value)}>
+        <option value="ALL">All strategies</option>
+        <option value="SWING">Swing</option>
+        <option value="MOMENTUM">Momentum</option>
+      </select>
+    </div>
+    <div className="paperFilterButtons" role="group" aria-label="Paper trade status filter">
+      {PAPER_TRADE_FILTERS.map((filter) => (
+        <button
+          key={filter.key}
+          type="button"
+          className={`paperStateButton ${activeTradeFilter === filter.key ? "active" : ""}`}
+          onClick={() => setActiveTradeFilter(filter.key)}
+        >
+          {filter.label}
+        </button>
+      ))}
+    </div>
+    <Card title="Paper Trades" eyebrow="automatic open/history feed" className="paperTableCard">
+      <div className="paperTableMeta">
+        <span>{filteredRows.length} of {tabRows.length} shown</span>
+        <Badge tone={selectedFilter.key === "completed" ? "yellow" : selectedFilter.key === "active" ? "green" : "gray"}>{selectedFilter.label}</Badge>
+      </div>
+      <PaperTradeTable rows={filteredRows} loading={initialLoading} emptyMessage={emptyMessage} />
+    </Card>
   </div>;
 }
 
-function Settings({ settings, health }) {
-  return <div className="settingsPage"><Card title="Safety Locks" eyebrow="read-only"><div className="settingsGrid"><div><span>paper_only</span><strong>true</strong></div><div><span>live_trading</span><strong>false</strong></div><div><span>broker_orders</span><strong>false</strong></div><div><span>yfinance_for_tv_candles</span><strong>false</strong></div></div></Card><Card title="API Status" eyebrow="local backend"><div className="settingsGrid"><div><span>backend</span><strong>{health.status}</strong></div><div><span>API base</span><strong>{API_BASE}</strong></div><div><span>TradingView port</span><strong>{settings?.tradingview_debug_port ?? 9222}</strong></div><div><span>data source</span><strong>TradingView Desktop CDP</strong></div></div></Card><Card title="TradingView Desktop Reminder"><p className="muted">Keep Chrome or TradingView Desktop running with debug port 9222, logged in, and a chart tab open.</p></Card></div>;
+function Settings({ settings, health, runtimeInfo, tvRuntimeStatus, tvAttachableTabs, onRefreshTvTabs, onAttachTvTab, onDetachTvTab, loading }) {
+  const gitCommit = runtimeInfo?.git_commit || "unknown";
+  const startedAt = runtimeInfo?.started_at ? new Date(runtimeInfo.started_at).toLocaleString() : "unknown";
+  const attached = tvRuntimeStatus?.attached_target;
+  const attachableTargets = arr(tvAttachableTabs, ["targets"]);
+  const tvStatusTone = attached?.target_id ? "green" : "yellow";
+  return <div className="settingsPage">
+    <Card title="Safety Locks" eyebrow="read-only">
+      <div className="settingsGrid"><div><span>paper_only</span><strong>true</strong></div><div><span>live_trading</span><strong>false</strong></div><div><span>broker_orders</span><strong>false</strong></div><div><span>yfinance_for_tv_candles</span><strong>false</strong></div></div>
+    </Card>
+    <Card title="API Status" eyebrow="local backend">
+      <div className="settingsGrid"><div><span>backend</span><strong>{health.status}</strong></div><div><span>API base</span><strong>{API_BASE}</strong></div><div><span>TradingView port</span><strong>{settings?.tradingview_debug_port ?? 9222}</strong></div><div><span>data source</span><strong>TradingView Desktop CDP</strong></div></div>
+    </Card>
+    <Card title="Running Project Identity" eyebrow="backend runtime">
+      <div className="settingsGrid"><div><span>project_root</span><strong>{runtimeInfo?.project_root || "unknown"}</strong></div><div><span>backend_pid</span><strong>{runtimeInfo?.backend_pid ?? "unknown"}</strong></div><div><span>git_commit</span><strong>{gitCommit}</strong></div><div><span>started_at</span><strong>{startedAt}</strong></div></div>
+    </Card>
+    <Card title="TV Runtime" eyebrow="dedicated tab">
+      <div className="tvAttachHeader">
+        <Badge tone={tvStatusTone}>{attached?.target_id ? "attached" : "not attached"}</Badge>
+        <div className="tvAttachActions">
+          <ActionButton onClick={onRefreshTvTabs} disabled={loading}>Refresh TV Tabs</ActionButton>
+          <ActionButton onClick={onDetachTvTab} disabled={loading || !attached?.target_id}>Detach</ActionButton>
+        </div>
+      </div>
+      <div className="settingsGrid">
+        <div><span>attached target</span><strong>{attached?.target_id || "none"}</strong></div>
+        <div><span>title</span><strong>{attached?.title || "none"}</strong></div>
+        <div><span>URL</span><strong>{attached?.url || "none"}</strong></div>
+        <div><span>runtime</span><strong>{tvRuntimeStatus?.worker_running ? "busy" : tvRuntimeStatus?.connected ? "connected" : "idle"}</strong></div>
+      </div>
+      <div className="tvAttachList">
+        {attachableTargets.length ? attachableTargets.map((target) => (
+          <div className="tvAttachTarget" key={target.target_id}>
+            <div><strong>{target.title || "TradingView chart"}</strong><span>{target.target_id}</span><span>{target.url}</span></div>
+            <Badge tone={target.ready ? "green" : "yellow"}>{target.ready ? "ready" : "not ready"}</Badge>
+            <ActionButton onClick={() => onAttachTvTab(target.target_id)} disabled={loading || attached?.target_id === target.target_id}>Attach</ActionButton>
+          </div>
+        )) : <p className="muted">No attachable TradingView chart tabs found.</p>}
+      </div>
+    </Card>
+    <Card title="TradingView Desktop Reminder"><p className="muted">Keep TradingView Desktop running with debug port 9222, logged in, and one chart tab open. Attach that chart here before running TV confirmation.</p></Card>
+  </div>;
 }
 
 export default function App() {
@@ -1750,6 +1879,7 @@ export default function App() {
   const [search, setSearch] = useState("");
   const [health, setHealth] = useState({ online: false, status: "checking" });
   const [settings, setSettings] = useState(null);
+  const [systemRuntimeInfo, setSystemRuntimeInfo] = useState(null);
   const [loading, setLoading] = useState("");
   const [error, setError] = useState("");
   const [lastResponse, setLastResponse] = useState(null);
@@ -1762,6 +1892,7 @@ export default function App() {
   const [scoreSummary, setScoreSummary] = useState(null);
   const [swingSummary, setSwingSummary] = useState(null);
   const [momentumSummary, setMomentumSummary] = useState(null);
+  const [dashboardEquity, setDashboardEquity] = useState(null);
   const [aiDatasetSummary, setAiDatasetSummary] = useState(null);
   const [aiFeatureSnapshots, setAiFeatureSnapshots] = useState([]);
   const [aiOutcomePreview, setAiOutcomePreview] = useState(null);
@@ -1771,16 +1902,26 @@ export default function App() {
   const [paperUpdateRuns, setPaperUpdateRuns] = useState([]);
   const [paperUpdateLock, setPaperUpdateLock] = useState(null);
   const [paperUpdateScheduler, setPaperUpdateScheduler] = useState(null);
-  const [paperUpdateDryRunResult, setPaperUpdateDryRunResult] = useState(null);
-  const [paperUpdateApprovalText, setPaperUpdateApprovalText] = useState("");
-  const [paperUpdateApprovalResult, setPaperUpdateApprovalResult] = useState(null);
-  const [paperUpdateApprovalError, setPaperUpdateApprovalError] = useState("");
-  const [signals, setSignals] = useState([]);
-  const [plans, setPlans] = useState([]);
-  const [activeTrades, setActiveTrades] = useState([]);
-  const [allTrades, setAllTrades] = useState([]);
+  const [paperOpenTrades, setPaperOpenTrades] = useState({ waiting_for_entry: [], active_partial: [] });
+  const [paperHistory, setPaperHistory] = useState({ completed: [], sl_hit: [], ambiguous: [] });
+  const [paperLiveStatus, setPaperLiveStatus] = useState({ running: false, lastUpdated: "", error: "", hasLoaded: false });
+  const actionCycleRef = useRef(false);
+  const dashboardRefreshCycleRef = useRef(false);
+  const dashboardRefreshAbortRef = useRef(null);
+  const globalStatusCycleRef = useRef(false);
+  const globalStatusAbortRef = useRef(null);
+  const paperLiveCycleRef = useRef(false);
+  const paperLiveAbortRef = useRef(null);
+  const paperSafetyCycleRef = useRef(false);
+  const paperSafetyAbortRef = useRef(null);
+  const tvRuntimeCycleRef = useRef(false);
+  const tvRuntimeAbortRef = useRef(null);
+  const stockDetailRequestRef = useRef(0);
+  const stockDetailAbortRef = useRef(null);
   const [tv, setTv] = useState({ symbol: "NSE:RELIANCE", timeframe: "1D" });
   const [tvResult, setTvResult] = useState(null);
+  const [tvRuntimeStatus, setTvRuntimeStatus] = useState(null);
+  const [tvAttachableTabs, setTvAttachableTabs] = useState(null);
   const [marketLoadResult, setMarketLoadResult] = useState(null);
   const [marketProgress, setMarketProgress] = useState(null);
   const [scoreRunResult, setScoreRunResult] = useState(null);
@@ -1826,48 +1967,175 @@ export default function App() {
   const [stockMomentumTimeframes, setStockMomentumTimeframes] = useState(MOMENTUM_MTF_TIMEFRAMES);
 
   const act = async (name, fn) => {
+    if (actionCycleRef.current) return null;
+    actionCycleRef.current = true;
     setLoading(name); setError(""); setNotice("");
-    try { const data = await fn(); setLastResponse(data); return data; }
-    catch (err) { console.error(`${name} failed`, err); setError(formatActionError(err, name)); return null; }
-    finally { setLoading(""); }
+    try {
+      const data = await fn();
+      setLastResponse(data);
+      setError("");
+      return data;
+    } catch (err) {
+      if (isRequestCancellation(err)) return null;
+      console.error(`${name} failed`, err);
+      setError(formatActionError(err, name));
+      return null;
+    } finally {
+      actionCycleRef.current = false;
+      setLoading("");
+    }
+  };
+
+  const refreshGlobalHealth = async ({ includeSettings = false, includeRuntime = false, isCancelled = () => false } = {}) => {
+    if (globalStatusCycleRef.current) return null;
+    const controller = new AbortController();
+    globalStatusCycleRef.current = true;
+    globalStatusAbortRef.current = controller;
+    const requestOptions = { signal: controller.signal };
+    try {
+      const [healthData, settingsData, systemRuntime, tradingViewStatus] = await Promise.all([
+        getHealth(requestOptions),
+        includeSettings ? getSettings(requestOptions) : Promise.resolve(null),
+        includeSettings ? getSystemRuntimeInfo(requestOptions) : Promise.resolve(null),
+        includeRuntime ? getTradingViewRuntimeStatus(requestOptions) : Promise.resolve(null),
+      ]);
+      if (!isCancelled()) {
+        setHealth({ online: healthData?.status === "ok", status: healthData?.status || "unknown" });
+        if (settingsData) setSettings(settingsData);
+        if (systemRuntime) setSystemRuntimeInfo(systemRuntime);
+        if (tradingViewStatus) setTvRuntimeStatus(tradingViewStatus);
+      }
+      return { health: healthData, settings: settingsData, system_runtime: systemRuntime, tradingview_runtime: tradingViewStatus };
+    } catch (err) {
+      if (!isCancelled() && !isRequestCancellation(err)) {
+        console.error("global health poll failed", err);
+        setHealth({ online: false, status: "offline" });
+      }
+      return null;
+    } finally {
+      if (globalStatusAbortRef.current === controller) {
+        globalStatusAbortRef.current = null;
+        globalStatusCycleRef.current = false;
+      }
+    }
+  };
+
+  const refreshDashboardSnapshot = async (isCancelled = () => false) => {
+    if (dashboardRefreshCycleRef.current) return null;
+    const controller = new AbortController();
+    dashboardRefreshCycleRef.current = true;
+    dashboardRefreshAbortRef.current = controller;
+    const requestOptions = { signal: controller.signal };
+    try {
+      const [equity, paperSummary, scoreData, swingData, momentumData, progress, runs, lock, scheduler, tradingViewStatus] = await Promise.all([
+        getDashboardPaperEquity(requestOptions),
+        getPaperSummary(requestOptions),
+        getScoreSummary("BROAD_MARKET_750", requestOptions),
+        getSwingSummary("BROAD_MARKET_750", requestOptions),
+        getMomentumSummary("BROAD_MARKET_750", requestOptions),
+        getPaperUpdateProgress(requestOptions),
+        getPaperUpdateRuns(10, requestOptions),
+        getPaperUpdateLock(requestOptions),
+        getPaperUpdateSchedulerStatus(requestOptions),
+        getTradingViewRuntimeStatus(requestOptions),
+      ]);
+      if (!isCancelled()) {
+        setDashboardEquity(equity);
+        setSummary(paperSummary);
+        setScoreSummary(scoreData);
+        setSwingSummary(swingData);
+        setMomentumSummary(momentumData);
+        setPaperUpdateProgress(progress);
+        setPaperUpdateRuns(arr(runs, ["runs"]));
+        setPaperUpdateLock(lock);
+        setPaperUpdateScheduler(scheduler);
+        setTvRuntimeStatus(tradingViewStatus);
+      }
+      return { equity, paperSummary, scoreData, swingData, momentumData, progress, runs, lock, scheduler, tradingViewStatus };
+    } catch (err) {
+      if (!isCancelled() && !isRequestCancellation(err)) console.error("dashboard snapshot refresh failed", err);
+      return null;
+    } finally {
+      if (dashboardRefreshAbortRef.current === controller) {
+        dashboardRefreshAbortRef.current = null;
+        dashboardRefreshCycleRef.current = false;
+      }
+    }
   };
 
   const refreshPaperUpdateSafety = async () => {
-    const [progress, runs, lock, scheduler] = await Promise.all([
-      getPaperUpdateProgress(),
-      getPaperUpdateRuns(10),
-      getPaperUpdateLock(),
-      getPaperUpdateSchedulerStatus(),
-    ]);
-    const runRows = arr(runs, ["runs"]);
-    setPaperUpdateProgress(progress);
-    setPaperUpdateRuns(runRows);
-    setPaperUpdateLock(lock);
-    setPaperUpdateScheduler(scheduler);
-    return { progress, runs: runRows, lock, scheduler };
+    if (paperSafetyCycleRef.current) return null;
+    const controller = new AbortController();
+    paperSafetyCycleRef.current = true;
+    paperSafetyAbortRef.current = controller;
+    const requestOptions = { signal: controller.signal };
+    try {
+      const [progress, runs, lock, scheduler] = await Promise.all([
+        getPaperUpdateProgress(requestOptions),
+        getPaperUpdateRuns(10, requestOptions),
+        getPaperUpdateLock(requestOptions),
+        getPaperUpdateSchedulerStatus(requestOptions),
+      ]);
+      const runRows = arr(runs, ["runs"]);
+      setPaperUpdateProgress(progress);
+      setPaperUpdateRuns(runRows);
+      setPaperUpdateLock(lock);
+      setPaperUpdateScheduler(scheduler);
+      return { progress, runs: runRows, lock, scheduler };
+    } finally {
+      if (paperSafetyAbortRef.current === controller) {
+        paperSafetyAbortRef.current = null;
+        paperSafetyCycleRef.current = false;
+      }
+    }
   };
-  const refreshPaperDashboardStatus = async () => {
-    const [safetyResult, summaryResult, equityResult] = await Promise.allSettled([
-      refreshPaperUpdateSafety(),
-      getPaperSummary(),
-      getPaperEquity(),
-    ]);
-    if (summaryResult.status === "fulfilled") {
-      setSummary(summaryResult.value);
-    } else {
-      console.error("paper summary refresh failed", summaryResult.reason);
+  const runPaperLiveCycle = async (isCancelled = () => false) => {
+    if (paperLiveCycleRef.current) return null;
+    const controller = new AbortController();
+    paperLiveCycleRef.current = true;
+    paperLiveAbortRef.current = controller;
+    if (!isCancelled()) setPaperLiveStatus((current) => ({ ...current, running: true }));
+    try {
+      const requestOptions = { signal: controller.signal };
+      const results = await Promise.allSettled([
+        getPaperOpenTrades(requestOptions),
+        getPaperHistory(requestOptions),
+        getPaperSummary(requestOptions),
+      ]);
+      const errors = [];
+      let successCount = 0;
+      const applyResult = (index, label, apply) => {
+        const result = results[index];
+        if (result.status === "fulfilled") {
+          successCount += 1;
+          if (!isCancelled()) apply(result.value);
+          return;
+        }
+        if (isRequestCancellation(result.reason)) return;
+        if (!isCancelled()) {
+          console.error(`${label} failed`, result.reason);
+          errors.push(`${label}: ${result.reason?.message || String(result.reason)}`);
+        }
+      };
+      applyResult(0, "paper open trades refresh", setPaperOpenTrades);
+      applyResult(1, "paper history refresh", setPaperHistory);
+      applyResult(2, "paper summary refresh", setSummary);
+      if (!isCancelled()) {
+        setPaperLiveStatus((current) => ({
+          running: false,
+          lastUpdated: new Date().toLocaleTimeString(),
+          error: errors.length ? errors.join(" | ") : "",
+          hasLoaded: current.hasLoaded || successCount > 0,
+        }));
+      }
+      return { errors };
+    } finally {
+      if (paperLiveAbortRef.current === controller) {
+        paperLiveAbortRef.current = null;
+        paperLiveCycleRef.current = false;
+      }
+      if (!isCancelled()) setPaperLiveStatus((current) => ({ ...current, running: false }));
     }
-    if (safetyResult.status === "rejected") {
-      console.error("paper update safety refresh failed", safetyResult.reason);
-    }
-    if (equityResult.status === "rejected") {
-      console.error("paper equity refresh failed", equityResult.reason);
-    }
-    return {
-      safety: safetyResult.status === "fulfilled" ? safetyResult.value : null,
-      summary: summaryResult.status === "fulfilled" ? summaryResult.value : null,
-      paper_equity: equityResult.status === "fulfilled" ? equityResult.value : null,
-    };
   };
 
   useEffect(() => {
@@ -1894,17 +2162,121 @@ export default function App() {
   }, [loading]);
 
   useEffect(() => {
-    act("status", async () => {
-      const [healthData, settingsData] = await Promise.all([getHealth(), getSettings()]);
-      setHealth({ online: healthData?.status === "ok", status: healthData?.status || "unknown" });
-      setSettings(settingsData);
-      return { health: healthData, settings: settingsData };
-    }).catch(() => setHealth({ online: false, status: "offline" }));
-  }, []);
+    if (loading !== "swing batch tv confirm" && loading !== "momentum batch tv confirm") return undefined;
+    let cancelled = false;
+    const pollRuntime = async () => {
+      if (tvRuntimeCycleRef.current) return;
+      const controller = new AbortController();
+      tvRuntimeCycleRef.current = true;
+      tvRuntimeAbortRef.current = controller;
+      try {
+        const status = await getTradingViewRuntimeStatus({ signal: controller.signal });
+        if (!cancelled) setTvRuntimeStatus(status);
+      } catch (err) {
+        if (!cancelled && !isRequestCancellation(err)) console.error("TradingView runtime status poll failed", err);
+      } finally {
+        if (tvRuntimeAbortRef.current === controller) {
+          tvRuntimeAbortRef.current = null;
+          tvRuntimeCycleRef.current = false;
+        }
+      }
+    };
+    pollRuntime();
+    const intervalId = window.setInterval(pollRuntime, BATCH_TV_RUNTIME_REFRESH_MS);
+    return () => {
+      cancelled = true;
+      const activeController = tvRuntimeAbortRef.current;
+      activeController?.abort();
+      if (activeController) {
+        tvRuntimeAbortRef.current = null;
+        tvRuntimeCycleRef.current = false;
+      }
+      window.clearInterval(intervalId);
+    };
+  }, [loading]);
 
   useEffect(() => {
     let cancelled = false;
-    Promise.all([getAiFeatureDatasetSummary(), getAiFeatureSnapshots(50), getAiOutcomePreview(50), getAiDataCollectionStatus()])
+    const isCancelled = () => cancelled;
+    refreshGlobalHealth({ includeSettings: true, includeRuntime: true, isCancelled });
+    const intervalId = window.setInterval(() => {
+      refreshGlobalHealth({ isCancelled });
+    }, GLOBAL_HEALTH_REFRESH_MS);
+    return () => {
+      cancelled = true;
+      const activeController = globalStatusAbortRef.current;
+      activeController?.abort();
+      if (activeController) {
+        globalStatusAbortRef.current = null;
+        globalStatusCycleRef.current = false;
+      }
+      window.clearInterval(intervalId);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (activePage !== "Settings") return undefined;
+    let cancelled = false;
+    const controller = new AbortController();
+    refreshGlobalHealth({ includeSettings: true, includeRuntime: true, isCancelled: () => cancelled });
+    Promise.all([
+      getTradingViewAttachableTabs({ signal: controller.signal }),
+      getTradingViewRuntimeStatus({ signal: controller.signal }),
+    ])
+      .then(([tabs, status]) => {
+        if (cancelled) return;
+        setTvAttachableTabs(tabs);
+        setTvRuntimeStatus(status);
+      })
+      .catch((err) => {
+        if (!cancelled && !isRequestCancellation(err)) console.error("TradingView tab refresh failed", err);
+      });
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [activePage]);
+
+  useEffect(() => () => {
+    dashboardRefreshAbortRef.current?.abort();
+    globalStatusAbortRef.current?.abort();
+    paperLiveAbortRef.current?.abort();
+    paperSafetyAbortRef.current?.abort();
+    tvRuntimeAbortRef.current?.abort();
+    stockDetailAbortRef.current?.abort();
+  }, []);
+
+  useEffect(() => {
+    if (activePage !== "Dashboard") return undefined;
+    let cancelled = false;
+    const isCancelled = () => cancelled;
+    refreshDashboardSnapshot(isCancelled);
+    const intervalId = window.setInterval(() => {
+      refreshDashboardSnapshot(isCancelled);
+    }, DASHBOARD_REFRESH_MS);
+    return () => {
+      cancelled = true;
+      const activeController = dashboardRefreshAbortRef.current;
+      activeController?.abort();
+      if (activeController) {
+        dashboardRefreshAbortRef.current = null;
+        dashboardRefreshCycleRef.current = false;
+      }
+      window.clearInterval(intervalId);
+    };
+  }, [activePage]);
+
+  useEffect(() => {
+    if (activePage !== "Dashboard") return undefined;
+    let cancelled = false;
+    const controller = new AbortController();
+    const requestOptions = { signal: controller.signal };
+    Promise.all([
+      getAiFeatureDatasetSummary({}, requestOptions),
+      getAiFeatureSnapshots(50, requestOptions),
+      getAiOutcomePreview(50, requestOptions),
+      getAiDataCollectionStatus(requestOptions),
+    ])
       .then(([summaryData, snapshotsData, outcomePreviewData, collectionStatusData]) => {
         if (!cancelled) {
           setAiDatasetSummary(summaryData);
@@ -1913,35 +2285,42 @@ export default function App() {
           setAiDataCollectionStatus(collectionStatusData);
         }
       })
-      .catch((err) => console.error("AI dataset tracking load failed", err));
+      .catch((err) => {
+        if (!cancelled && !isRequestCancellation(err)) console.error("AI dataset tracking load failed", err);
+      });
     return () => {
       cancelled = true;
+      controller.abort();
     };
-  }, []);
+  }, [activePage]);
 
   useEffect(() => {
+    if (activePage !== "Paper Trades") return undefined;
     let cancelled = false;
-    Promise.all([
-      getPaperUpdateProgress(),
-      getPaperUpdateRuns(10),
-      getPaperUpdateLock(),
-      getPaperUpdateSchedulerStatus(),
-    ])
-      .then(([progress, runs, lock, scheduler]) => {
-        if (cancelled) return;
-        setPaperUpdateProgress(progress);
-        setPaperUpdateRuns(arr(runs, ["runs"]));
-        setPaperUpdateLock(lock);
-        setPaperUpdateScheduler(scheduler);
-      })
-      .catch((err) => console.error("paper update safety load failed", err));
+    const isCancelled = () => cancelled;
+    runPaperLiveCycle(isCancelled);
+    const intervalId = window.setInterval(() => {
+      runPaperLiveCycle(isCancelled);
+    }, PAPER_TRADES_REFRESH_MS);
     return () => {
       cancelled = true;
+      const activeController = paperLiveAbortRef.current;
+      activeController?.abort();
+      if (activeController) {
+        paperLiveAbortRef.current = null;
+        paperLiveCycleRef.current = false;
+      }
+      window.clearInterval(intervalId);
     };
-  }, []);
+  }, [activePage]);
 
   useEffect(() => {
     const searched = normalizeSearchSymbol(search);
+    stockDetailAbortRef.current?.abort();
+    const requestId = stockDetailRequestRef.current + 1;
+    stockDetailRequestRef.current = requestId;
+    const controller = new AbortController();
+    stockDetailAbortRef.current = controller;
     setStockSwingPrecheck(null);
     setStockMomentumPrecheck(null);
     setStockSwingTvResult(null);
@@ -1950,17 +2329,22 @@ export default function App() {
     setStockSavedMomentumResult(null);
     if (activePage !== "Stock Detail" || !searched.symbol) {
       setStockMarketData(null);
-      return undefined;
+      return () => {
+        controller.abort();
+        if (stockDetailAbortRef.current === controller) stockDetailAbortRef.current = null;
+      };
     }
     const timerId = window.setTimeout(() => {
+      const requestOptions = { signal: controller.signal };
       Promise.all([
-        getMarketDataSymbol({ exchange: searched.exchange, symbol: searched.symbol }),
-        getSwingPrecheck({ exchange: searched.exchange, symbol: searched.symbol }),
-        getMomentumPrecheck({ exchange: searched.exchange, symbol: searched.symbol }),
-        getSwingTvConfirmed({ limit: 200 }),
-        getMomentumTvConfirmed({ limit: 200 }),
+        getMarketDataSymbol({ exchange: searched.exchange, symbol: searched.symbol }, requestOptions),
+        getSwingPrecheck({ exchange: searched.exchange, symbol: searched.symbol }, requestOptions),
+        getMomentumPrecheck({ exchange: searched.exchange, symbol: searched.symbol }, requestOptions),
+        getSwingTvConfirmed({ limit: 200 }, requestOptions),
+        getMomentumTvConfirmed({ limit: 200 }, requestOptions),
       ])
         .then(([marketData, swingPrecheck, momentumPrecheck, savedSwing, savedMomentum]) => {
+          if (controller.signal.aborted || stockDetailRequestRef.current !== requestId) return;
           setStockMarketData(marketData);
           setStockSwingPrecheck(swingPrecheck);
           setStockMomentumPrecheck(momentumPrecheck);
@@ -1968,11 +2352,16 @@ export default function App() {
           setStockSavedMomentumResult(savedMomentum);
         })
         .catch((err) => {
+          if (controller.signal.aborted || stockDetailRequestRef.current !== requestId || isRequestCancellation(err)) return;
           console.error("stock detail load failed", err);
           setStockMarketData({ found: false, error: err.message || String(err) });
         });
     }, 350);
-    return () => window.clearTimeout(timerId);
+    return () => {
+      window.clearTimeout(timerId);
+      controller.abort();
+      if (stockDetailAbortRef.current === controller) stockDetailAbortRef.current = null;
+    };
   }, [activePage, search]);
 
   const openStockDetail = (row) => {
@@ -2000,77 +2389,30 @@ export default function App() {
       setAiDataCollectionStatus(collectionStatusData);
       return { summary: summaryData, snapshots: snapshotsData, outcome_preview: outcomePreviewData, collection_status: collectionStatusData };
     }),
-    paperUpdateDryRun: () => {
-      if (!window.confirm(PAPER_UPDATE_DRY_RUN_CONFIRM)) {
-        setNotice("Paper update dry-run cancelled.");
-        return null;
-      }
-      return act("paper update dry-run", async () => {
-        setPaperUpdateApprovalText("");
-        setPaperUpdateApprovalResult(null);
-        setPaperUpdateApprovalError("");
-        const result = await runPaperUpdateDryRun({ maxTrades: 6, maxWrites: 1 });
-        const refreshed = await refreshPaperDashboardStatus();
-        const normalizedResult = normalizeDryRunForApproval(
-          result,
-          refreshed.safety?.progress,
-          refreshed.safety?.runs,
-        );
-        setPaperUpdateDryRunResult(normalizedResult);
-        return { dry_run_result: normalizedResult, refreshed };
-      });
-    },
-    paperUpdateApprove: () => {
-      const approvalDryRun = normalizeDryRunForApproval(
-        paperUpdateDryRunResult,
-        paperUpdateProgress,
-        paperUpdateRuns,
-      );
-      const gate = canApprovePaperRealUpdate({
-        latestDryRun: approvalDryRun,
-        lockStatus: paperUpdateLock,
-        schedulerStatus: paperUpdateScheduler,
-      });
-      if (!gate.allowed) {
-        const reasonText = gate.reasons.length ? gate.reasons.join("\n") : "Unknown gate failure.";
-        setPaperUpdateApprovalError(`Approval gate failed. Backend was not called.\n${reasonText}`);
-        setNotice("Paper approval blocked by the local gate. Run a fresh dry-run when ready.");
-        return null;
-      }
-      if (paperUpdateApprovalText !== PAPER_UPDATE_APPROVAL_CONFIRMATION_TEXT) {
-        setPaperUpdateApprovalError("Exact confirmation text is required. Backend was not called.");
-        setNotice("Paper approval blocked until the exact confirmation text is typed.");
-        return null;
-      }
-      return act("paper update approval", async () => {
-        let response = null;
-        try {
-          response = await approvePaperUpdateFromDryRun({
-            approvedDryRunId: approvalDryRun.run_id,
-            confirmationText: PAPER_UPDATE_APPROVAL_CONFIRMATION_TEXT,
-            maxTrades: PAPER_UPDATE_APPROVAL_MAX_TRADES,
-            maxWrites: PAPER_UPDATE_APPROVAL_MAX_WRITES,
-          });
-          setPaperUpdateApprovalResult(response);
-          if (response?.blocked) {
-            setPaperUpdateApprovalError(`Approval rejected: ${paperUpdateApprovalRejectionReason(response)}. Run a fresh dry-run before trying approval again.`);
-          } else {
-            setPaperUpdateApprovalError("");
-          }
-          return { approval_result: response };
-        } catch (err) {
-          const rejectionReason = paperUpdateApprovalRejectionReason(err?.responseBody);
-          setPaperUpdateApprovalError(`Approval request failed${rejectionReason !== "-" ? `: ${rejectionReason}` : ""}. Run a fresh dry-run before trying approval again.`);
-          throw err;
-        } finally {
-          setPaperUpdateDryRunResult(null);
-          setPaperUpdateApprovalText("");
-          await refreshPaperDashboardStatus();
-        }
-      });
-    },
     dryRun: () => act("pipeline dry run", () => runPaperPipeline({ limit: 1, timeframe: "1D", dryRun: true, strategy: "swing" })),
     saveRun: () => act("pipeline save", () => runPaperPipeline({ limit: 1, timeframe: "1D", dryRun: false, strategy: "swing" })),
+    tvRefreshTabs: () => act("tv tabs", async () => {
+      const tabs = await getTradingViewAttachableTabs();
+      setTvAttachableTabs(tabs);
+      const status = await getTradingViewRuntimeStatus();
+      setTvRuntimeStatus(status);
+      return { attachable_tabs: tabs, runtime: status };
+    }),
+    tvAttachTab: (targetId) => act("tv attach tab", async () => {
+      if (!targetId) throw new Error("Missing TradingView target id.");
+      const attached = await attachTradingViewTab(targetId);
+      const [tabs, status] = await Promise.all([getTradingViewAttachableTabs(), getTradingViewRuntimeStatus()]);
+      setTvAttachableTabs(tabs);
+      setTvRuntimeStatus(status);
+      return { attached, attachable_tabs: tabs, runtime: status };
+    }),
+    tvDetachTab: () => act("tv detach tab", async () => {
+      const detached = await detachTradingViewTab();
+      const [tabs, status] = await Promise.all([getTradingViewAttachableTabs(), getTradingViewRuntimeStatus()]);
+      setTvAttachableTabs(tabs);
+      setTvRuntimeStatus(status);
+      return { detached, attachable_tabs: tabs, runtime: status };
+    }),
     scan: () => act("scan", async () => { const data = await runScan(); if (data?.scan_run_id) setLatestScanRunId(data.scan_run_id); setScanRows(await getPaperSafeScanRows(data?.scan_run_id)); return data; }),
     scoreMarketData: () => act("score market data", async () => {
       const data = await runScoring();
@@ -2298,11 +2640,6 @@ export default function App() {
     tvTest: () => act("tv candles", async () => { const data = await testTvSymbol(tv.symbol, tv.timeframe); setTvResult(data); return data; }),
     dryRun750: () => act("dry run 750 scan", async () => { const data = await loadAllMarketData(true); setMarketLoadResult(data); const progress = await getMarketLoadProgress(); setMarketProgress(progress); return { load_all: data, progress }; }),
     scanAll750: () => act("scan all 750 stocks", async () => { const data = await loadAllMarketData(false); setMarketLoadResult(data); const progress = await getMarketLoadProgress(); setMarketProgress(progress); setSwingCandidatesStale(true); setMomentumCandidatesStale(true); setMarketDataNeedsScore(true); setNotice(SCAN_SCORE_WARNING); return { load_all: data, progress }; }),
-    paperSignals: () => act("paper signals", async () => { const data = await getPaperSignals(); setSignals(arr(data, ["signals"])); return data; }),
-    paperPlans: () => act("paper plans", async () => { const data = await getPaperPlans(); setPlans(arr(data, ["plans"])); return data; }),
-    active: () => act("active trades", async () => { const data = await getActiveTrades(); setActiveTrades(arr(data, ["trades"])); return data; }),
-    all: () => act("all trades", async () => { const data = await getAllTrades(); setAllTrades(arr(data, ["trades"])); return data; }),
-    update: () => act("update paper", () => updatePaperPlans()),
   };
 
   const page = useMemo(() => {
@@ -2310,15 +2647,18 @@ export default function App() {
     if (activePage === "Momentum Trading") return <MomentumTrading momentumRows={momentumRows} momentumSummary={momentumSummary} latestMomentumTvRows={latestMomentumTvRows} momentumTvRowsLoaded={momentumTvRowsLoaded} momentumBatchResults={momentumBatchResults} momentumBatchProgress={momentumBatchProgress} momentumBatchError={momentumBatchError} momentumBatchStopRequested={momentumBatchStopRequested} momentumBatchStopMessage={momentumBatchStopMessage} momentumBatchRunning={loading === "momentum batch tv confirm"} candidatesStale={momentumCandidatesStale} onSummary={handlers.momentumSummary} onLoad={handlers.momentum} onBatchConfirm={handlers.momentumBatchConfirm} onStopBatch={handlers.momentumStopBatch} onLoadSaved={handlers.momentumSavedTv} onSignals={handlers.momentumSignals} onPlans={handlers.momentumPlans} onOpenStock={openStockDetail} loading={!!loading} />;
     if (activePage === "Market Data") return <MarketDataPage tv={tv} setTv={setTv} tvResult={tvResult} onTest={handlers.tvTest} onDryRun750={handlers.dryRun750} onScanAll750={handlers.scanAll750} onScoreMarketData={handlers.scoreMarketData} marketLoadResult={marketLoadResult} marketProgress={marketProgress} scoreRunResult={scoreRunResult} scoreSummary={scoreSummary} marketDataNeedsScore={marketDataNeedsScore} loading={!!loading} loadingText={loading} lastResponse={lastResponse} />;
     if (activePage === "Stock Detail") return <StockDetailPage search={search} stockMarketData={stockMarketData} stockSwingPrecheck={stockSwingPrecheck} stockMomentumPrecheck={stockMomentumPrecheck} stockSwingTvResult={stockSwingTvResult} stockMomentumTvResult={stockMomentumTvResult} stockSavedSwingResult={stockSavedSwingResult} stockSavedMomentumResult={stockSavedMomentumResult} latestSwingTvRows={latestSwingTvRows} latestMomentumTvRows={latestMomentumTvRows} stockSwingTimeframes={stockSwingTimeframes} setStockSwingTimeframes={setStockSwingTimeframes} stockMomentumTimeframes={stockMomentumTimeframes} setStockMomentumTimeframes={setStockMomentumTimeframes} onLoadStockMarket={handlers.stockMarketData} onSwingPrecheck={handlers.stockSwingPrecheck} onMomentumPrecheck={handlers.stockMomentumPrecheck} onStockSwingTvConfirm={handlers.stockSwingTvConfirm} onStockMomentumTvConfirm={handlers.stockMomentumTvConfirm} loading={!!loading} />;
-    if (activePage === "Paper Trades") return <PaperTrades signals={signals} plans={plans} activeTrades={activeTrades} allTrades={allTrades} onSignals={handlers.paperSignals} onPlans={handlers.paperPlans} onActive={handlers.active} onAll={handlers.all} onUpdate={handlers.update} loading={!!loading} />;
-    if (activePage === "Settings") return <Settings settings={settings} health={health} />;
-    return <Dashboard summary={summary} scoreSummary={scoreSummary} swingSummary={swingSummary} momentumSummary={momentumSummary} aiDatasetSummary={aiDatasetSummary} aiFeatureSnapshots={aiFeatureSnapshots} aiOutcomePreview={aiOutcomePreview} aiDataCollectionStatus={aiDataCollectionStatus} aiDatasetFilters={aiDatasetFilters} paperUpdateProgress={paperUpdateProgress} paperUpdateRuns={paperUpdateRuns} paperUpdateLock={paperUpdateLock} paperUpdateScheduler={paperUpdateScheduler} paperUpdateDryRunResult={paperUpdateDryRunResult} paperUpdateApprovalText={paperUpdateApprovalText} paperUpdateApprovalResult={paperUpdateApprovalResult} paperUpdateApprovalError={paperUpdateApprovalError} onSummary={handlers.loadSummary} onDryRun={handlers.dryRun} onSaveRun={handlers.saveRun} onAiDatasetRefresh={handlers.aiDatasetSummary} onAiDatasetFiltersChange={setAiDatasetFilters} onPaperUpdateDryRun={handlers.paperUpdateDryRun} onPaperUpdateApprove={handlers.paperUpdateApprove} onPaperUpdateApprovalTextChange={setPaperUpdateApprovalText} aiDatasetLoading={loading === "AI dataset summary"} paperUpdateDryRunLoading={loading === "paper update dry-run"} paperUpdateApprovalLoading={loading === "paper update approval"} loading={!!loading} />;
-  }, [activePage, settings, health, summary, scoreSummary, swingSummary, momentumSummary, aiDatasetSummary, aiFeatureSnapshots, aiOutcomePreview, aiDataCollectionStatus, aiDatasetFilters, paperUpdateProgress, paperUpdateRuns, paperUpdateLock, paperUpdateScheduler, paperUpdateDryRunResult, paperUpdateApprovalText, paperUpdateApprovalResult, paperUpdateApprovalError, swingRows, latestSwingTvRows, swingTvRowsLoaded, swingBatchResults, swingBatchProgress, swingBatchError, swingBatchStopRequested, swingBatchStopMessage, swingCandidatesStale, momentumRows, momentumCandidatesStale, latestMomentumTvRows, momentumTvRowsLoaded, momentumBatchResults, momentumBatchProgress, momentumBatchError, momentumBatchStopRequested, momentumBatchStopMessage, stockMarketData, stockSwingPrecheck, stockMomentumPrecheck, stockSwingTvResult, stockMomentumTvResult, stockSavedSwingResult, stockSavedMomentumResult, stockSwingTimeframes, stockMomentumTimeframes, search, tv, tvResult, marketLoadResult, marketProgress, scoreRunResult, marketDataNeedsScore, signals, plans, activeTrades, allTrades, loading, lastResponse]);
+    if (activePage === "Paper Trades") return <PaperTrades openTrades={paperOpenTrades} history={paperHistory} summary={summary} liveStatus={paperLiveStatus} />;
+    if (activePage === "Settings") return <Settings settings={settings} health={health} runtimeInfo={systemRuntimeInfo} tvRuntimeStatus={tvRuntimeStatus} tvAttachableTabs={tvAttachableTabs} onRefreshTvTabs={handlers.tvRefreshTabs} onAttachTvTab={handlers.tvAttachTab} onDetachTvTab={handlers.tvDetachTab} loading={!!loading} />;
+    return <Dashboard summary={summary} scoreSummary={scoreSummary} swingSummary={swingSummary} momentumSummary={momentumSummary} dashboardEquity={dashboardEquity} health={health} tvRuntimeStatus={tvRuntimeStatus} aiDatasetSummary={aiDatasetSummary} aiFeatureSnapshots={aiFeatureSnapshots} aiOutcomePreview={aiOutcomePreview} aiDataCollectionStatus={aiDataCollectionStatus} aiDatasetFilters={aiDatasetFilters} paperUpdateProgress={paperUpdateProgress} paperUpdateRuns={paperUpdateRuns} paperUpdateLock={paperUpdateLock} paperUpdateScheduler={paperUpdateScheduler} onSummary={handlers.loadSummary} onDryRun={handlers.dryRun} onSaveRun={handlers.saveRun} onAiDatasetRefresh={handlers.aiDatasetSummary} onAiDatasetFiltersChange={setAiDatasetFilters} aiDatasetLoading={loading === "AI dataset summary"} loading={!!loading} />;
+  }, [activePage, settings, health, systemRuntimeInfo, summary, scoreSummary, swingSummary, momentumSummary, dashboardEquity, tvRuntimeStatus, tvAttachableTabs, aiDatasetSummary, aiFeatureSnapshots, aiOutcomePreview, aiDataCollectionStatus, aiDatasetFilters, paperUpdateProgress, paperUpdateRuns, paperUpdateLock, paperUpdateScheduler, swingRows, latestSwingTvRows, swingTvRowsLoaded, swingBatchResults, swingBatchProgress, swingBatchError, swingBatchStopRequested, swingBatchStopMessage, swingCandidatesStale, momentumRows, momentumCandidatesStale, latestMomentumTvRows, momentumTvRowsLoaded, momentumBatchResults, momentumBatchProgress, momentumBatchError, momentumBatchStopRequested, momentumBatchStopMessage, stockMarketData, stockSwingPrecheck, stockMomentumPrecheck, stockSwingTvResult, stockMomentumTvResult, stockSavedSwingResult, stockSavedMomentumResult, stockSwingTimeframes, stockMomentumTimeframes, search, tv, tvResult, marketLoadResult, marketProgress, scoreRunResult, marketDataNeedsScore, paperOpenTrades, paperHistory, paperLiveStatus, loading, lastResponse]);
+
+  const tradingViewBatchBusy = loading === "swing batch tv confirm" || loading === "momentum batch tv confirm";
+  const tvBadge = tradingViewBatchBusy ? { tone: "yellow", label: "TradingView Busy" } : tradingViewBadge(tvRuntimeStatus);
 
   return <div className="appShell">
     <aside className="sidebar"><div className="brand"><div className="brandMark">TA</div><div><h1>Trading Agent</h1><p>Paper Terminal</p></div></div><div className="navSeparator">Workspace</div><nav>{NAV_WITH_STOCK_DETAIL.map((item) => <button className={activePage === item.label ? "navItem active" : "navItem"} key={item.label} onClick={() => setActivePage(item.label)}><span>{item.icon}</span>{item.label}</button>)}</nav><div className="sidebarFooter"><Badge tone="yellow">PAPER ONLY</Badge><p>No live trading. No broker orders.</p></div></aside>
     <div className="mainArea">
-      <header className="topHeader"><div><h2>{activePage}</h2><p>API base: {API_BASE}</p></div><input className="searchInput" value={search} onChange={(e) => { setSearch(e.target.value); if (e.target.value.trim()) setActivePage("Stock Detail"); }} placeholder="Search NSE/BSE symbols..." /><div className="statusBadges"><Badge tone={health.online ? "green" : "red"}>Market API {health.status}</Badge><Badge tone="green">TradingView Desktop</Badge><Badge tone="yellow">Paper Mode</Badge></div></header>
+      <header className="topHeader"><div><h2>{activePage}</h2><p>API base: {API_BASE}</p></div><input className="searchInput" value={search} onChange={(e) => { setSearch(e.target.value); if (e.target.value.trim()) setActivePage("Stock Detail"); }} placeholder="Search NSE/BSE symbols..." /><div className="statusBadges"><Badge tone={health.online ? "green" : "red"}>Market API {health.status}</Badge><Badge tone={tvBadge.tone}>{tvBadge.label}</Badge><Badge tone="yellow">Paper Mode</Badge></div></header>
       <section className="modeBanner"><strong>PAPER MODE / NO LIVE ORDERS</strong><span>Simulated signals and paper trade plans only.</span></section>
       {loading && <div className="noticePanel">Loading {loading}...</div>}
       {notice && <div className="warningText appNotice">{notice}</div>}

@@ -537,6 +537,77 @@ PAPER_PLAN_FIELDS = (
     "projected_plan_valid",
     "projected_plan_reason",
     "fallback_buffer_used",
+    # Audit fields for v2 calculations
+    "calculation_version",
+    "calculation_timestamp",
+    "technical_stop_loss",
+    "final_stop_loss",
+    "stop_loss_basis",
+    "stop_loss_overridden",
+    "stop_loss_override_reason",
+    "structure_swing_low",
+    "structure_swing_low_timeframe",
+    "atr_used",
+    "atr_multiplier",
+    "daily_ema20",
+    "daily_ema50",
+    "weekly_support_used",
+    "raw_targets",
+    "final_targets",
+    "target_rr_values",
+    "target_confidence",
+    "target_structure_basis",
+    "target_flags",
+    "risk_budget",
+    "quantity_by_risk",
+    "quantity_by_grade_margin",
+    "quantity_by_available_margin",
+    "quantity_for_minimum_margin",
+    "minimum_allowed_quantity",
+    "final_quantity",
+    "maximum_loss",
+    "combined_portfolio_risk_after",
+    "t1_allocation_percent",
+    "t2_allocation_percent",
+    "t3_allocation_percent",
+    "t1_quantity",
+    "t2_quantity",
+    "t3_quantity",
+    "allocation_reason",
+    "exit_allocations",
+    "t1_target_raw",
+    "t1_target_final",
+    "t1_raw_rr",
+    "t1_final_rr",
+    "t1_confidence",
+    "t1_structure_basis",
+    "t1_structure_timeframe",
+    "t1_structure_timestamp",
+    "t1_structure_zone_lower",
+    "t1_structure_zone_upper",
+    "t1_flag",
+    "t2_target_raw",
+    "t2_target_final",
+    "t2_raw_rr",
+    "t2_final_rr",
+    "t2_confidence",
+    "t2_structure_basis",
+    "t2_structure_timeframe",
+    "t2_structure_timestamp",
+    "t2_structure_zone_lower",
+    "t2_structure_zone_upper",
+    "t2_flag",
+    "t3_target_raw",
+    "t3_target_final",
+    "t3_raw_rr",
+    "t3_final_rr",
+    "t3_confidence",
+    "t3_structure_basis",
+    "t3_structure_timeframe",
+    "t3_structure_timestamp",
+    "t3_structure_zone_lower",
+    "t3_structure_zone_upper",
+    "t3_flag",
 )
 
 WAIT_PAPER_STATUSES = {"WAIT_FOR_PULLBACK", "WAIT_FOR_RETEST", "WATCH_FOR_PULLBACK", "WATCH_FOR_BREAKOUT"}
@@ -1054,63 +1125,103 @@ def build_price_action_paper_plan(
     support, support_label = _paper_support_level(entry, analyses)
     if support is None:
         return _empty_paper_trade_plan("STOP_MISSING")
-    stop_buffer = _paper_atr_buffer(entry_analysis, daily, 0.15)
-    stop_loss = support - stop_buffer
-    risk = entry - stop_loss
-    if risk <= 0:
-        plan = _empty_paper_trade_plan("INVALID_RISK")
-        plan.update({"paper_entry_price": _round(entry), "paper_stop_loss": _round(stop_loss), "paper_risk_per_share": _round(risk)})
-        return plan
 
-    target_1 = entry + (2 * risk)
-    target_2 = entry + (3 * risk)
-    target_3_base = entry + (4 * risk)
-    nearest_resistance = _paper_nearest_resistance(entry, analyses)
-    resistance_blocks_2r = nearest_resistance is not None and nearest_resistance < target_1
-    target_3 = target_3_base if strategy == "momentum" else nearest_resistance if nearest_resistance is not None and target_2 < nearest_resistance < target_3_base else target_3_base
-    paper_rr_1 = (target_1 - entry) / risk
-    paper_rr_2 = (target_2 - entry) / risk
-    paper_rr_3 = (target_3 - entry) / risk
-    if paper_rr_1 < 2:
-        plan_valid = False
-        plan_reason = "RR_BELOW_2"
-    elif strategy == "momentum":
-        plan_valid = True
-        plan_reason = "VALID_2R_PLAN"
-    else:
-        plan_valid = not resistance_blocks_2r
-        plan_reason = "TARGET_BLOCKED_BY_RESISTANCE_BEFORE_2R" if resistance_blocks_2r else "VALID_2R_PLAN"
+    # confirmed resistance zones
+    zones = []
+    for tf, ans in analyses.items():
+        if not ans or ans.get("technical_failed"):
+            continue
+        for key in ("recent_high_20", "prior_high_20", "last_high"):
+            val = _to_float(ans.get(key))
+            if val is not None and val > 0:
+                zones.append({
+                    "level": val,
+                    "lower_bound": val * 0.99,
+                    "upper_bound": val * 1.01,
+                    "timeframe": tf,
+                    "source": f"{tf}_{key}",
+                    "candle_timestamp": ans.get("last_candle_timestamp") or ans.get("timestamp"),
+                    "strength": 1
+                })
+
+    tf_support = "1D"
+    if support_label:
+        for t_f in ("1H", "4H", "1D", "1W"):
+            if t_f in support_label:
+                tf_support = t_f
+                break
+
+    entry_atr = _to_float((entry_analysis or {}).get("atr14")) or _to_float((daily or {}).get("atr14")) or 0.0
+    atr_4h = _to_float((analyses.get("4H") or {}).get("atr14")) or entry_atr
+    atr_daily = _to_float((analyses.get("1D") or {}).get("atr14")) or entry_atr
+    daily_ema20 = _to_float((analyses.get("1D") or {}).get("ema20"))
+    daily_ema50 = _to_float((analyses.get("1D") or {}).get("ema50"))
+
+    weekly = analyses.get("1W") or {}
+    nearest_weekly_support = _to_float(weekly.get("recent_low_20")) or _to_float(weekly.get("last_low"))
+
+    grade = risk_context.get("trade_quality_grade") or risk_context.get("grade") or "A+"
+
+    from services.trade_plan_calculator import calculate_trade_plan
+
+    plan_res = calculate_trade_plan(
+        strategy_type=strategy,
+        side="BUY",
+        entry_reference_high=entry_high,
+        entry_atr=entry_atr,
+        structure_swing_low=support,
+        structure_swing_low_timeframe=tf_support,
+        atr_4h=atr_4h,
+        atr_daily=atr_daily,
+        daily_ema20=daily_ema20,
+        daily_ema50=daily_ema50,
+        nearest_weekly_support=nearest_weekly_support,
+        confirmed_resistance_zones=zones,
+        current_balance=250000.0,
+        available_margin=250000.0,
+        combined_open_risk=0.0,
+        setup_grade=grade,
+        allow_sl_override=False,
+    )
+
+    if not plan_res.get("activation_allowed") or plan_res.get("block_code") is not None:
+        plan_reason = plan_res.get("block_code") or "PLAN_BLOCKED"
+        empty_plan = _empty_paper_trade_plan(plan_reason)
+        empty_plan.update(plan_res)
+        return empty_plan
+
     entry_text = "momentum confirmation candle" if strategy == "momentum" else "price-action confirmation candle"
     stop_text = support_label or "latest swing low/support"
-    target_text = "T1 is minimum 2R, T2 is 3R, T3 is 4R"
-    if nearest_resistance is not None:
-        target_text += f" or nearest higher resistance near {_round(nearest_resistance)}"
+    target_text = plan_res["target_logic"]
+    resistance_blocks_2r = plan_res.get("t1_adjusted_to_resistance", False)
 
-    return {
-        "paper_entry_price": _round(entry),
-        "paper_stop_loss": _round(stop_loss),
-        "paper_target_1": _round(target_1),
-        "paper_target_2": _round(target_2),
-        "paper_target_3": _round(target_3),
-        "paper_risk_per_share": _round(risk),
-        "paper_rr_1": _round(paper_rr_1),
-        "paper_rr_2": _round(paper_rr_2),
-        "paper_rr_3": _round(paper_rr_3),
-        "paper_plan_valid": plan_valid,
-        "paper_plan_reason": plan_reason,
-        "entry_zone": _price_zone_text(entry_high, entry),
-        "pullback_zone": _price_zone_text(support, stop_loss),
+    final_plan = {
+        "paper_entry_price": plan_res["entry_price"],
+        "paper_stop_loss": plan_res["final_stop_loss"],
+        "paper_target_1": plan_res["t1_target_final"],
+        "paper_target_2": plan_res["t2_target_final"],
+        "paper_target_3": plan_res["t3_target_final"],
+        "paper_risk_per_share": plan_res["risk_per_share"],
+        "paper_rr_1": plan_res["t1_final_rr"],
+        "paper_rr_2": plan_res["t2_final_rr"],
+        "paper_rr_3": plan_res["t3_final_rr"],
+        "paper_plan_valid": True,
+        "paper_plan_reason": "VALID_2R_PLAN",
+        "entry_zone": _price_zone_text(entry_high, plan_res["entry_price"]),
+        "pullback_zone": _price_zone_text(support, plan_res["final_stop_loss"]),
         "trigger_condition": f"{entry_frame or '1H'} close or buy-stop trigger above {_round(entry_high)}.",
         "entry_condition": f"Entry above {entry_frame or '1H'} {entry_text} high with ATR buffer when available.",
         "stop_loss_logic": f"SL below {stop_text} with ATR buffer when available.",
-        "target_logic": target_text + ".",
+        "target_logic": target_text,
         "invalidation_condition": "Invalidate on close below stop/support, HIGH fake breakout risk, DANGER trap, or failed candle safety.",
-        "next_action_for_paper_trade": "PAPER_PLAN_READY" if plan_valid else "WAIT_FOR_CLEAR_2R_SPACE",
-        "entry_readiness": "READY" if plan_valid else "WAIT",
+        "next_action_for_paper_trade": "PAPER_PLAN_READY",
+        "entry_readiness": "READY",
         "planned_stop_loss_logic": "Below pullback/retest swing low with ATR buffer.",
         "planned_targets_after_trigger": "T1 = entry + 2R; T2 = entry + 3R; T3 = entry + 4R or nearest higher resistance.",
         "target_1_adjusted_to_resistance": resistance_blocks_2r,
+        **plan_res,
     }
+    return final_plan
 
 
 def build_price_action_paper_plan_from_candles(

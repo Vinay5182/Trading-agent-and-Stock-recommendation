@@ -77,7 +77,7 @@ def test_position_sizing_grades_and_caps() -> None:
     assert res_a_plus["required_margin"] == 5000.0
     assert res_a_plus["estimated_sl_risk"] == 1250.0
 
-    # A Sizing: 0.35% risk. Under new bypassed limits, this should succeed and scale up to 5k margin!
+    # A Sizing: 0.35% risk. Under version 2, this must not scale up and is blocked because risk qty is below minimum margin qty
     res_a = calculate_proposed_sizing(
         entry_price=100.0,
         stop_loss=90.0,
@@ -87,11 +87,10 @@ def test_position_sizing_grades_and_caps() -> None:
         open_margin=0.0,
         combined_open_risk=0.0
     )
-    assert res_a["ok"] is True
-    assert res_a["final_quantity"] == 125
-    assert res_a["required_margin"] == 5000.0
+    assert res_a["ok"] is False
+    assert res_a["reason"] == "RISK_QUANTITY_BELOW_MINIMUM"
 
-    # B Sizing: 0.25% risk. Should succeed and scale up to 5k margin!
+    # B Sizing: 0.25% risk. Should not scale up and is blocked.
     res_b = calculate_proposed_sizing(
         entry_price=100.0,
         stop_loss=90.0,
@@ -101,9 +100,8 @@ def test_position_sizing_grades_and_caps() -> None:
         open_margin=0.0,
         combined_open_risk=0.0
     )
-    assert res_b["ok"] is True
-    assert res_b["final_quantity"] == 125
-    assert res_b["required_margin"] == 5000.0
+    assert res_b["ok"] is False
+    assert res_b["reason"] == "RISK_QUANTITY_BELOW_MINIMUM"
 
     # C or Lower / Invalid Grade Sizing: Should reject
     res_c = calculate_proposed_sizing(
@@ -144,7 +142,7 @@ def test_invalid_sizing_parameters() -> None:
         combined_open_risk=0.0
     )
     assert res_no_margin["ok"] is False
-    assert res_no_margin["reason"] == "INSUFFICIENT_MARGIN"
+    assert res_no_margin["reason"] == "INSUFFICIENT_AVAILABLE_MARGIN"
 
 # 3. ₹5,000 minimum entry-margin acceptance
 def test_minimum_entry_margin_scaling() -> None:
@@ -167,8 +165,7 @@ def test_minimum_entry_margin_scaling() -> None:
 
     # Balance: 30,000, Grade: A+ (Risk budget = 150)
     # Stop distance = 2 (entry=100, sl=98)
-    # Since margin (3000) < 5000, it tries to scale up to 5000 margin (qty = 125).
-    # This exceeds the grade margin cap of 10% of 30,000 (which is 3,000).
+    # Since margin (3000) < 5000, and we never scale up under v2, it blocks with RISK_QUANTITY_BELOW_MINIMUM.
     res_exceeded = calculate_proposed_sizing(
         entry_price=100.0,
         stop_loss=98.0,
@@ -179,7 +176,7 @@ def test_minimum_entry_margin_scaling() -> None:
         combined_open_risk=0.0
     )
     assert res_exceeded["ok"] is False
-    assert res_exceeded["reason"] == "GRADE_MARGIN_CAP_EXCEEDED"
+    assert res_exceeded["reason"] == "RISK_QUANTITY_BELOW_MINIMUM"
 
 # 4. available-margin limit & 80% portfolio margin limit & 5% combined open-risk limit bypasses
 def test_portfolio_limits() -> None:
@@ -194,7 +191,7 @@ def test_portfolio_limits() -> None:
         combined_open_risk=0.0
     )
     assert res_avail["ok"] is False
-    assert res_avail["reason"] == "INSUFFICIENT_MARGIN"
+    assert res_avail["reason"] == "INSUFFICIENT_AVAILABLE_MARGIN"
 
     # 80% portfolio margin limit enforcement
     res_margin_limit = calculate_proposed_sizing(

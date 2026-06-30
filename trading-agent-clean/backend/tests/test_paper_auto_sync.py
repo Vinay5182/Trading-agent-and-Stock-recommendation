@@ -434,8 +434,8 @@ def test_build_paper_plans_concurrent_calls_create_one_logical_trade(monkeypatch
 
     async def run_twice():
         return await asyncio.gather(
-            paper.build_paper_plans(limit=1, timeframe="1D", save=True, paper_capital=100000, risk_percent=1, signal_type="SWING_TV_CONFIRMED"),
-            paper.build_paper_plans(limit=1, timeframe="1D", save=True, paper_capital=100000, risk_percent=1, signal_type="SWING_TV_CONFIRMED"),
+            paper.build_paper_plans(limit=1, timeframe="1D", save=True, paper_capital=500000, risk_percent=1, signal_type="SWING_TV_CONFIRMED"),
+            paper.build_paper_plans(limit=1, timeframe="1D", save=True, paper_capital=500000, risk_percent=1, signal_type="SWING_TV_CONFIRMED"),
         )
 
     responses = asyncio.run(run_twice())
@@ -450,7 +450,7 @@ def test_build_paper_plans_concurrent_calls_create_one_logical_trade(monkeypatch
 
 def test_upsert_paper_plans_concurrent_calls_create_one_logical_trade(monkeypatch) -> None:
     signal = paper_signal_row("UPSERT")
-    plan = paper.build_plan_from_candles(signal, build_plan_candles(), 100000, 1)
+    plan = paper.build_plan_from_candles(signal, build_plan_candles(), 500000, 1)
     db = FakeDb()
     monkeypatch.setattr(paper, "get_database", lambda: db)
 
@@ -471,7 +471,7 @@ def test_upsert_paper_plans_concurrent_calls_create_one_logical_trade(monkeypatc
 
 def test_terminal_trade_cannot_be_reset_by_plan_builder(monkeypatch) -> None:
     signal = paper_signal_row("TERMINAL", source_id="terminal-confirmation")
-    waiting_plan = paper.build_plan_from_candles(signal, build_plan_candles(), 100000, 1)
+    waiting_plan = paper.build_plan_from_candles(signal, build_plan_candles(), 500000, 1)
     completed_trade = apply_setup_identity(
         {
             **waiting_plan,

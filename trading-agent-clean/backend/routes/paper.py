@@ -43,6 +43,29 @@ from tv_confirmation import PAPER_PLAN_FIELDS, build_price_action_paper_plan_fro
 
 
 router = APIRouter()
+
+
+def log_lifecycle_system_error_sync(plan: dict, code: str, msg: str):
+    import asyncio
+    try:
+        db = get_database()
+    except Exception:
+        return
+    exc = ValueError(f"{code}: {msg}")
+    try:
+        loop = asyncio.get_running_loop()
+        if loop.is_running():
+            loop.create_task(
+                record_system_error(
+                    db,
+                    component="paper_lifecycle",
+                    operation="trade_evaluation",
+                    exception=exc,
+                    trade=plan
+                )
+            )
+    except RuntimeError:
+        pass
 logger = logging.getLogger("uvicorn.error")
 WAITING_FOR_ENTRY_STATUS = "WAITING_FOR_ENTRY"
 WAITING_STATUSES = {"NOT_TRIGGERED", "PLANNED", "WAITING", WAITING_FOR_ENTRY_STATUS}
@@ -929,15 +952,83 @@ def trade_side_multiplier(plan: dict) -> int:
 
 
 def exit_allocations_for_trade(plan: dict) -> dict:
+    calc_ver = plan.get("calculation_version") or plan.get("risk_plan_version") or 1
+    is_v2 = (calc_ver >= 2)
+
     existing = plan.get("exit_allocations")
-    if isinstance(existing, dict):
-        t1_qty = number_or_none(existing.get("t1_quantity"))
-        t2_qty = number_or_none(existing.get("t2_quantity"))
-        t3_qty = number_or_none(existing.get("t3_quantity"))
-        total_qty = number_or_none(existing.get("total_quantity")) or total_trade_quantity(plan)
-        if all(value is not None and value > 0 for value in (t1_qty, t2_qty, t3_qty)) and round(t1_qty + t2_qty + t3_qty, 8) == round(total_qty, 8):
-            return dict(existing)
-    total_qty = int(total_trade_quantity(plan))
+
+    def make_alloc_dict(t1_q, t1_p, t2_q, t2_p, t3_q, t3_p, total_q, reason, ver=2):
+        return {
+            "t1": {"quantity": int(t1_q), "percent": float(t1_p)},
+            "t2": {"quantity": int(t2_q), "percent": float(t2_p)},
+            "t3": {"quantity": int(t3_q), "percent": float(t3_p)},
+            "total_quantity": int(total_q),
+            "t1_quantity": int(t1_q),
+            "t2_quantity": int(t2_q),
+            "t3_quantity": int(t3_q),
+            "allocation_reason": str(reason),
+            "allocation_version": int(ver),
+            "valid": True
+        }
+
+    # 1. If a valid Version 2 exit_allocations object exists (nested)
+    if isinstance(existing, dict) and "t1" in existing and "t2" in existing and "t3" in existing:
+        t1_dict = existing["t1"]
+        t2_dict = existing["t2"]
+        t3_dict = existing["t3"]
+        if isinstance(t1_dict, dict) and isinstance(t2_dict, dict) and isinstance(t3_dict, dict):
+            t1_q = number_or_none(t1_dict.get("quantity"))
+            t2_q = number_or_none(t2_dict.get("quantity"))
+            t3_q = number_or_none(t3_dict.get("quantity"))
+            total_q = number_or_none(existing.get("total_quantity")) or total_trade_quantity(plan)
+            if all(q is not None and q > 0 for q in (t1_q, t2_q, t3_q)):
+                if int(t1_q + t2_q + t3_q) == int(total_q):
+                    t1_p = number_or_none(t1_dict.get("percent")) or 33.0
+                    t2_p = number_or_none(t2_dict.get("percent")) or 33.0
+                    t3_p = number_or_none(t3_dict.get("percent")) or 34.0
+                    reason = existing.get("allocation_reason") or "V2_NESTED_ALLOCATION"
+                    return make_alloc_dict(t1_q, t1_p, t2_q, t2_p, t3_q, t3_p, total_q, reason, existing.get("allocation_version", 2))
+                else:
+                    if is_v2:
+                        return {"valid": False, "reason": "V2_EXIT_ALLOCATIONS_INVALID"}
+
+    # Legacy flat exit_allocations dictionary (for V1 existing records)
+    if isinstance(existing, dict) and not ("t1" in existing or "t2" in existing or "t3" in existing):
+        t1_q = number_or_none(existing.get("t1_quantity"))
+        t2_q = number_or_none(existing.get("t2_quantity"))
+        t3_q = number_or_none(existing.get("t3_quantity"))
+        total_q = number_or_none(existing.get("total_quantity")) or total_trade_quantity(plan)
+        if all(q is not None and q > 0 for q in (t1_q, t2_q, t3_q)):
+            if int(t1_q + t2_q + t3_q) == int(total_q):
+                return {
+                    "total_quantity": int(total_q),
+                    "t1_quantity": int(t1_q),
+                    "t2_quantity": int(t2_q),
+                    "t3_quantity": int(t3_q),
+                    "valid": True
+                }
+
+    # 2. Otherwise, if valid Version 2 root quantity aliases exist
+    root_t1 = number_or_none(plan.get("t1_quantity"))
+    root_t2 = number_or_none(plan.get("t2_quantity"))
+    root_t3 = number_or_none(plan.get("t3_quantity"))
+    total_q = total_trade_quantity(plan)
+    if all(q is not None and q > 0 for q in (root_t1, root_t2, root_t3)):
+        if int(root_t1 + root_t2 + root_t3) == int(total_q):
+            t1_p = number_or_none(plan.get("t1_allocation_percent")) or 33.0
+            t2_p = number_or_none(plan.get("t2_allocation_percent")) or 33.0
+            t3_p = number_or_none(plan.get("t3_allocation_percent")) or 34.0
+            reason = plan.get("allocation_reason") or "V2_ROOT_ALIASES_CONSTRUCTED"
+            return make_alloc_dict(root_t1, t1_p, root_t2, t2_p, root_t3, t3_p, total_q, reason, 2)
+        else:
+            if is_v2:
+                return {"valid": False, "reason": "V2_EXIT_ALLOCATIONS_INVALID"}
+
+    # 3. Otherwise, for legacy pre-Version-2 trades only
+    if is_v2:
+        return {"valid": False, "reason": "V2_EXIT_ALLOCATIONS_MISSING"}
+
+    total_qty = int(total_q)
     t1_qty = floor(total_qty * 0.33)
     t2_qty = floor(total_qty * 0.33)
     t3_qty = total_qty - t1_qty - t2_qty
@@ -1387,30 +1478,108 @@ def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: fl
     stop_loss = previous_day_low if is_buy_trade(signal) and previous_day_low is not None else planned_stop_loss
     target_1 = paper_plan.get("paper_target_1")
     target_2 = paper_plan.get("paper_target_2")
-    target_3 = paper_plan.get("paper_target_3")
-    if None in (entry_price, stop_loss, target_1, target_2, target_3):
-        return None
-    risk_per_share = entry_price - stop_loss
-    if risk_per_share <= 0:
-        return None
+def extract_resistance_zones_from_candles(candles: list[dict]) -> list[dict]:
+    zones = []
+    if len(candles) >= 3:
+        for i in range(1, len(candles) - 1):
+            if candles[i]["high"] > candles[i-1]["high"] and candles[i]["high"] > candles[i+1]["high"]:
+                zones.append({
+                    "level": candles[i]["high"],
+                    "lower_bound": candles[i]["high"] * 0.99,
+                    "upper_bound": candles[i]["high"] * 1.01,
+                    "timeframe": "1D",
+                    "source": "1D_pivot_high",
+                    "candle_timestamp": candles[i].get("time") or candles[i].get("timestamp"),
+                    "strength": 1
+                })
+    if candles:
+        last_20 = candles[-20:]
+        val = max(c["high"] for c in last_20)
+        zones.append({
+            "level": val,
+            "lower_bound": val * 0.99,
+            "upper_bound": val * 1.01,
+            "timeframe": "1D",
+            "source": "1D_recent_high_20",
+            "candle_timestamp": candles[-1].get("time") or candles[-1].get("timestamp"),
+            "strength": 1
+        })
+    return zones
 
-    grade = signal.get("trade_quality_grade") or signal.get("grade") or paper_plan.get("trade_quality_grade") or paper_plan.get("grade")
 
-    from services.position_sizing import calculate_proposed_sizing
-    sizing = calculate_proposed_sizing(
-        entry_price=entry_price,
-        stop_loss=stop_loss,
-        grade=grade,
-        current_balance=250000.0,
-        available_margin=250000.0,
-        open_margin=0.0,
+def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: float = 250000.0, risk_percent: float = 1.0) -> dict | None:
+    if len(candles) < 10:
+        return None
+    signal_has_paper_plan = "paper_plan_valid" in signal
+    if signal.get("paper_plan_valid") is True:
+        paper_plan = {field: signal.get(field) for field in PAPER_PLAN_FIELDS if signal.get(field) is not None}
+    elif signal_has_paper_plan:
+        return None
+    else:
+        signal_type = signal.get("signal_type") or signal.get("source_signal_type", "SWING_TV_CONFIRMED")
+        strategy = "momentum" if signal_type == "MOMENTUM_TV_CONFIRMED" else "swing"
+        status = "MOMENTUM_CONFIRMED" if strategy == "momentum" else "CONFIRMED_SIGNAL"
+        paper_plan = build_price_action_paper_plan_from_candles(candles, strategy, status, signal.get("timeframe", "1D"))
+        if not paper_plan.get("paper_plan_valid"):
+            return None
+
+    entry_price = paper_plan.get("paper_entry_price")
+    planned_stop_loss = paper_plan.get("paper_stop_loss") or paper_plan.get("technical_stop_loss")
+    previous_day_low = previous_day_low_from_candles(candles)
+
+    allow_override = is_buy_trade(signal) and previous_day_low is not None
+    strategy_type = "momentum" if (signal.get("signal_type") or signal.get("source_signal_type") or "").upper() == "MOMENTUM_TV_CONFIRMED" else "swing"
+
+    entry_atr = paper_plan.get("entry_atr") or paper_plan.get("atr_used") or 0.05 * entry_price
+    atr_4h = paper_plan.get("atr_4h") or entry_atr
+    atr_daily = paper_plan.get("atr_daily") or entry_atr
+    daily_ema20 = paper_plan.get("daily_ema20") or paper_plan.get("ema20")
+    daily_ema50 = paper_plan.get("daily_ema50") or paper_plan.get("ema50")
+    weekly_support_used = paper_plan.get("weekly_support_used")
+
+    zones = extract_resistance_zones_from_candles(candles) if signal.get("calculation_version") == 2 else []
+    grade = signal.get("trade_quality_grade") or signal.get("grade") or paper_plan.get("trade_quality_grade") or paper_plan.get("grade") or "A+"
+
+    from services.trade_plan_calculator import calculate_trade_plan
+
+    plan_res = calculate_trade_plan(
+        strategy_type=strategy_type,
+        side="BUY" if is_buy_trade(signal) else "SELL",
+        entry_reference_high=entry_price - (entry_atr * 0.05),
+        entry_atr=entry_atr,
+        structure_swing_low=paper_plan.get("structure_swing_low") or planned_stop_loss,
+        structure_swing_low_timeframe=paper_plan.get("structure_swing_low_timeframe") or "1D",
+        atr_4h=atr_4h,
+        atr_daily=atr_daily,
+        daily_ema20=daily_ema20,
+        daily_ema50=daily_ema50,
+        nearest_weekly_support=weekly_support_used,
+        confirmed_resistance_zones=zones,
+        current_balance=paper_capital,
+        available_margin=paper_capital,
         combined_open_risk=0.0,
+        setup_grade=grade,
+        allow_sl_override=allow_override,
+        previous_day_low=previous_day_low,
+        previous_day_low_timestamp=candles[-2].get("time") or candles[-2].get("timestamp") if len(candles) >= 2 else None,
     )
 
-    proposed_qty = sizing.get("final_quantity", 0) if sizing.get("ok") else 0
-    proposed_margin = sizing.get("required_margin", 0.0) if sizing.get("ok") else 0.0
-    proposed_risk = sizing.get("estimated_sl_risk", 0.0) if sizing.get("ok") else 0.0
-    proposed_exposure = sizing.get("exposure", 0.0) if sizing.get("ok") else 0.0
+    if not plan_res.get("activation_allowed"):
+        return None
+
+    paper_plan.update(plan_res)
+
+    entry_price = plan_res["entry_price"]
+    stop_loss = plan_res["final_stop_loss"]
+    target_1 = plan_res["t1_target_final"]
+    target_2 = plan_res["t2_target_final"]
+    target_3 = plan_res["t3_target_final"]
+    risk_per_share = plan_res["risk_per_share"]
+    proposed_qty = plan_res["final_quantity"]
+
+    proposed_margin = (proposed_qty * entry_price) / settings.LEVERAGE
+    proposed_risk = plan_res["maximum_loss"]
+    proposed_exposure = proposed_qty * entry_price
 
     now = datetime.utcnow().isoformat()
     plan = {
@@ -1430,11 +1599,11 @@ def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: fl
         "target_2": target_2,
         "target_3": target_3,
         "risk_per_share": risk_per_share,
-        "risk_reward": paper_plan.get("paper_rr_1"),
-        "risk_reward_1": paper_plan.get("paper_rr_1"),
-        "risk_reward_2": paper_plan.get("paper_rr_2"),
-        "risk_reward_3": paper_plan.get("paper_rr_3"),
-        **{field: paper_plan.get(field) for field in PAPER_PLAN_FIELDS},
+        "risk_reward": plan_res["t1_final_rr"],
+        "risk_reward_1": plan_res["t1_final_rr"],
+        "risk_reward_2": plan_res["t2_final_rr"],
+        "risk_reward_3": plan_res["t3_final_rr"],
+        **{field: paper_plan.get(field) for field in PAPER_PLAN_FIELDS if paper_plan.get(field) is not None},
         "avoid_condition": paper_plan.get("invalidation_condition"),
         "paper_only_note": "Paper plan only. No live trading, broker API, or order placement.",
 
@@ -1692,6 +1861,8 @@ def _update_plan_status_raw(
     open_margin: float = 0.0,
     combined_open_risk: float = 0.0,
 ) -> dict:
+    if plan.get("lifecycle_blocked") is True:
+        return {}
     if is_terminal_trade(plan):
         return {}
 
@@ -1752,7 +1923,7 @@ def _update_plan_status_raw(
             temp_plan = {**plan, "quantity": final_q}
             allocations = exit_allocations_for_trade(temp_plan)
             if not allocations.get("valid"):
-                sizing = {"ok": False, "reason": "INVALID_EXIT_ALLOCATION"}
+                sizing = {"ok": False, "reason": allocations.get("reason") or "INVALID_EXIT_ALLOCATION"}
 
         if sizing["ok"]:
             temp_plan = {**plan, "quantity": final_q}
@@ -1796,7 +1967,23 @@ def _update_plan_status_raw(
             }
         else:
             rejection_reason = sizing["reason"]
-            if rejection_reason in {"INSUFFICIENT_MARGIN", "PORTFOLIO_MARGIN_LIMIT_EXCEEDED", "PORTFOLIO_RISK_LIMIT_EXCEEDED", "INVALID_BALANCE"}:
+            if rejection_reason in {"V2_EXIT_ALLOCATIONS_MISSING", "V2_EXIT_ALLOCATIONS_INVALID"}:
+                return {
+                    "latest_close": latest_close,
+                    "latest_high": latest_high,
+                    "latest_low": latest_low,
+                    "last_checked_at": now,
+                    "updated_at": now,
+                    "status": "WAITING_FOR_ENTRY",
+                    "outcome_status": "WAITING_FOR_ENTRY",
+                    "state": "WAITING_FOR_ENTRY",
+                    "activation_blocked_reason": rejection_reason,
+                    "last_activation_attempt_at": now,
+                    "lifecycle_blocked": True,
+                    "block_code": rejection_reason,
+                    "block_message": "Version 2 exit allocations are missing or invalid.",
+                }
+            elif rejection_reason in {"INSUFFICIENT_MARGIN", "PORTFOLIO_MARGIN_LIMIT_EXCEEDED", "PORTFOLIO_RISK_LIMIT_EXCEEDED", "INVALID_BALANCE"}:
                 return {
                     "latest_close": latest_close,
                     "latest_high": latest_high,
@@ -1855,6 +2042,17 @@ def _update_plan_status_raw(
 
     management_update = {**stop_loss_update}
     allocations = exit_allocations_for_trade(plan)
+    calc_ver = plan.get("calculation_version") or plan.get("risk_plan_version") or 1
+    if calc_ver >= 2 and not allocations.get("valid"):
+        reason = allocations.get("reason") or "V2_EXIT_ALLOCATIONS_MISSING"
+        log_lifecycle_system_error_sync(plan, reason, f"Active/Partial trade has missing or invalid exit allocations.")
+        return {
+            "lifecycle_blocked": True,
+            "block_code": reason,
+            "block_message": "Version 2 exit allocations are missing or invalid.",
+            "updated_at": now,
+        }
+
     if not plan.get("exit_allocations") and allocations.get("valid"):
         management_update["exit_allocations"] = allocations
     quantity_remaining = existing_quantity_remaining({**plan, **management_update})
@@ -2108,6 +2306,133 @@ async def get_paper_plans(
     cursor = get_database().paper_trades.find(query, {"_id": 0}).sort("updated_at", -1).limit(limit)
     plans = [row async for row in cursor]
     return {"count": len(plans), "plans": plans}
+
+
+@router.get("/audit-waiting")
+async def audit_waiting_trades() -> dict:
+    db = get_database()
+    cursor = db.paper_trades.find({"paper_only": True, "status": WAITING_FOR_ENTRY_STATUS})
+    plans = [row async for row in cursor]
+    results = []
+
+    from services.trade_plan_calculator import calculate_trade_plan
+
+    for plan in plans:
+        symbol = plan["symbol"]
+        timeframe = plan.get("timeframe", "1D")
+        try:
+            tv_result = await tradingview_manager.run_sync(
+                "paper.audit_waiting.fetch_candles",
+                fetch_tradingview_candles_sync,
+                symbol,
+                timeframe,
+                min_candles=10,
+                timeout_seconds=settings.TRADINGVIEW_SYMBOL_TIMEOUT_SECONDS,
+                retries=1,
+            )
+            candles = tv_result.get("candles") or []
+        except Exception as exc:
+            logger.warning("Failed to fetch candles for symbol=%s in waiting audit: %s", symbol, exc)
+            candles = []
+
+        if not candles:
+            results.append({
+                "symbol": symbol,
+                "error": "COULD_NOT_FETCH_CANDLES",
+                "old": {
+                    "entry_price": plan.get("entry_price"),
+                    "stop_loss": plan.get("stop_loss"),
+                    "quantity": plan.get("quantity"),
+                }
+            })
+            continue
+
+        previous_day_low = previous_day_low_from_candles(candles)
+        allow_override = is_buy_trade(plan) and previous_day_low is not None
+        strategy_type = "momentum" if "MOMENTUM" in str(plan.get("source_signal_type") or "").upper() else "swing"
+
+        entry_price = plan.get("entry_price")
+        planned_stop_loss = plan.get("stop_loss")
+        entry_atr = plan.get("entry_atr") or plan.get("atr_used") or 0.05 * entry_price
+        atr_4h = plan.get("atr_4h") or entry_atr
+        atr_daily = plan.get("atr_daily") or entry_atr
+        daily_ema20 = plan.get("daily_ema20") or plan.get("ema20")
+        daily_ema50 = plan.get("daily_ema50") or plan.get("ema50")
+        weekly_support_used = plan.get("weekly_support_used")
+
+        zones = extract_resistance_zones_from_candles(candles)
+        grade = plan.get("trade_quality_grade") or plan.get("grade") or "A+"
+
+        current_balance, _ = await get_current_virtual_balance_and_pnl(db)
+        open_margin, combined_open_risk = await get_portfolio_totals(db)
+        available_margin = current_balance - open_margin
+
+        plan_res = calculate_trade_plan(
+            strategy_type=strategy_type,
+            side="BUY" if is_buy_trade(plan) else "SELL",
+            entry_reference_high=entry_price - (entry_atr * 0.05),
+            entry_atr=entry_atr,
+            structure_swing_low=plan.get("structure_swing_low") or planned_stop_loss,
+            structure_swing_low_timeframe=plan.get("structure_swing_low_timeframe") or "1D",
+            atr_4h=atr_4h,
+            atr_daily=atr_daily,
+            daily_ema20=daily_ema20,
+            daily_ema50=daily_ema50,
+            nearest_weekly_support=weekly_support_used,
+            confirmed_resistance_zones=zones,
+            current_balance=current_balance,
+            available_margin=available_margin,
+            combined_open_risk=combined_open_risk,
+            setup_grade=grade,
+            allow_sl_override=allow_override,
+            previous_day_low=previous_day_low,
+            previous_day_low_timestamp=candles[-2].get("time") or candles[-2].get("timestamp") if len(candles) >= 2 else None,
+        )
+
+        is_over_risk = False
+        if plan.get("quantity") and plan_res.get("risk_budget"):
+            new_risk = plan_res.get("risk_per_share") or 0.0
+            if plan["quantity"] * new_risk > plan_res["risk_budget"] + 1e-4:
+                is_over_risk = True
+
+        results.append({
+            "symbol": symbol,
+            "error": None,
+            "old": {
+                "entry_price": plan.get("entry_price"),
+                "stop_loss": plan.get("stop_loss"),
+                "risk_per_share": plan.get("risk_per_share"),
+                "target_1": plan.get("target_1"),
+                "target_2": plan.get("target_2"),
+                "target_3": plan.get("target_3"),
+                "quantity": plan.get("quantity"),
+                "maximum_loss": (plan.get("quantity") or 0) * (plan.get("risk_per_share") or 0),
+                "t1_quantity": plan.get("t1_quantity"),
+                "t2_quantity": plan.get("t2_quantity"),
+                "t3_quantity": plan.get("t3_quantity"),
+            },
+            "new": {
+                "entry_price": plan_res.get("entry_price"),
+                "technical_stop_loss": plan_res.get("technical_stop_loss"),
+                "final_stop_loss": plan_res.get("final_stop_loss"),
+                "stop_loss_basis": plan_res.get("stop_loss_basis"),
+                "stop_loss_overridden": plan_res.get("stop_loss_overridden"),
+                "risk_per_share": plan_res.get("risk_per_share"),
+                "target_1": plan_res.get("t1_target_final"),
+                "target_2": plan_res.get("t2_target_final"),
+                "target_3": plan_res.get("t3_target_final"),
+                "quantity": plan_res.get("final_quantity"),
+                "maximum_loss": plan_res.get("maximum_loss"),
+                "t1_quantity": plan_res.get("t1_quantity"),
+                "t2_quantity": plan_res.get("t2_quantity"),
+                "t3_quantity": plan_res.get("t3_quantity"),
+            },
+            "is_over_risk": is_over_risk,
+            "activation_allowed": plan_res.get("activation_allowed"),
+            "block_code": plan_res.get("block_code"),
+            "block_message": plan_res.get("block_message"),
+        })
+    return {"count": len(results), "audit": results}
 
 
 async def run_paper_trade_update(

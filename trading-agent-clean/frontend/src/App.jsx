@@ -1408,6 +1408,22 @@ function PaperTradePlan({ title, row }) {
       <PlanMetricCard label="Risk / Share" value={row?.paper_risk_per_share} tone={cautionPlan ? "yellow" : validPlan ? "green" : "red"} />
       <PlanMetricCard label="RR" value={rrDisplay(row?.paper_rr_1, row?.paper_rr_2, row?.paper_rr_3)} detail={rrStatusDetail} tone={cautionPlan ? "yellow" : validPlan ? "green" : "red"} />
       <PlanMetricCard label="Exit / Invalidation" value={row?.invalidation_condition} detail={row?.next_action_for_paper_trade} tone="red" />
+      {row?.calculation_version === 2 && <>
+        <PlanMetricCard label="Technical SL" value={row?.technical_stop_loss} detail={row?.stop_loss_basis} tone="yellow" />
+        <PlanMetricCard label="SL Basis" value={row?.stop_loss_basis} tone="yellow" />
+        <PlanMetricCard label="SL Overridden?" value={row?.stop_loss_overridden ? "Yes" : "No"} detail={row?.stop_loss_override_reason} tone={row?.stop_loss_overridden ? "yellow" : "green"} />
+        <PlanMetricCard label="Raw Targets" value={`T1: ${row?.t1_target_raw} | T2: ${row?.t2_target_raw} | T3: ${row?.t3_target_raw}`} tone="yellow" />
+        <PlanMetricCard label="T1 Details" value={`Final: ${row?.t1_target_final} (${row?.t1_final_rr}R)`} detail={`Conf: ${row?.t1_confidence} | Basis: ${row?.t1_structure_basis} | Flag: ${row?.t1_flag}`} tone="green" />
+        <PlanMetricCard label="T2 Details" value={`Final: ${row?.t2_target_final} (${row?.t2_final_rr}R)`} detail={`Conf: ${row?.t2_confidence} | Basis: ${row?.t2_structure_basis} | Flag: ${row?.t2_flag}`} tone="green" />
+        <PlanMetricCard label="T3 Details" value={`Final: ${row?.t3_target_final} (${row?.t3_final_rr}R)`} detail={`Conf: ${row?.t3_confidence} | Basis: ${row?.t3_structure_basis} | Flag: ${row?.t3_flag}`} tone="green" />
+        <PlanMetricCard label="Risk Budget" value={row?.risk_budget} tone="green" />
+        <PlanMetricCard label="Quantity Ceilings" value={`Risk: ${row?.quantity_by_risk} | Grade: ${row?.quantity_by_grade_margin} | Avail: ${row?.quantity_by_available_margin}`} tone="yellow" />
+        <PlanMetricCard label="Min Allowed Qty" value={row?.minimum_allowed_quantity} detail={`Req Margin Qty: ${row?.quantity_for_minimum_margin}`} tone="yellow" />
+        <PlanMetricCard label="Final Qty" value={row?.final_quantity} tone="green" />
+        <PlanMetricCard label="Max Loss" value={row?.maximum_loss} tone="red" />
+        <PlanMetricCard label="Partial Quantities" value={`T1: ${row?.t1_quantity} | T2: ${row?.t2_quantity} | T3: ${row?.t3_quantity}`} detail={`Reason: ${row?.allocation_reason}`} tone="green" />
+        {row?.block_code && <PlanMetricCard label="Block Reason" value={row?.block_code} detail={row?.block_message} tone="red" />}
+      </>}
     </div>}
   </section>;
 }

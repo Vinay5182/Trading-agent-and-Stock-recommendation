@@ -16,7 +16,7 @@ def calculate_proposed_sizing(
     Pure position sizing calculator that enforces:
     1. Dynamic risk by grade (A+: 0.50%, A: 0.35%, B: 0.25%, others reject)
     2. Sizing by stop-loss distance
-    3. Minimum ₹5,000 entry-margin rule (scales quantity up if required margin < ₹5,000)
+    3. Minimum ₹5,000 entry-margin rule (never scales quantity up, ceiling is min)
     4. Available margin, grade caps, and portfolio limits.
     5. Minimum quantity threshold of 4.
     """
@@ -53,13 +53,26 @@ def calculate_proposed_sizing(
     risk_budget = current_balance * (grade_risk_percent / 100.0)
     quantity_by_risk = floor(risk_budget / stop_distance)
 
-    # Minimum entry-margin rule (scales quantity up to ₹5,000 margin):
-    qty_for_5k = ceil((settings.MINIMUM_ENTRY_MARGIN * settings.LEVERAGE) / entry_price)
+    grade_margin_capital = current_balance * (grade_margin_cap / 100.0)
+    quantity_by_grade_margin = floor(grade_margin_capital * settings.LEVERAGE / entry_price)
+    quantity_by_available_margin = floor(available_margin * settings.LEVERAGE / entry_price)
 
-    final_quantity = max(quantity_by_risk, qty_for_5k)
+    # Sizing checks treat all quantities as ceilings using min()
+    final_quantity = min(quantity_by_risk, quantity_by_grade_margin, quantity_by_available_margin)
 
-    if final_quantity < 4:
-        return {"ok": False, "reason": "QUANTITY_BELOW_MINIMUM"}
+    # Minimum entry-margin requirement
+    quantity_for_minimum_margin = ceil((settings.MINIMUM_ENTRY_MARGIN * settings.LEVERAGE) / entry_price)
+    minimum_allowed_quantity = max(4, quantity_for_minimum_margin)
+
+    if final_quantity < minimum_allowed_quantity:
+        if quantity_by_risk < minimum_allowed_quantity:
+            return {"ok": False, "reason": "RISK_QUANTITY_BELOW_MINIMUM"}
+        elif quantity_by_available_margin < minimum_allowed_quantity:
+            return {"ok": False, "reason": "INSUFFICIENT_AVAILABLE_MARGIN"}
+        elif quantity_by_grade_margin < minimum_allowed_quantity:
+            return {"ok": False, "reason": "GRADE_MARGIN_CAP_TOO_LOW"}
+        else:
+            return {"ok": False, "reason": "MINIMUM_ENTRY_MARGIN_NOT_MET"}
 
     exposure = final_quantity * entry_price
     required_margin = exposure / settings.LEVERAGE

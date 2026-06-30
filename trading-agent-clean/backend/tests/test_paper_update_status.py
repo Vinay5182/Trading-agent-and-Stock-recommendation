@@ -127,7 +127,7 @@ def test_build_plan_stores_initial_and_current_stop_from_previous_day_low() -> N
         "paper_target_3": 140.0,
     }
 
-    plan = paper.build_plan_from_candles(signal, candles, 100000, 1)
+    plan = paper.build_plan_from_candles(signal, candles, 500000, 1)
 
     assert plan is not None
     assert plan["stop_loss"] == 99.0
@@ -939,3 +939,127 @@ def test_active_stop_dry_run_proposes_transition_without_mongo_write(monkeypatch
     assert result["would_write"] is True
     assert collection.update_calls == []
     assert collection.delete_calls == []
+
+
+def test_v2_allocation_integrity_scenarios() -> None:
+    # 1. Missing V2 allocation before activation blocks activation
+    plan_1 = {
+        "calculation_version": 2,
+        "quantity": 10,
+        "entry_price": 100.0,
+        "stop_loss": 90.0,
+        "status": "WAITING_FOR_ENTRY",
+        "outcome_status": "WAITING_FOR_ENTRY",
+        "state": "WAITING_FOR_ENTRY",
+    }
+    candle_1 = {"high": 105.0, "low": 95.0, "close": 101.0}
+    update_1 = paper.update_plan_status(plan_1, candle_1)
+    assert update_1.get("status") == "WAITING_FOR_ENTRY"
+    assert update_1.get("lifecycle_blocked") is True
+    assert update_1.get("block_code") == "V2_EXIT_ALLOCATIONS_MISSING"
+
+    # 2. Invalid V2 allocation before activation blocks activation
+    plan_2 = {
+        "calculation_version": 2,
+        "quantity": 10,
+        "entry_price": 100.0,
+        "stop_loss": 90.0,
+        "status": "WAITING_FOR_ENTRY",
+        "outcome_status": "WAITING_FOR_ENTRY",
+        "state": "WAITING_FOR_ENTRY",
+        "exit_allocations": {"t1": {"quantity": 5}, "t2": {"quantity": 3}, "t3": {"quantity": 1}} # sum is 9, quantity is 10 (invalid!)
+    }
+    update_2 = paper.update_plan_status(plan_2, candle_1)
+    assert update_2.get("status") == "WAITING_FOR_ENTRY"
+    assert update_2.get("lifecycle_blocked") is True
+    assert update_2.get("block_code") == "V2_EXIT_ALLOCATIONS_INVALID"
+
+    # 3. Missing V2 allocation on ACTIVE trade preserves ACTIVE status and records a lifecycle error
+    plan_3 = {
+        "calculation_version": 2,
+        "quantity": 100,
+        "entry_price": 100.0,
+        "stop_loss": 90.0,
+        "status": "ACTIVE",
+        "outcome_status": "ACTIVE",
+        "state": "ACTIVE",
+    }
+    update_3 = paper.update_plan_status(plan_3, candle_1)
+    assert "status" not in update_3
+    assert "outcome_status" not in update_3
+    assert update_3.get("lifecycle_blocked") is True
+    assert update_3.get("block_code") == "V2_EXIT_ALLOCATIONS_MISSING"
+
+    # 4. Missing V2 allocation on T1_PARTIAL preserves T1_PARTIAL status
+    plan_4 = {
+        "calculation_version": 2,
+        "quantity": 100,
+        "entry_price": 100.0,
+        "stop_loss": 90.0,
+        "status": "T1_PARTIAL",
+        "outcome_status": "T1_PARTIAL",
+        "state": "T1_PARTIAL",
+    }
+    update_4 = paper.update_plan_status(plan_4, candle_1)
+    assert "status" not in update_4
+    assert "outcome_status" not in update_4
+    assert update_4.get("lifecycle_blocked") is True
+    assert update_4.get("block_code") == "V2_EXIT_ALLOCATIONS_MISSING"
+
+    # 5. No missing-allocation case becomes AMBIGUOUS
+    assert update_1.get("status") != "AMBIGUOUS"
+    assert update_2.get("status") != "AMBIGUOUS"
+    assert "status" not in update_3
+    assert "status" not in update_4
+
+    # 6. Genuine same-candle conflict still becomes AMBIGUOUS
+    plan_6 = {
+        "quantity": 100,
+        "entry_price": 100.0,
+        "stop_loss": 90.0,
+        "target_1": 110.0,
+        "target_2": 120.0,
+        "target_3": 130.0,
+        "status": "ACTIVE",
+        "outcome_status": "ACTIVE",
+        "state": "ACTIVE",
+    }
+    conflict_candle = {"high": 115.0, "low": 85.0, "close": 95.0}
+    update_6 = paper.update_plan_status(plan_6, conflict_candle)
+    assert update_6.get("status") == "AMBIGUOUS"
+
+    # 7. Analytics do not count allocation-integrity errors as ambiguous trades, wins or losses
+    from services.trade_journal import is_ambiguous_trade, is_completed_trade
+    t_blocked = {**plan_3, "lifecycle_blocked": True}
+    assert not is_ambiguous_trade(t_blocked)
+    assert not is_completed_trade(t_blocked)
+
+    # 8. Journal does not create a terminal trade snapshot for this integrity error
+    import asyncio
+    class DummyColl:
+        def __init__(self):
+            self.items = []
+        def find(self, query):
+            class Cursor:
+                def __init__(self, items):
+                    self.items = items
+                def sort(self, *args, **kwargs):
+                    return self
+                def limit(self, *args, **kwargs):
+                    return self
+                def __aiter__(self):
+                    return self
+                async def __anext__(self):
+                    if not self.items:
+                        raise StopAsyncIteration
+                    return self.items.pop(0)
+            return Cursor(list(self.items))
+    dummy_db = type("DummyDB", (), {
+        "paper_trades": DummyColl(),
+        "trade_journal": DummyColl()
+    })
+    dummy_db.paper_trades.items = [t_blocked]
+    from services.trade_journal import sync_completed_trades_to_journal
+    sync_res = asyncio.run(sync_completed_trades_to_journal(dummy_db))
+    assert sync_res["skipped"] == 1
+    assert sync_res["journaled"] == 0

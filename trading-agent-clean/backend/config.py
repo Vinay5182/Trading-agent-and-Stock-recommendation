@@ -96,8 +96,25 @@ class Settings:
     GRADE_RISK_PERCENT_B: float = 0.25
     GRADE_MARGIN_CAP_B: float = 6.0
 
+    MOMENTUM_SL_ATR_MULTIPLIER: float = 1.25
+    SWING_SL_ATR_MULTIPLIER: float = 1.75
+    TARGET_STRUCTURE_TOLERANCE_PERCENT_MIN: float = 10.0
+    TARGET_STRUCTURE_TOLERANCE_PERCENT_MAX: float = 15.0
+    TARGET_STRUCTURE_TOLERANCE_PERCENT: float = 12.5
+    SUB_1R_T1_ALLOCATION_PERCENT: float = 25.0
+    SUB_1R_T2_ALLOCATION_PERCENT: float = 42.0
+    MOMENTUM_SL_MAX_ATR_DIST_EMA20: float = 2.0
+    SWING_SL_MAX_ATR_DIST_WEEKLY_SUPPORT: float = 1.5
+
 
 def validate_settings(value: Settings) -> dict:
+    if not (1.0 <= value.MOMENTUM_SL_ATR_MULTIPLIER <= 1.5):
+        raise ConfigValidationError("CONFIG_INVALID_MOMENTUM_SL_ATR_MULTIPLIER", "MOMENTUM_SL_ATR_MULTIPLIER must be between 1.0 and 1.5.", {"field": "MOMENTUM_SL_ATR_MULTIPLIER"})
+    if not (1.5 <= value.SWING_SL_ATR_MULTIPLIER <= 2.0):
+        raise ConfigValidationError("CONFIG_INVALID_SWING_SL_ATR_MULTIPLIER", "SWING_SL_ATR_MULTIPLIER must be between 1.5 and 2.0.", {"field": "SWING_SL_ATR_MULTIPLIER"})
+    if not (10.0 <= value.TARGET_STRUCTURE_TOLERANCE_PERCENT <= 15.0):
+        raise ConfigValidationError("CONFIG_INVALID_TARGET_STRUCTURE_TOLERANCE_PERCENT", "TARGET_STRUCTURE_TOLERANCE_PERCENT must be between 10.0 and 15.0.", {"field": "TARGET_STRUCTURE_TOLERANCE_PERCENT"})
+
     parsed = urlparse(value.MONGO_URI)
     if parsed.scheme not in {"mongodb", "mongodb+srv"} or not parsed.netloc:
         raise ConfigValidationError("CONFIG_INVALID_MONGO_URI", "MONGO_URI must be a valid MongoDB URI.", {"field": "MONGO_URI"})

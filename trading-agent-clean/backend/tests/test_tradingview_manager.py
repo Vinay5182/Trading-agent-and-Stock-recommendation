@@ -107,7 +107,7 @@ def test_tradingview_timeout_quarantines_manager_until_worker_finishes(tmp_path)
                 timeout_seconds=1,
             )
         except TradingViewPreflightError as exc:
-            assert exc.code == "TV_MANAGER_RECOVERING"
+            assert exc.code == "TV_OPERATION_QUARANTINED"
         else:
             raise AssertionError("quarantined manager should reject a second worker")
         assert not second_called.is_set()

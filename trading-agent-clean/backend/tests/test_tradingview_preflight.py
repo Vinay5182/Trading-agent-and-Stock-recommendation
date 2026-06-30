@@ -107,7 +107,7 @@ def test_no_attached_tab_blocks_batch_before_candidate_iteration(monkeypatch):
     assert result.status_code == 400
 
     content = json.loads(result.body.decode("utf-8"))
-    assert content["code"] == "TV_TAB_NOT_ATTACHED"
+    assert content["code"] == "TV_NO_VALID_CHART_TAB"
     assert content["valid_target_count"] == 0
     assert content["attached_target_id"] is None
 
@@ -156,7 +156,7 @@ def test_cdp_unavailable_error_code(monkeypatch):
     with pytest.raises(TradingViewPreflightError) as exc_info:
         tradingview_manager.ensure_ready_attached_target()
 
-    assert exc_info.value.code == "TV_CDP_UNAVAILABLE"
+    assert exc_info.value.code == "TV_CDP_UNREACHABLE"
     assert "is unreachable" in exc_info.value.message
     assert exc_info.value.details["cdp_reachable"] is False
 
@@ -205,7 +205,7 @@ def test_multiple_valid_charts_require_manual_selection(monkeypatch):
     with pytest.raises(TradingViewPreflightError) as exc_info:
         tradingview_manager.ensure_ready_attached_target()
 
-    assert exc_info.value.code == "TV_MULTIPLE_CHART_TABS"
+    assert exc_info.value.code == "TV_MULTIPLE_TABS_SELECTION_REQUIRED"
     assert exc_info.value.details["manual_attachment_required"] is True
 
 
@@ -287,7 +287,7 @@ def test_target_disappears_after_frontend_check_or_queueing(monkeypatch):
     with pytest.raises(TradingViewPreflightError) as exc_info:
         asyncio.run(tradingview_manager.run_sync("test_op", lambda: {"status": "ok"}, require_preflight=True))
 
-    assert exc_info.value.code in ("TV_TAB_NOT_ATTACHED", "TV_TAB_DISCONNECTED")
+    assert exc_info.value.code in ("TV_NO_VALID_CHART_TAB", "TV_ATTACH_FAILED")
     assert tradingview_manager.attached_target_id is None
 
 
@@ -320,7 +320,7 @@ def test_manager_busy_returns_tv_manager_busy(monkeypatch):
         try:
             with pytest.raises(TradingViewPreflightError) as exc_info:
                 await tradingview_manager.run_sync("dummy", lambda: None, require_preflight=True)
-            assert exc_info.value.code == "TV_MANAGER_BUSY"
+            assert exc_info.value.code == "TV_OPERATION_BUSY"
         finally:
             tradingview_manager._lock.release()
 
@@ -390,7 +390,7 @@ def test_historical_records_classification():
     from routes.swing import should_save_confirmation_row
 
     # Preflight errors should not be saved as confirmation rows
-    assert should_save_confirmation_row({"tv_status": "TECHNICAL_FAILED", "reason": "TV_TAB_NOT_ATTACHED"}) is False
+    assert should_save_confirmation_row({"tv_status": "TECHNICAL_FAILED", "reason": "TV_NO_VALID_CHART_TAB"}) is False
     assert should_save_confirmation_row({"tv_status": "TECHNICAL_FAILED", "reason": "TV_TAB_DISCONNECTED"}) is False
 
     # Real technical failures during operation are saved so they can be shown in UI, but separated
@@ -478,7 +478,7 @@ def test_target_disappears_after_queueing_but_before_execution(monkeypatch):
         with pytest.raises(TradingViewPreflightError) as exc_info:
             await sync_task
 
-        assert exc_info.value.code == "TV_TAB_NOT_ATTACHED"
+        assert exc_info.value.code == "TV_NO_VALID_CHART_TAB"
         assert tradingview_manager.attached_target_id is None
 
     asyncio.run(run_disappear_flow())
@@ -575,7 +575,7 @@ def test_multiple_tabs_require_explicit_selection_in_status(monkeypatch):
     status = tradingview_manager.get_preflight_status()
 
     assert status["preflight_ready"] is False
-    assert status["preflight_code"] == "TV_MULTIPLE_CHART_TABS"
+    assert status["preflight_code"] == "TV_MULTIPLE_TABS_SELECTION_REQUIRED"
     assert status["valid_chart_target_count"] == 2
     assert status["manual_attachment_required"] is True
 
@@ -628,7 +628,7 @@ def test_attachment_failure_returns_stable_error(monkeypatch):
     with pytest.raises(TradingViewPreflightError) as exc_info:
         tradingview_manager.ensure_ready_attached_target()
 
-    assert exc_info.value.code == "TV_CDP_UNAVAILABLE"
+    assert exc_info.value.code == "TV_CDP_UNREACHABLE"
     assert "unreachable" in exc_info.value.message.lower()
 
 
@@ -640,7 +640,7 @@ def test_zero_valid_tabs_blocks_attachment(monkeypatch):
     with pytest.raises(TradingViewPreflightError) as exc_info:
         tradingview_manager.ensure_ready_attached_target()
 
-    assert exc_info.value.code == "TV_TAB_NOT_ATTACHED"
+    assert exc_info.value.code == "TV_NO_VALID_CHART_TAB"
     assert exc_info.value.details["valid_target_count"] == 0
 
 
@@ -651,5 +651,5 @@ def test_cdp_unreachable_preflight(monkeypatch):
     status = tradingview_manager.get_preflight_status()
 
     assert status["preflight_ready"] is False
-    assert status["preflight_code"] == "TV_CDP_UNAVAILABLE"
+    assert status["preflight_code"] == "TV_CDP_UNREACHABLE"
     assert status["cdp_reachable"] is False

@@ -799,6 +799,64 @@ class TradingViewClient:
             candles = result.get("candles") or []
             if candles:
                 break
+
+        # Validate candles in Python
+        validated_candles = []
+        seen_timestamps = set()
+        for c in candles:
+            if not isinstance(c, dict):
+                continue
+            time_val = c.get("time")
+            if time_val is None:
+                continue
+            try:
+                time_val = float(time_val)
+            except (ValueError, TypeError):
+                continue
+
+            open_val = c.get("open")
+            high_val = c.get("high")
+            low_val = c.get("low")
+            close_val = c.get("close")
+            volume_val = c.get("volume")
+
+            try:
+                open_val = float(open_val)
+                high_val = float(high_val)
+                low_val = float(low_val)
+                close_val = float(close_val)
+                if volume_val is not None:
+                    volume_val = float(volume_val)
+            except (ValueError, TypeError):
+                continue
+
+            if high_val < low_val:
+                continue
+
+            # Reject stale candles (older than 30 days)
+            if time.time() - time_val > 30 * 86400:
+                continue
+
+            # Handle future timestamp safely
+            if time_val > time.time() + 86400:
+                continue
+
+            if time_val in seen_timestamps:
+                continue
+            seen_timestamps.add(time_val)
+
+            validated_candles.append({
+                "time": int(time_val),
+                "open": open_val,
+                "high": high_val,
+                "low": low_val,
+                "close": close_val,
+                "volume": volume_val
+            })
+
+        validated_candles.sort(key=lambda x: x["time"])
+        candles = validated_candles[:2000]
+
         for key in (
             "tradingview_api_available",
             "active_chart_available",

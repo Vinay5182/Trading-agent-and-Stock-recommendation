@@ -830,23 +830,23 @@ def test_timed_out_worker_cannot_mutate_after_later_operation_starts(tmp_path):
         status = manager.runtime_status()
         assert status["worker_running"] is True
         assert status["recovering_from_timeout"] is True
-        assert status["preflight_code"] == "TV_MANAGER_RECOVERING"
+        assert status["preflight_code"] == "TV_OPERATION_QUARANTINED"
         assert status["quarantined_operation"] == "tv.timeout_worker"
         assert status["manager_available"] is False
 
         with pytest.raises(TradingViewPreflightError) as second_exc:
             await manager.run_sync("tv.second_worker", second_worker, timeout_seconds=1)
-        assert second_exc.value.code == "TV_MANAGER_RECOVERING"
+        assert second_exc.value.code == "TV_OPERATION_QUARANTINED"
         assert not second_started.is_set()
 
         with pytest.raises(TradingViewPreflightError) as inspection_exc:
             await manager.run_read_only_inspection("tv.discovery", inspection_worker, timeout_seconds=1)
-        assert inspection_exc.value.code == "TV_MANAGER_RECOVERING"
+        assert inspection_exc.value.code == "TV_OPERATION_QUARANTINED"
         assert not inspection_started.is_set()
 
         with pytest.raises(TradingViewPreflightError) as detach_exc:
             await manager.detach_target_serialized()
-        assert detach_exc.value.code == "TV_MANAGER_RECOVERING"
+        assert detach_exc.value.code == "TV_OPERATION_QUARANTINED"
 
         release.set()
         for _ in range(100):

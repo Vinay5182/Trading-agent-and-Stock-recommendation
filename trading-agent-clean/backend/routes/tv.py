@@ -1,5 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from typing import Any
 
 from config import settings
 from security.operator_intent import require_operator_intent
@@ -21,15 +23,20 @@ class TVTestRequest(BaseModel):
 async def test_symbol(
     request: TVTestRequest,
     _operator_intent: None = Depends(require_operator_intent),
-) -> dict:
-    return await tradingview_manager.run_sync(
-        "tv.test_symbol",
-        _test_symbol_sync,
-        request,
-        timeout_seconds=settings.TRADINGVIEW_SYMBOL_TIMEOUT_SECONDS,
-        retries=1,
-        require_preflight=True,
-    )
+) -> Any:
+    try:
+        return await tradingview_manager.run_operation(
+            "tv.test_symbol",
+            _test_symbol_sync,
+            request,
+            require_chart=True,
+            allow_single_tab_auto_attach=True,
+            timeout_seconds=settings.TRADINGVIEW_SYMBOL_TIMEOUT_SECONDS,
+            retries=1,
+        )
+    except TradingViewPreflightError as exc:
+        status_code = 409 if exc.code == "TV_OPERATION_BUSY" else 400
+        return JSONResponse(status_code=status_code, content=exc.details)
 
 
 @router.get("/runtime-status")
@@ -38,7 +45,7 @@ async def runtime_status() -> dict:
 
 
 @router.get("/attachable-tabs")
-async def attachable_tabs() -> dict:
+async def attachable_tabs() -> Any:
     try:
         return await tradingview_manager.run_read_only_inspection(
             "tv.list_attachable_tabs",
@@ -46,42 +53,54 @@ async def attachable_tabs() -> dict:
             timeout_seconds=25,
         )
     except TradingViewPreflightError as exc:
-        if exc.code == "TV_MANAGER_BUSY":
+        if exc.code in ("TV_OPERATION_BUSY", "TV_MANAGER_BUSY"):
             return _attachable_tabs_busy_payload(exc)
-        _raise_tradingview_preflight_http(exc)
+        return JSONResponse(status_code=400, content=exc.details)
     except TimeoutError as exc:
-        raise HTTPException(status_code=504, detail={"code": "TV_DISCOVERY_TIMEOUT", "message": str(exc)}) from exc
+        return JSONResponse(
+            status_code=504,
+            content={"code": "TV_DISCOVERY_TIMEOUT", "message": str(exc), "retryable": True},
+        )
 
 
 @router.post("/attach-tab")
 async def attach_tab(
     target_id: str = Query(...),
     _operator_intent: None = Depends(require_operator_intent),
-) -> dict:
+) -> Any:
     try:
-        return await tradingview_manager.run_sync(
+        return await tradingview_manager.run_operation(
             "tv.attach_tab",
             _attach_tab_sync,
             target_id,
+            require_chart=False,
             timeout_seconds=25,
             retries=0,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except TradingViewPreflightError as exc:
-        _raise_tradingview_preflight_http(exc)
+        status_code = 409 if exc.code == "TV_OPERATION_BUSY" else 400
+        return JSONResponse(status_code=status_code, content=exc.details)
     except TimeoutError as exc:
-        raise HTTPException(status_code=504, detail={"code": "TV_ATTACH_TIMEOUT", "message": str(exc)}) from exc
+        return JSONResponse(
+            status_code=504,
+            content={"code": "TV_ATTACH_TIMEOUT", "message": str(exc), "retryable": True},
+        )
 
 
 @router.post("/detach-tab")
-async def detach_tab(_operator_intent: None = Depends(require_operator_intent)) -> dict:
+async def detach_tab(_operator_intent: None = Depends(require_operator_intent)) -> Any:
     try:
         return await tradingview_manager.detach_target_serialized()
     except TradingViewPreflightError as exc:
-        _raise_tradingview_preflight_http(exc)
+        status_code = 409 if exc.code == "TV_OPERATION_BUSY" else 400
+        return JSONResponse(status_code=status_code, content=exc.details)
     except TimeoutError as exc:
-        raise HTTPException(status_code=504, detail={"code": "TV_DETACH_TIMEOUT", "message": str(exc)}) from exc
+        return JSONResponse(
+            status_code=504,
+            content={"code": "TV_DETACH_TIMEOUT", "message": str(exc), "retryable": True},
+        )
 
 
 def _list_attachable_tabs_sync() -> dict:
@@ -93,6 +112,7 @@ def _list_attachable_tabs_sync() -> dict:
     attached_target_id = attached.get("target_id") if attached else None
     target_ids = {str(target.get("target_id")) for target in targets if target.get("target_id")}
     attached_target_visible = bool(attached_target_id and str(attached_target_id) in target_ids)
+    preflight = tradingview_manager.get_preflight_status()
     return {
         "targets": targets,
         "count": len(targets),
@@ -103,6 +123,7 @@ def _list_attachable_tabs_sync() -> dict:
         "attached_target_stale": bool(attached_target_id and not attached_target_visible),
         "manual_attachment_required": attached_target_id is None or not attached_target_visible,
         "manager_busy": False,
+        "state": preflight.get("state"),
         "diagnostics": getattr(client, "diagnostics", {}),
     }
 
@@ -139,18 +160,6 @@ def _attachable_tabs_busy_payload(exc: TradingViewPreflightError) -> dict:
             "message": exc.message,
         },
     }
-
-
-def _raise_tradingview_preflight_http(exc: TradingViewPreflightError) -> None:
-    status_code = 409 if exc.code == "TV_MANAGER_BUSY" else 503
-    raise HTTPException(
-        status_code=status_code,
-        detail={
-            "code": exc.code,
-            "message": exc.message,
-            "details": exc.details,
-        },
-    )
 
 
 def _test_symbol_sync(request: TVTestRequest) -> dict:

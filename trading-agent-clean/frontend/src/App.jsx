@@ -4,7 +4,7 @@ import {
   getAiDataCollectionStatus, getAiFeatureDatasetSummary, getAiFeatureSnapshots, getAiOutcomePreview, getDashboardPaperEquity, getHealth, getMarketDataSymbol, getMarketLoadProgress, getMomentumCandidates, getMomentumPrecheck,
   getMomentumSummary, getMomentumTvConfirmed, getPaperHistory, getPaperOpenTrades, getPaperSummary, getPaperUpdateLock, getPaperUpdateProgress, getPaperUpdateRuns, getPaperUpdateSchedulerStatus, getScanRows, getScoreSummary, getSettings, getSwingCandidates, getSystemRuntimeInfo,
   getSwingPrecheck, getSwingSummary, getSwingTvConfirmed, getTradingViewAttachableTabs, getTradingViewRuntimeStatus, isRequestCancellation, momentumTvConfirm, loadAllMarketData, runPaperPipeline, runScoring,
-  swingTvConfirm, testTvSymbol, tradingViewBadge, deriveTradingViewBusy, isBatchReady,
+  swingTvConfirm, testTvSymbol, tradingViewBadge, deriveTradingViewBusy, isBatchReady, canStartTradingViewOperation,
 } from "./api";
 import { aiDataCollectionChecklist, aiOutcomeEligibleRows, aiOutcomeSkippedRows, aiSnapshotDisplayRows } from "./aiDataset";
 
@@ -2851,7 +2851,7 @@ export default function App() {
       tvPollAbortRef.current?.abort();
       try {
         const status = await fetchAndSetTvRuntimeStatusAction({ manual: true, forceAbort: true });
-        if (!status || status.preflight_ready !== true) {
+        if (!status || !canStartTradingViewOperation(status)) {
           throw new Error(status?.preflight_message || "TradingView is not ready for batch confirm.");
         }
         if (deriveTradingViewBusy(status)) {
@@ -2921,6 +2921,13 @@ export default function App() {
             setSwingBatchResults([...completed]);
             setLatestSwingTvRows((current) => [...current, ...rows]);
             setSwingTvRowsLoaded(true);
+            if (offset === 0) {
+              try {
+                await fetchAndSetTvRuntimeStatusAction({ manual: true });
+              } catch (statusErr) {
+                console.error("Failed to refresh status after first batch attachment", statusErr);
+              }
+            }
             setSwingBatchProgress((current) => current ? { ...current, processed_so_far: processedSoFar, elapsed_time: Math.floor((Date.now() - startedAt) / 1000) } : current);
           } catch (err) {
             if (isRequestCancellation(err)) throw err;
@@ -3007,7 +3014,7 @@ export default function App() {
       tvPollAbortRef.current?.abort();
       try {
         const status = await fetchAndSetTvRuntimeStatusAction({ manual: true, forceAbort: true });
-        if (!status || status.preflight_ready !== true) {
+        if (!status || !canStartTradingViewOperation(status)) {
           throw new Error(status?.preflight_message || "TradingView is not ready for batch confirm.");
         }
         if (deriveTradingViewBusy(status)) {
@@ -3076,6 +3083,13 @@ export default function App() {
             setMomentumBatchResults([...completed]);
             setLatestMomentumTvRows((current) => [...current, ...rows]);
             setMomentumTvRowsLoaded(true);
+            if (offset === 0) {
+              try {
+                await fetchAndSetTvRuntimeStatusAction({ manual: true });
+              } catch (statusErr) {
+                console.error("Failed to refresh status after first batch attachment", statusErr);
+              }
+            }
             setMomentumBatchProgress((current) => current ? { ...current, processed_so_far: processedSoFar, elapsed_time: Math.floor((Date.now() - startedAt) / 1000) } : current);
           } catch (err) {
             if (isRequestCancellation(err)) throw err;

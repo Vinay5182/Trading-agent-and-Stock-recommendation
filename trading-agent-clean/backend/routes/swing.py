@@ -265,7 +265,7 @@ async def save_confirmation_row(row: dict) -> None:
 def should_save_confirmation_row(row: dict) -> bool:
     if row.get("tab_creation_failed_before_symbol_validation") is True:
         return False
-    if row.get("reason") in {"TV_TAB_NOT_ATTACHED", "TV_TAB_DISCONNECTED", "TAB_NAVIGATION_FAILED"}:
+    if row.get("reason") in {"TV_TAB_NOT_ATTACHED", "TV_TAB_DISCONNECTED", "TAB_NAVIGATION_FAILED", "TV_CDP_UNREACHABLE", "TV_NO_VALID_CHART_TAB", "TV_MULTIPLE_TABS_SELECTION_REQUIRED", "TV_ATTACH_FAILED"}:
         return False
     return True
 
@@ -284,25 +284,9 @@ async def run_swing_tv_confirmation(
     exchange: str = "NSE",
 ) -> Any:
     # Advisory-only preflight: reject immediately only for hard failures
-    # (no attached target AND no CDP connection recorded). This uses ONLY
-    # in-memory state and cached results — no live CDP calls.
-    # Transient/busy states are handled by run_sync serialization.
-    if not tradingview_manager.attached_target_id and not tradingview_manager._connected:
-        cached = tradingview_manager._cached_preflight
-        if cached and not cached.get("preflight_ready") and cached.get("preflight_code") not in ("TV_MANAGER_BUSY", "OK"):
-            details = {
-                "code": cached.get("preflight_code"),
-                "message": cached.get("preflight_message"),
-                "cdp_reachable": cached.get("cdp_reachable"),
-                "valid_target_count": cached.get("valid_chart_target_count"),
-                "attached_target_id": None,
-                "attached_title": cached.get("attached_title"),
-                "attached_url": cached.get("attached_url"),
-                "chart_ready": False,
-                "manual_attachment_required": cached.get("manual_attachment_required"),
-                "retryable": False,
-            }
-            return JSONResponse(status_code=400, content=details)
+    preflight = tradingview_manager.get_preflight_status()
+    if not preflight.get("operation_allowed"):
+        return JSONResponse(status_code=400, content=preflight)
 
     clean_index = clean_index_name(index_name)
     available_candidates_count = None
@@ -322,16 +306,17 @@ async def run_swing_tv_confirmation(
         started_at = time.monotonic()
         logger.info("Swing TV symbol started symbol=%s", symbol_name)
         try:
-            confirmation = await tradingview_manager.run_sync(
+            confirmation = await tradingview_manager.run_operation(
                 "swing.confirm_symbol_timeframes",
                 confirm_swing_symbol_timeframes,
                 candidate.get("tradingview_symbol"),
                 checked_timeframes,
                 candidate,
                 tradingview_manager.attached_target_id,
+                require_chart=True,
+                allow_single_tab_auto_attach=True,
                 timeout_seconds=settings.TRADINGVIEW_SYMBOL_TIMEOUT_SECONDS + 10 if hasattr(settings, "TRADINGVIEW_SYMBOL_TIMEOUT_SECONDS") else 100,
                 retries=1,
-                require_preflight=True,
             )
         except TradingViewPreflightError as exc:
             logger.error("Swing TV preflight failed during candidate loop: %s", exc)

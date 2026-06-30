@@ -30,6 +30,7 @@ import {
   deriveTradingViewBusy,
   tradingViewBadge,
   isBatchReady,
+  canStartTradingViewOperation,
 } from "./api.js";
 import { aiDataCollectionChecklist, aiOutcomeSkippedRows, aiSnapshotDisplayRows } from "./aiDataset.js";
 
@@ -1171,4 +1172,81 @@ test("Stock Detail row-open passes exact-row identity and normalizes exchange sy
 test("request cancellation does not display as error", () => {
   const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
   assert.ok(appSource.includes("if (isRequestCancellation(err)) return \"\";"));
+});
+
+test("TV operation eligibility and button conditions under various states", () => {
+  // 1. Ready state enables Swing/Momentum confirmation
+  const readyStatus = { preflight_ready: true, cdp_reachable: true, valid_chart_target_count: 1 };
+  assert.equal(canStartTradingViewOperation(readyStatus), true);
+
+  // 2. One-tab pending state enables Swing/Momentum confirmation
+  const pendingStatus = {
+    preflight_ready: false,
+    cdp_reachable: true,
+    valid_chart_target_count: 1,
+    manual_attachment_required: false,
+    preflight_code: "TV_TAB_NOT_ATTACHED",
+  };
+  assert.equal(canStartTradingViewOperation(pendingStatus), true);
+
+  // 3. Zero tabs disables both
+  const zeroTabsStatus = {
+    preflight_ready: false,
+    cdp_reachable: true,
+    valid_chart_target_count: 0,
+    manual_attachment_required: true,
+    preflight_code: "TV_TAB_NOT_ATTACHED",
+  };
+  assert.equal(canStartTradingViewOperation(zeroTabsStatus), false);
+
+  // 4. Multiple tabs disables both
+  const multiTabsStatus = {
+    preflight_ready: false,
+    cdp_reachable: true,
+    valid_chart_target_count: 2,
+    manual_attachment_required: true,
+    preflight_code: "TV_MULTIPLE_CHART_TABS",
+  };
+  assert.equal(canStartTradingViewOperation(multiTabsStatus), false);
+
+  // 5. CDP unreachable disables both
+  const cdpUnreachableStatus = {
+    preflight_ready: false,
+    cdp_reachable: false,
+    valid_chart_target_count: 0,
+    manual_attachment_required: true,
+    preflight_code: "TV_CDP_UNAVAILABLE",
+  };
+  assert.equal(canStartTradingViewOperation(cdpUnreachableStatus), false);
+
+  // 6. manual_attachment_required disables both
+  const manualRequiredStatus = {
+    preflight_ready: false,
+    cdp_reachable: true,
+    valid_chart_target_count: 1,
+    manual_attachment_required: true,
+    preflight_code: "TV_TAB_NOT_ATTACHED",
+  };
+  assert.equal(canStartTradingViewOperation(manualRequiredStatus), false);
+
+  // 7. running batch (busy) disables start button
+  const busyStatus = {
+    preflight_ready: true,
+    worker_running: true,
+  };
+  assert.equal(canStartTradingViewOperation(busyStatus), false);
+});
+
+test("Swing and Momentum confirmation App logic checks canStartTradingViewOperation and refreshes status", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  // 8. Checks in Swing/Momentum batch confirm calls canStartTradingViewOperation
+  assert.ok(appSource.includes("!canStartTradingViewOperation(status)"));
+
+  // 9. Successful operation (offset === 0) refreshes status
+  assert.ok(appSource.includes("if (offset === 0) {"));
+  assert.ok(appSource.includes("await fetchAndSetTvRuntimeStatusAction({ manual: true });"));
+
+  // 10. Attachment failure (in catch blocks) also triggers refresh to not leave UI permanently disabled
+  assert.ok(appSource.includes("Failed to refresh status after batch failure"));
 });

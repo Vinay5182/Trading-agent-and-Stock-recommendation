@@ -206,8 +206,19 @@ export function tradingViewBadge(status) {
   if (status.connected) return { tone: "green", label: "TradingView Connected" };
   return { tone: "gray", label: "TradingView Idle" };
 }
+export function canStartTradingViewOperation(status) {
+  if (!status) return false;
+  if (deriveTradingViewBusy(status)) return false;
+  if (status.preflight_ready === true) return true;
+  return Boolean(
+    status.cdp_reachable === true &&
+    status.valid_chart_target_count === 1 &&
+    status.manual_attachment_required === false &&
+    status.preflight_code === "TV_TAB_NOT_ATTACHED"
+  );
+}
 export function isBatchReady(status, lastUpdatedTime) {
-  if (!status || status.preflight_ready !== true) return false;
+  if (!canStartTradingViewOperation(status)) return false;
   if (!lastUpdatedTime) return false;
   const elapsed = Date.now() - lastUpdatedTime;
   return elapsed <= 10000;

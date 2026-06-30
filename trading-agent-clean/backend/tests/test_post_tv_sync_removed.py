@@ -248,6 +248,7 @@ def test_swing_confirmation_passes_attached_target_to_worker(monkeypatch) -> Non
     monkeypatch.setattr(swing, "resolve_tv_limit", fake_resolve_tv_limit)
     monkeypatch.setattr(swing, "load_swing_tv_candidate_rows", fake_load_candidates)
     monkeypatch.setattr(swing.tradingview_manager, "run_sync", fake_run_sync)
+    monkeypatch.setattr(swing.tradingview_manager, "get_preflight_status", lambda: {"operation_allowed": True})
     swing.tradingview_manager.attach_target({"target_id": "attached-chart", "title": "TradingView", "url": "https://in.tradingview.com/chart/ThW59K6v/", "websocket_debugger_url": "ws://attached-chart"})
     try:
         result = asyncio.run(swing.run_swing_tv_confirmation("BROAD_MARKET_750", 1, ["1D"], save=False))
@@ -291,6 +292,7 @@ def test_momentum_confirmation_passes_attached_target_to_worker(monkeypatch) -> 
     monkeypatch.setattr(momentum, "resolve_tv_limit", fake_resolve_tv_limit)
     monkeypatch.setattr(momentum, "load_momentum_tv_candidate_rows", fake_load_candidates)
     monkeypatch.setattr(momentum.tradingview_manager, "run_sync", fake_run_sync)
+    monkeypatch.setattr(momentum.tradingview_manager, "get_preflight_status", lambda: {"operation_allowed": True})
     momentum.tradingview_manager.attach_target({"target_id": "attached-chart", "title": "TradingView", "url": "https://in.tradingview.com/chart/ThW59K6v/", "websocket_debugger_url": "ws://attached-chart"})
     try:
         result = asyncio.run(momentum.run_momentum_tv_confirmation("BROAD_MARKET_750", 1, ["1D"], save=False, force_use_stale_scores=False))

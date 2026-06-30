@@ -13,6 +13,16 @@ from fastapi.testclient import TestClient
 
 from main import app
 from routes import paper
+from security.operator_intent import OPERATOR_INTENT_HEADER, OPERATOR_INTENT_VALUE
+
+
+OPERATOR_HEADERS = {OPERATOR_INTENT_HEADER: OPERATOR_INTENT_VALUE}
+
+
+def trusted_client() -> TestClient:
+    client = TestClient(app)
+    client.headers.update(OPERATOR_HEADERS)
+    return client
 
 
 def make_trade(symbol: str = "WAIT1") -> dict:
@@ -289,7 +299,7 @@ def assert_rejected(response, reason: str, db) -> None:
 def test_unbound_real_update_is_rejected_before_evaluation(monkeypatch) -> None:
     db = make_db()
     patch_db(monkeypatch, db)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.post("/api/paper/update-trades?dry_run=false&max_trades=6&max_writes=1")
 
@@ -299,7 +309,7 @@ def test_unbound_real_update_is_rejected_before_evaluation(monkeypatch) -> None:
 def test_approval_rejects_missing_dry_run_id(monkeypatch) -> None:
     db = make_db()
     patch_db(monkeypatch, db)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.post("/api/paper/update-trades/approve", json=approval_body(approved_dry_run_id=None))
 
@@ -310,7 +320,7 @@ def test_approval_rejects_invalid_confirmation_text(monkeypatch) -> None:
     db = make_db()
     make_approval_run(db)
     patch_db(monkeypatch, db)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.post("/api/paper/update-trades/approve", json=approval_body(confirmation_text="wrong"))
 
@@ -338,7 +348,7 @@ def test_approval_rejects_unsafe_dry_run(monkeypatch, overrides, reason) -> None
     db = make_db()
     make_approval_run(db, **overrides)
     patch_db(monkeypatch, db)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.post("/api/paper/update-trades/approve", json=approval_body())
 
@@ -362,7 +372,7 @@ def test_approval_rejects_when_scheduler_is_not_disabled(monkeypatch, unsafe_fie
         return status
 
     monkeypatch.setattr(paper, "get_paper_update_scheduler_status", unsafe_scheduler_status)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.post("/api/paper/update-trades/approve", json=approval_body())
 
@@ -373,7 +383,7 @@ def test_approval_rejects_request_limit_mismatch(monkeypatch) -> None:
     db = make_db()
     make_approval_run(db)
     patch_db(monkeypatch, db)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.post("/api/paper/update-trades/approve", json=approval_body(max_trades=5))
 
@@ -396,7 +406,7 @@ def test_approval_rejects_when_lock_is_held(monkeypatch) -> None:
     )
     make_approval_run(db)
     patch_db(monkeypatch, db)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.post("/api/paper/update-trades/approve", json=approval_body())
 
@@ -408,7 +418,7 @@ def test_approval_rejects_when_snapshot_changed(monkeypatch) -> None:
     dry_run = make_approval_run(db)
     db.paper_trades.rows[0]["updated_at"] = "changed"
     patch_db(monkeypatch, db)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.post("/api/paper/update-trades/approve", json=approval_body())
 
@@ -421,7 +431,7 @@ def test_approval_rejects_when_transition_hash_changed(monkeypatch) -> None:
     dry_run = make_approval_run(db)
     dry_run["per_trade_results"][0]["proposed_update"]["status"] = "STOPPED"
     patch_db(monkeypatch, db)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.post("/api/paper/update-trades/approve", json=approval_body())
 
@@ -435,7 +445,7 @@ def test_approval_rejects_when_target_trade_changed(monkeypatch) -> None:
     current_snapshot = asyncio.run(paper.capture_paper_update_snapshot(db))
     dry_run["pre_snapshot_hash"] = current_snapshot["snapshot_hash"]
     patch_db(monkeypatch, db)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.post("/api/paper/update-trades/approve", json=approval_body())
 
@@ -451,7 +461,7 @@ def test_successful_approval_applies_exact_transition_once(monkeypatch) -> None:
         "update_plan_status",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Must not recalculate transitions")),
     )
-    client = TestClient(app)
+    client = trusted_client()
     before_count = len(db.paper_trades.rows)
 
     response = client.post("/api/paper/update-trades/approve", json=approval_body())
@@ -482,7 +492,7 @@ def test_approval_write_error_is_rejected_without_creating_or_deleting_trades(mo
 
     db.paper_trades.update_one = fail_update
     patch_db(monkeypatch, db)
-    client = TestClient(app)
+    client = trusted_client()
     before_rows = [row.copy() for row in db.paper_trades.rows]
 
     response = client.post("/api/paper/update-trades/approve", json=approval_body())
@@ -498,7 +508,7 @@ def test_approval_cannot_be_used_twice(monkeypatch) -> None:
     db = make_db()
     make_approval_run(db)
     patch_db(monkeypatch, db)
-    client = TestClient(app)
+    client = trusted_client()
 
     first = client.post("/api/paper/update-trades/approve", json=approval_body())
     second = client.post("/api/paper/update-trades/approve", json=approval_body())

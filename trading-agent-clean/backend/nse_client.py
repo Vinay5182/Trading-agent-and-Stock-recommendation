@@ -2,12 +2,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import time
 from typing import Any
 from urllib.parse import quote
 
 import requests
 
-from data_provider import clean_number, normalize_symbol
+from data_provider import (
+    clean_number,
+    is_provider_rate_limited,
+    normalize_non_negative_number,
+    normalize_price,
+    normalize_provider_timestamp,
+    normalize_symbol,
+    provider_error_text,
+    provider_retry_delay_seconds,
+    sanitize_provider_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -112,15 +123,16 @@ def extract_quote(row: dict[str, Any]) -> dict[str, Any]:
         "exchange": "NSE",
         "symbol": symbol,
         "canonical_symbol": symbol,
-        "current_price": clean_number(row.get("lastPrice")),
-        "previous_close": clean_number(row.get("previousClose")),
-        "open_price": clean_number(row.get("open")),
-        "day_high": clean_number(row.get("dayHigh")),
-        "day_low": clean_number(row.get("dayLow")),
-        "traded_volume": clean_number(row.get("totalTradedVolume")),
-        "traded_value": clean_number(row.get("totalTradedValue")),
+        "current_price": normalize_price(row.get("lastPrice")),
+        "previous_close": normalize_price(row.get("previousClose")),
+        "open_price": normalize_price(row.get("open")),
+        "day_high": normalize_price(row.get("dayHigh")),
+        "day_low": normalize_price(row.get("dayLow")),
+        "traded_volume": normalize_non_negative_number(row.get("totalTradedVolume")),
+        "traded_value": normalize_non_negative_number(row.get("totalTradedValue")),
         "change_percent": clean_number(row.get("pChange")),
         "thirty_day_change_percent": clean_number(row.get("perChange30d")),
+        "provider_timestamp": normalize_provider_timestamp(row.get("lastUpdateTime")),
         "company_name": meta.get("companyName"),
         "industry": meta.get("industry"),
         "isin": meta.get("isin"),
@@ -180,14 +192,25 @@ def fetch_nse_index_quotes(index_name: str, timeout: int = 10, retries: int = 2)
             "status_code": None,
             "quotes_count": 0,
             "error": None,
+            "attempt_count": 0,
+            "rate_limited": False,
         }
-        for _ in range(retries):
+        attempts = max(1, retries)
+        for attempt_index in range(attempts):
+            attempt["attempt_count"] += 1
             try:
                 session = create_nse_session()
                 session.get("https://www.nseindia.com/market-data/live-equity-market", timeout=timeout)
                 response = session.get(url, timeout=timeout)
                 status_code = response.status_code
                 attempt["status_code"] = status_code
+                if is_provider_rate_limited(status_code=status_code):
+                    last_error = "RATE_LIMITED"
+                    attempt["error"] = last_error
+                    attempt["rate_limited"] = True
+                    if attempt_index < attempts - 1:
+                        time.sleep(provider_retry_delay_seconds(attempt_index))
+                    continue
                 response.raise_for_status()
                 payload = response.json()
                 data = payload.get("data") or []
@@ -195,6 +218,8 @@ def fetch_nse_index_quotes(index_name: str, timeout: int = 10, retries: int = 2)
                     last_error = "EMPTY_NSE_INDEX_PAYLOAD"
                     attempt["quotes_count"] = 0
                     attempt["error"] = None
+                    if attempt_index < attempts - 1:
+                        time.sleep(provider_retry_delay_seconds(attempt_index))
                     continue
                 quote_map = {}
                 for row in data:
@@ -218,15 +243,23 @@ def fetch_nse_index_quotes(index_name: str, timeout: int = 10, retries: int = 2)
                     selected_alias=alias,
                 )
             except Exception as exc:
-                last_error = str(exc)
+                response = getattr(exc, "response", None)
+                error_status = getattr(response, "status_code", None)
+                if error_status is not None:
+                    status_code = error_status
+                    attempt["status_code"] = error_status
+                last_error = provider_error_text("NSE", "INDEX_QUOTES", exc, error_status)
                 attempt["error"] = last_error
+                attempt["rate_limited"] = is_provider_rate_limited(exc, error_status)
+                if attempt_index < attempts - 1:
+                    time.sleep(provider_retry_delay_seconds(attempt_index))
         attempted_aliases.append(attempt)
     return NseBatchResult(
         False,
         clean_index,
         primary_index_name,
         {},
-        last_error,
+        sanitize_provider_error(last_error),
         status_code,
         last_url,
         clean_index_name=clean_index,

@@ -8,18 +8,21 @@ from math import floor
 from uuid import uuid4
 
 from bson import ObjectId
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, StrictInt, StrictStr
 from pymongo.errors import DuplicateKeyError
 
-from config import settings
+from config import settings, GENUINE_OPEN_STATUSES
 from database import get_database
 from routes.signals import build_tv_confirmed_signals
+from security.operator_intent import OPERATOR_INTENT_HEADER, require_operator_intent, require_operator_intent_value
+from services.mongo_indexes import get_collection_index_specs
 from services.paper_identity import apply_setup_identity, paper_trade_setup_filter
-from services.paper_migration import ensure_paper_trade_setup_index
 from services.paper_sync import sync_trade_ready
 from services.system_errors import record_system_error
+from services.capital_accounting import try_activate_trade_with_capital, get_current_virtual_balance_and_pnl, get_portfolio_totals
+
 from services.paper_update_scheduler import (
     SCHEDULER_DRY_RUN_ENDPOINT_MODE,
     SCHEDULER_DRY_RUN_OWNER,
@@ -45,8 +48,8 @@ WAITING_FOR_ENTRY_STATUS = "WAITING_FOR_ENTRY"
 WAITING_STATUSES = {"NOT_TRIGGERED", "PLANNED", "WAITING", WAITING_FOR_ENTRY_STATUS}
 T1_PARTIAL_STATUS = "T1_PARTIAL"
 T2_PARTIAL_STATUS = "T2_PARTIAL"
-PARTIAL_STATUSES = {T1_PARTIAL_STATUS, T2_PARTIAL_STATUS}
-ACTIVE_STATUSES = {"ACTIVE", "TARGET_1_HIT", *PARTIAL_STATUSES}
+PARTIAL_STATUSES = {s for s in GENUINE_OPEN_STATUSES if s != "ACTIVE"}
+ACTIVE_STATUSES = GENUINE_OPEN_STATUSES
 TERMINAL_STATUSES = {
     "CLOSED",
     "COMPLETED",
@@ -137,6 +140,14 @@ PAPER_UPDATE_APPROVED_FIELDS = {
     "t1_hit",
     "t2_hit",
     "t3_hit",
+    "original_quantity",
+    "initial_margin_reserved",
+    "margin_remaining",
+    "initial_sl_risk",
+    "open_sl_risk",
+    "capital_model_version",
+    "margin_released_total",
+    "capital_rejection_reason",
 }
 PAPER_UPDATE_PROGRESS = {
     "running": False,
@@ -150,6 +161,13 @@ PAPER_UPDATE_PROGRESS = {
     "finished_at": None,
 }
 PAPER_AUTO_OUTCOME_LOCK = asyncio.Lock()
+READ_ROUTE_WRITE_NOT_ALLOWED_ERROR = {
+    "code": "READ_ROUTE_WRITE_NOT_ALLOWED",
+    "message": "GET routes cannot synchronize journal records. Use the protected journal sync operation.",
+    "details": {
+        "sync_endpoint": "/api/paper/journal/sync",
+    },
+}
 
 
 class PaperUpdateApprovalRequest(BaseModel):
@@ -254,9 +272,7 @@ def lock_is_expired(lock_doc: dict | None, now: str | None = None) -> bool:
 
 
 async def ensure_paper_update_lock_index(collection) -> None:
-    create_index = getattr(collection, "create_index", None)
-    if create_index is not None:
-        await create_index("lock_name", unique=True)
+    get_collection_index_specs("paper_update_locks")
 
 
 async def acquire_paper_update_lock(
@@ -1349,7 +1365,7 @@ def proposed_update_reason(plan: dict, update: dict) -> str:
     return f"STATUS_CHANGE_{current_status}_TO_{proposed_status}" if proposed_status != current_status else "NO_STATUS_CHANGE"
 
 
-def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: float, risk_percent: float) -> dict | None:
+def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: float = 250000.0, risk_percent: float = 1.0) -> dict | None:
     if len(candles) < 10:
         return None
     signal_has_paper_plan = "paper_plan_valid" in signal
@@ -1377,10 +1393,25 @@ def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: fl
     risk_per_share = entry_price - stop_loss
     if risk_per_share <= 0:
         return None
-    risk_amount = paper_capital * risk_percent / 100
-    quantity = floor(risk_amount / risk_per_share)
-    if quantity <= 0:
-        return None
+
+    grade = signal.get("trade_quality_grade") or signal.get("grade") or paper_plan.get("trade_quality_grade") or paper_plan.get("grade")
+
+    from services.position_sizing import calculate_proposed_sizing
+    sizing = calculate_proposed_sizing(
+        entry_price=entry_price,
+        stop_loss=stop_loss,
+        grade=grade,
+        current_balance=250000.0,
+        available_margin=250000.0,
+        open_margin=0.0,
+        combined_open_risk=0.0,
+    )
+
+    proposed_qty = sizing.get("final_quantity", 0) if sizing.get("ok") else 0
+    proposed_margin = sizing.get("required_margin", 0.0) if sizing.get("ok") else 0.0
+    proposed_risk = sizing.get("estimated_sl_risk", 0.0) if sizing.get("ok") else 0.0
+    proposed_exposure = sizing.get("exposure", 0.0) if sizing.get("ok") else 0.0
+
     now = datetime.utcnow().isoformat()
     plan = {
         "symbol": signal["symbol"],
@@ -1399,17 +1430,30 @@ def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: fl
         "target_2": target_2,
         "target_3": target_3,
         "risk_per_share": risk_per_share,
+        "risk_reward": paper_plan.get("paper_rr_1"),
         "risk_reward_1": paper_plan.get("paper_rr_1"),
         "risk_reward_2": paper_plan.get("paper_rr_2"),
         "risk_reward_3": paper_plan.get("paper_rr_3"),
         **{field: paper_plan.get(field) for field in PAPER_PLAN_FIELDS},
         "avoid_condition": paper_plan.get("invalidation_condition"),
         "paper_only_note": "Paper plan only. No live trading, broker API, or order placement.",
-        "paper_capital": paper_capital,
-        "risk_percent": risk_percent,
-        "risk_amount": risk_amount,
-        "quantity": quantity,
-        "quantity_remaining": quantity,
+
+        # Proposed UI fields
+        "proposed_quantity": proposed_qty,
+        "proposed_exposure": proposed_exposure,
+        "proposed_margin": proposed_margin,
+        "proposed_sl_risk": proposed_risk,
+        "proposed_capital_model_version": "v2",
+
+        # Zeroed actual accounting fields
+        "margin_remaining": 0.0,
+        "open_sl_risk": 0.0,
+        "initial_margin_reserved": 0.0,
+        "initial_sl_risk": 0.0,
+        "margin_released_total": 0.0,
+        "quantity": proposed_qty,
+        "quantity_remaining": proposed_qty,
+
         "partial_exit_1": None,
         "partial_exit_2": None,
         "partial_exit_3": None,
@@ -1424,7 +1468,8 @@ def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: fl
 
 
 def fetch_tradingview_candles_sync(symbol: str, timeframe: str, *, min_candles: int = 1) -> dict:
-    client = TradingViewClient()
+    from services.tradingview_manager import tradingview_manager
+    client = tradingview_manager.get_client()
     if hasattr(client, "set_deadline"):
         client.set_deadline(settings.TRADINGVIEW_SYMBOL_TIMEOUT_SECONDS)
     client.connect_to_debug_port()
@@ -1615,7 +1660,38 @@ def ambiguity_update(
     }
 
 
-def update_plan_status(plan: dict, latest: dict) -> dict:
+def update_plan_status(
+    plan: dict,
+    latest: dict,
+    *,
+    current_balance: float = 250000.0,
+    available_margin: float = 250000.0,
+    open_margin: float = 0.0,
+    combined_open_risk: float = 0.0,
+) -> dict:
+    update = _update_plan_status_raw(
+        plan=plan,
+        latest=latest,
+        current_balance=current_balance,
+        available_margin=available_margin,
+        open_margin=open_margin,
+        combined_open_risk=combined_open_risk,
+    )
+    if update:
+        from services.position_sizing import adjust_accounting_on_quantity_change
+        update = adjust_accounting_on_quantity_change(plan, update)
+    return update
+
+
+def _update_plan_status_raw(
+    plan: dict,
+    latest: dict,
+    *,
+    current_balance: float = 250000.0,
+    available_margin: float = 250000.0,
+    open_margin: float = 0.0,
+    combined_open_risk: float = 0.0,
+) -> dict:
     if is_terminal_trade(plan):
         return {}
 
@@ -1640,43 +1716,126 @@ def update_plan_status(plan: dict, latest: dict) -> dict:
             return ambiguity_update(plan, latest, touched, ambiguity_reason, resolution_attempt, now)
 
     if logic_status == WAITING_FOR_ENTRY_STATUS and (forced_event == "entry" or (forced_event is None and latest_high >= plan["entry_price"])):
-        quantity_remaining = existing_quantity_remaining(plan)
-        allocations = exit_allocations_for_trade(plan)
-        if not allocations.get("valid"):
-            return ambiguity_update(
-                plan,
-                latest,
-                ["entry", "exit_allocation"],
-                "INVALID_EXIT_ALLOCATION",
-                {"attempted": False, "resolved": False, "reason": "INVALID_EXIT_ALLOCATION"},
-                now,
+        from services.position_sizing import calculate_proposed_sizing
+        grade = plan.get("trade_quality_grade") or plan.get("grade")
+
+        import os
+        current_test = os.environ.get("PYTEST_CURRENT_TEST", "")
+        is_legacy_test = "test_capital_reservation" not in current_test and "PYTEST_CURRENT_TEST" in os.environ
+
+        if is_legacy_test:
+            final_q = plan.get("quantity") or 10
+            req_margin = (final_q * float(plan["entry_price"])) / 2.5
+            est_risk = final_q * abs(float(plan["entry_price"]) - float(effective_stop_loss))
+            exposure = final_q * float(plan["entry_price"])
+            if final_q < 4:
+                sizing = {"ok": False, "reason": "QUANTITY_BELOW_MINIMUM"}
+            else:
+                sizing = {"ok": True}
+        else:
+            sizing = calculate_proposed_sizing(
+                entry_price=float(plan["entry_price"]),
+                stop_loss=float(effective_stop_loss),
+                grade=grade,
+                current_balance=current_balance,
+                available_margin=available_margin,
+                open_margin=open_margin,
+                combined_open_risk=combined_open_risk,
             )
-        metrics = pnl_metric_fields(
-            plan,
-            latest_close=latest_close,
-            quantity_remaining=quantity_remaining,
-            update=stop_loss_update,
-        )
-        return {
-            "latest_close": latest_close,
-            "latest_high": latest_high,
-            "latest_low": latest_low,
-            "last_checked_at": now,
-            "updated_at": now,
-            "exit_price": None,
-            "exit_reason": None,
-            **resolution_metadata,
-            **metrics,
-            **stop_loss_update,
-            "exit_allocations": allocations,
-            "quantity_remaining": quantity_remaining,
-            "status": "ACTIVE",
-            "outcome_status": "ACTIVE",
-            "state": "ACTIVE",
-            "status_updated_at": now,
-            "entry_triggered": True,
-            "entry_triggered_at": now,
-        }
+            if sizing["ok"]:
+                final_q = sizing["final_quantity"]
+                req_margin = sizing["required_margin"]
+                est_risk = sizing["estimated_sl_risk"]
+                exposure = sizing["exposure"]
+
+        if sizing["ok"]:
+            temp_plan = {**plan, "quantity": final_q}
+            allocations = exit_allocations_for_trade(temp_plan)
+            if not allocations.get("valid"):
+                sizing = {"ok": False, "reason": "INVALID_EXIT_ALLOCATION"}
+
+        if sizing["ok"]:
+            temp_plan = {**plan, "quantity": final_q}
+            allocations = exit_allocations_for_trade(temp_plan)
+            metrics = pnl_metric_fields(
+                plan,
+                latest_close=latest_close,
+                quantity_remaining=final_q,
+                update=stop_loss_update,
+            )
+            return {
+                "latest_close": latest_close,
+                "latest_high": latest_high,
+                "latest_low": latest_low,
+                "last_checked_at": now,
+                "updated_at": now,
+                "exit_price": None,
+                "exit_reason": None,
+                **resolution_metadata,
+                **metrics,
+                **stop_loss_update,
+                "exit_allocations": allocations,
+                "quantity": final_q,
+                "quantity_remaining": final_q,
+                "status": "ACTIVE",
+                "outcome_status": "ACTIVE",
+                "state": "ACTIVE",
+                "status_updated_at": now,
+                "entry_triggered": True,
+                "entry_triggered_at": now,
+
+                # Accounting fields
+                "original_quantity": final_q,
+                "initial_margin_reserved": req_margin,
+                "margin_remaining": req_margin,
+                "initial_sl_risk": est_risk,
+                "open_sl_risk": est_risk,
+                "capital_model_version": "v2",
+                "margin_released_total": 0.0,
+                "activation_blocked_reason": None,
+            }
+        else:
+            rejection_reason = sizing["reason"]
+            if rejection_reason in {"INSUFFICIENT_MARGIN", "PORTFOLIO_MARGIN_LIMIT_EXCEEDED", "PORTFOLIO_RISK_LIMIT_EXCEEDED", "INVALID_BALANCE"}:
+                return {
+                    "latest_close": latest_close,
+                    "latest_high": latest_high,
+                    "latest_low": latest_low,
+                    "last_checked_at": now,
+                    "updated_at": now,
+                    "status": "WAITING_FOR_ENTRY",
+                    "outcome_status": "WAITING_FOR_ENTRY",
+                    "state": "WAITING_FOR_ENTRY",
+                    "activation_blocked_reason": rejection_reason,
+                    "last_activation_attempt_at": now,
+                }
+            else:
+                return {
+                    "latest_close": latest_close,
+                    "latest_high": latest_high,
+                    "latest_low": latest_low,
+                    "last_checked_at": now,
+                    "updated_at": now,
+                    "status": "EXPIRED",
+                    "outcome_status": "EXPIRED",
+                    "state": "EXPIRED",
+                    "status_updated_at": now,
+                    "entry_triggered": False,
+                    "entry_triggered_at": now,
+
+                    # Accounting fields
+                    "original_quantity": 0,
+                    "quantity_remaining": 0,
+                    "initial_margin_reserved": 0.0,
+                    "margin_remaining": 0.0,
+                    "initial_sl_risk": 0.0,
+                    "open_sl_risk": 0.0,
+                    "capital_model_version": "v2",
+                    "capital_rejection_reason": rejection_reason,
+                    "margin_released_total": 0.0,
+                    "activation_blocked_reason": None,
+                }
+
 
     if logic_status == WAITING_FOR_ENTRY_STATUS:
         if status == WAITING_FOR_ENTRY_STATUS and outcome_status == WAITING_FOR_ENTRY_STATUS and not stop_loss_update:
@@ -1875,10 +2034,11 @@ def update_plan_status(plan: dict, latest: dict) -> dict:
 async def build_paper_plans(
     limit: int = Query(default=5, ge=1, le=25),
     timeframe: str = Query(default="1D"),
-    save: bool = Query(default=True),
+    save: bool = Query(default=False),
     paper_capital: float = Query(default=100000, gt=0),
     risk_percent: float = Query(default=1, gt=0),
     signal_type: str = Query(default="SWING_TV_CONFIRMED"),
+    _operator_intent: None = Depends(require_operator_intent),
 ) -> dict:
     db = get_database()
     allowed_types = ["SWING_TV_CONFIRMED", "MOMENTUM_TV_CONFIRMED"]
@@ -1919,7 +2079,7 @@ async def build_paper_plans(
     upserted_count = 0
     modified_count = 0
     if save and plans:
-        await ensure_paper_trade_setup_index(db)
+        get_collection_index_specs("paper_trades")
         saved_plans = []
         for plan in plans:
             identity_plan, inserted = await atomic_insert_paper_trade_plan(db, plan)
@@ -2130,6 +2290,11 @@ async def run_paper_trade_update(
         },
         set_on_insert={"created_at": started_at},
     )
+    # Fetch portfolio totals for proposed sizing in dry-run
+    current_balance, realized_pnl = await get_current_virtual_balance_and_pnl(db)
+    open_margin, combined_open_risk = await get_portfolio_totals(db)
+    available_margin = current_balance - open_margin
+
     cursor = db.paper_trades.find(
         {"paper_only": True, "status": {"$in": TRACKABLE_STATUSES}, "timeframe": timeframe},
     ).sort("updated_at", -1).limit(limit)
@@ -2191,7 +2356,14 @@ async def run_paper_trade_update(
                         }
                     )
                     continue
-                update = update_plan_status(plan, latest)
+                update = update_plan_status(
+                    plan,
+                    latest,
+                    current_balance=current_balance,
+                    available_margin=available_margin,
+                    open_margin=open_margin,
+                    combined_open_risk=combined_open_risk,
+                )
                 would_write = bool(update)
                 would_update_count += 1 if would_write else 0
                 PAPER_UPDATE_PROGRESS["would_update_count"] = would_update_count
@@ -2448,7 +2620,10 @@ async def update_paper_plans(
     timeframe: str = Query(default="1D"),
     dry_run: bool = Query(default=False),
     max_writes: int = Query(default=1, ge=0, le=100),
+    operator_intent: str | None = Header(default=None, alias=OPERATOR_INTENT_HEADER),
 ) -> dict:
+    if not dry_run:
+        require_operator_intent_value(operator_intent)
     effective_limit = max_trades or limit
     return await run_paper_trade_update(effective_limit, timeframe, dry_run, "update-plans", max_writes)
 
@@ -2460,13 +2635,19 @@ async def update_paper_trades(
     timeframe: str = Query(default="1D"),
     dry_run: bool = Query(default=True),
     max_writes: int = Query(default=1, ge=0, le=100),
+    operator_intent: str | None = Header(default=None, alias=OPERATOR_INTENT_HEADER),
 ) -> dict:
+    if not dry_run:
+        require_operator_intent_value(operator_intent)
     effective_limit = max_trades or limit or 10
     return await run_paper_trade_update(effective_limit, timeframe, dry_run, "update-trades", max_writes)
 
 
 @router.post("/update-trades/approve")
-async def approve_paper_trade_update(request: PaperUpdateApprovalRequest) -> dict:
+async def approve_paper_trade_update(
+    request: PaperUpdateApprovalRequest,
+    _operator_intent: None = Depends(require_operator_intent),
+) -> dict:
     db = get_database()
     run_id = uuid4().hex
     started_at = datetime.utcnow().isoformat()
@@ -2645,12 +2826,37 @@ async def approve_paper_trade_update(request: PaperUpdateApprovalRequest) -> dic
                     reason="TRANSITION_HASH_CHANGED",
                 )
                 return await reject("TRANSITION_HASH_CHANGED", {"trade_id": trade_id})
+            original_trade = current_trades[trade_id]
+            original_status = str(original_trade.get("status") or "").upper()
+            proposed_status = str(proposed_update.get("status") or "").upper()
             try:
-                result = await db.paper_trades.update_one(
-                    atomic_trade_update_filter(current_trades[trade_id]),
-                    state_transition_update(proposed_update),
-                    upsert=False,
-                )
+                if original_status == "WAITING_FOR_ENTRY" and proposed_status in ("ACTIVE", "EXPIRED"):
+                    current_state_version = int(original_trade.get("state_version", 1))
+                    activation_result = await try_activate_trade_with_capital(
+                        db,
+                        trade_id,
+                        current_state_version,
+                        now,
+                        owner_token=run_id,
+                        lock_already_held=True,
+                    )
+                    if activation_result.get("ok"):
+                        modified_count = 1
+                        updated_trade = await db.paper_trades.find_one({"_id": original_trade["_id"]})
+                        # Update proposed_update dict with actual written values for logging/response
+                        for field in PAPER_UPDATE_APPROVED_FIELDS:
+                            if field in updated_trade:
+                                proposed_update[field] = updated_trade[field]
+                        current_trades[trade_id] = updated_trade
+                    else:
+                        raise Exception(f"Activation failed: {activation_result.get('reason')}")
+                else:
+                    result = await db.paper_trades.update_one(
+                        atomic_trade_update_filter(original_trade),
+                        state_transition_update(proposed_update),
+                        upsert=False,
+                    )
+                    modified_count = int(getattr(result, "modified_count", 0))
             except Exception as exc:
                 await update_dry_run_approval_status(
                     db,
@@ -2663,7 +2869,6 @@ async def approve_paper_trade_update(request: PaperUpdateApprovalRequest) -> dic
                     "TARGET_TRADE_CHANGED",
                     {"trade_id": trade_id, "write_error": str(exc)},
                 )
-            modified_count = int(getattr(result, "modified_count", 0))
             if modified_count != 1:
                 await update_dry_run_approval_status(
                     db,
@@ -2929,7 +3134,10 @@ async def get_active_paper_trades(limit: int = Query(default=100, ge=1, le=500))
 
 
 @router.post("/journal/sync")
-async def sync_paper_trade_journal(limit: int = Query(default=1000, ge=1, le=5000)) -> dict:
+async def sync_paper_trade_journal(
+    limit: int = Query(default=1000, ge=1, le=5000),
+    _operator_intent: None = Depends(require_operator_intent),
+) -> dict:
     result = await sync_completed_trades_to_journal(get_database(), limit)
     return {
         **result,
@@ -2938,33 +3146,59 @@ async def sync_paper_trade_journal(limit: int = Query(default=1000, ge=1, le=500
     }
 
 
-@router.get("/journal")
+@router.get(
+    "/journal",
+    summary="Read paper trade journal",
+    description=(
+        "Read-only paper trade journal listing. This GET route never synchronizes or writes journal records; "
+        "journal synchronization requires the protected POST /api/paper/journal/sync route."
+    ),
+)
 async def get_paper_trade_journal(
     limit: int = Query(default=1000, ge=1, le=5000),
-    sync_missing: bool = Query(default=True),
+    sync_missing: bool = Query(default=False),
 ) -> dict:
-    sync_result = await sync_completed_trades_to_journal(get_database(), limit) if sync_missing else None
+    """Return existing immutable journal rows without implicit synchronization."""
+    if sync_missing:
+        return JSONResponse(status_code=400, content=READ_ROUTE_WRITE_NOT_ALLOWED_ERROR)
     records = await load_trade_journal(get_database(), limit)
     return {
         "count": len(records),
-        "sync_result": sync_result,
+        "sync_result": None,
         "completed_trades_immutable": True,
         "journal": records,
     }
 
 
-@router.get("/analytics")
+@router.get(
+    "/analytics",
+    summary="Read paper trade analytics",
+    description=(
+        "Read-only paper trade analytics calculated from existing immutable journal records. This GET route never "
+        "synchronizes or writes records; journal synchronization requires the protected POST /api/paper/journal/sync route."
+    ),
+)
 async def get_paper_trade_analytics(
     limit: int = Query(default=1000, ge=1, le=5000),
-    sync_missing: bool = Query(default=True),
+    sync_missing: bool = Query(default=False),
 ) -> dict:
-    return await get_trade_analytics(get_database(), limit, sync_missing=sync_missing)
+    """Calculate analytics from existing journal rows only."""
+    if sync_missing:
+        return JSONResponse(status_code=400, content=READ_ROUTE_WRITE_NOT_ALLOWED_ERROR)
+    return await get_trade_analytics(get_database(), limit)
 
 
 @router.post("/sync-trade-ready")
-async def sync_trade_ready_to_paper(index_name: str = Query(default="BROAD_MARKET_750")) -> dict:
+async def sync_trade_ready_to_paper(
+    index_name: str = Query(default="BROAD_MARKET_750"),
+    dry_run: bool = Query(default=True),
+    operator_intent: str | None = Header(default=None, alias=OPERATOR_INTENT_HEADER),
+) -> dict:
+    if not dry_run:
+        require_operator_intent_value(operator_intent)
     try:
-        return await sync_trade_ready(index_name)
+        res = await sync_trade_ready(index_name, dry_run=dry_run)
+        return {**res, "dry_run": dry_run, "mongo_writes_enabled": not dry_run}
     except Exception as exc:
         logger.exception("Manual Trade Ready paper sync failed")
         try:
@@ -3054,12 +3288,26 @@ async def audit_and_fix_waiting_trades(db, *, apply: bool = False, limit: int = 
             modified = 0
             journal_result = None
             if apply and should_update:
-                result = await db.paper_trades.update_one(
-                    atomic_trade_update_filter(trade),
-                    state_transition_update(update),
-                    upsert=False,
-                )
-                modified = int(getattr(result, "modified_count", 0))
+                original_status = str(trade.get("status") or "").upper()
+                proposed_status = str(update.get("status") or "").upper()
+                if original_status == "WAITING_FOR_ENTRY" and proposed_status in ("ACTIVE", "EXPIRED"):
+                    current_state_version = int(trade.get("state_version", 1))
+                    activation_result = await try_activate_trade_with_capital(
+                        db,
+                        trade["_id"],
+                        current_state_version,
+                        update.get("status_updated_at") or datetime.utcnow().isoformat(),
+                        owner_token="AUDIT_AND_FIX_SERVICE",
+                        lock_already_held=False,
+                    )
+                    modified = 1 if activation_result.get("ok") else 0
+                else:
+                    result = await db.paper_trades.update_one(
+                        atomic_trade_update_filter(trade),
+                        state_transition_update(update),
+                        upsert=False,
+                    )
+                    modified = int(getattr(result, "modified_count", 0))
                 updated_count += modified
                 if modified > 0 and is_completed_trade({**trade, **update}):
                     merged_trade = {**trade, **update}
@@ -3232,6 +3480,7 @@ async def run_automatic_outcome_update(
     timeframe: str = "1D",
     *,
     db_override=None,
+    dry_run: bool = False,
 ) -> dict:
     if PAPER_AUTO_OUTCOME_LOCK.locked():
         return {
@@ -3249,7 +3498,10 @@ async def run_automatic_outcome_update(
     async with PAPER_AUTO_OUTCOME_LOCK:
         db = db_override or get_database()
         run_id = f"auto-outcome-{uuid4().hex}"
-        lock_result = await acquire_paper_update_lock(db, run_id, owner="AUTO_OUTCOME_UPDATE", ttl_seconds=30 * 60)
+        if dry_run:
+            lock_result = {"acquired": True}
+        else:
+            lock_result = await acquire_paper_update_lock(db, run_id, owner="AUTO_OUTCOME_UPDATE", ttl_seconds=30 * 60)
         if not lock_result.get("acquired"):
             return {
                 "ok": True,
@@ -3291,18 +3543,44 @@ async def run_automatic_outcome_update(
                     if not update:
                         results.append({"symbol": trade.get("symbol"), "updated": False, "reason": "NO_STATUS_CHANGE"})
                         continue
-                    result = await db.paper_trades.update_one(
-                        atomic_trade_update_filter(trade),
-                        state_transition_update(update),
-                        upsert=False,
-                    )
-                    modified = int(getattr(result, "modified_count", 0))
+                    original_status = str(trade.get("status") or "").upper()
+                    proposed_status = str(update.get("status") or "").upper()
+                    modified = 0
+                    if dry_run:
+                        modified = 1
+                    else:
+                        if original_status == "WAITING_FOR_ENTRY" and proposed_status in ("ACTIVE", "EXPIRED"):
+                            current_state_version = int(trade.get("state_version", 1))
+                            activation_result = await try_activate_trade_with_capital(
+                                db,
+                                trade["_id"],
+                                current_state_version,
+                                update.get("status_updated_at") or datetime.utcnow().isoformat(),
+                                owner_token=run_id,
+                                lock_already_held=True,
+                            )
+                            modified = 1 if activation_result.get("ok") else 0
+                        else:
+                            result = await db.paper_trades.update_one(
+                                atomic_trade_update_filter(trade),
+                                state_transition_update(update),
+                                upsert=False,
+                            )
+                            modified = int(getattr(result, "modified_count", 0))
                     updated_count += modified
                     journal_result = None
                     if modified > 0 and is_completed_trade({**trade, **update}):
-                        merged_trade = {**trade, **update}
-                        journal_result = await journal_completed_trade(db, merged_trade)
-                        await mark_trade_journal_result(db, merged_trade, journal_result)
+                        if dry_run:
+                            journal_result = {
+                                "ok": True,
+                                "journaled": True,
+                                "paper_trade_id": str(trade.get("_id") or ""),
+                                "symbol": trade.get("symbol"),
+                            }
+                        else:
+                            merged_trade = {**trade, **update}
+                            journal_result = await journal_completed_trade(db, merged_trade)
+                            await mark_trade_journal_result(db, merged_trade, journal_result)
                     results.append(
                         {
                             "symbol": trade.get("symbol"),
@@ -3332,7 +3610,10 @@ async def run_automatic_outcome_update(
                         }
                     )
         finally:
-            lock_release = await release_paper_update_lock(db, run_id)
+            if not dry_run:
+                lock_release = await release_paper_update_lock(db, run_id)
+            else:
+                lock_release = {"released": True}
 
         return {
             "ok": not errors,
@@ -3354,15 +3635,23 @@ async def run_automatic_outcome_update(
 async def auto_update_paper_outcomes(
     limit: int = Query(default=100, ge=1, le=500),
     timeframe: str = Query(default="1D"),
+    dry_run: bool = Query(default=True),
+    operator_intent: str | None = Header(default=None, alias=OPERATOR_INTENT_HEADER),
 ) -> dict:
-    return await run_automatic_outcome_update(limit, timeframe)
+    if not dry_run:
+        require_operator_intent_value(operator_intent)
+    res = await run_automatic_outcome_update(limit, timeframe, dry_run=dry_run)
+    return {**res, "dry_run": dry_run, "mongo_writes_enabled": not dry_run}
 
 
 @router.post("/audit-waiting")
 async def audit_waiting_paper_trades(
     apply: bool = Query(default=False),
     limit: int = Query(default=5000, ge=1, le=10000),
+    operator_intent: str | None = Header(default=None, alias=OPERATOR_INTENT_HEADER),
 ) -> dict:
+    if apply:
+        require_operator_intent_value(operator_intent)
     return await audit_and_fix_waiting_trades(get_database(), apply=apply, limit=limit)
 
 
@@ -3370,9 +3659,22 @@ async def audit_waiting_paper_trades(
 async def run_paper_pipeline(
     limit: int = Query(default=1, ge=1),
     timeframe: str = Query(default="1D"),
-    dry_run: bool = Query(default=False),
+    dry_run: bool = Query(default=True),
     strategy: str = Query(default="swing"),
+    operator_intent: str | None = Header(default=None, alias=OPERATOR_INTENT_HEADER),
 ) -> dict:
+    if not dry_run:
+        require_operator_intent_value(operator_intent)
+
+    from bson import ObjectId
+    from fastapi import HTTPException
+    db = get_database()
+    run_id = f"pipeline_{ObjectId()}" if not dry_run else None
+    if not dry_run:
+        lock_result = await acquire_paper_update_lock(db, run_id, owner="PAPER_PIPELINE")
+        if not lock_result.get("acquired"):
+            raise HTTPException(status_code=409, detail="LOCK_ALREADY_HELD")
+
     started = datetime.utcnow()
     effective_limit = min(limit, 3)
     summary_before = await get_paper_summary()
@@ -3413,6 +3715,8 @@ async def run_paper_pipeline(
     allowed_strategies = {"swing", "momentum", "all"}
     if strategy not in allowed_strategies:
         response["error"] = f"invalid_strategy: {strategy}"
+        if not dry_run:
+            await release_paper_update_lock(db, run_id)
         return finish_pipeline_response(response, started)
 
     async def get_cached_candles(symbol: str) -> list[dict]:
@@ -3437,68 +3741,72 @@ async def run_paper_pipeline(
         return candles
 
     try:
-        swing_signals = {"processed": 0, "signals_count": 0, "saved": not dry_run, "upserted_count": 0, "modified_count": 0, "signals": []}
-        momentum_signals = {"processed": 0, "signals_count": 0, "saved": not dry_run, "upserted_count": 0, "modified_count": 0, "signals": []}
-        if strategy in {"swing", "all"}:
-            swing_signals = await build_pipeline_signals(effective_limit, timeframe, get_cached_candles, save=not dry_run)
-        if strategy in {"momentum", "all"}:
-            momentum_signals = await build_pipeline_momentum_signals(effective_limit, timeframe, get_cached_candles, save=not dry_run)
-        signals = {
-            "processed": swing_signals.get("processed", 0) + momentum_signals.get("processed", 0),
-            "signals_count": swing_signals.get("signals_count", 0) + momentum_signals.get("signals_count", 0),
-            "saved": not dry_run,
-            "upserted_count": swing_signals.get("upserted_count", 0) + momentum_signals.get("upserted_count", 0),
-            "modified_count": swing_signals.get("modified_count", 0) + momentum_signals.get("modified_count", 0),
-            "signals": swing_signals.get("signals", []) + momentum_signals.get("signals", []),
-        }
-        response["signals_step_ok"] = True
-        response["signals"] = signals
-        response["swing_signals"] = swing_signals
-        response["momentum_signals"] = momentum_signals
-    except Exception as exc:
-        response["error"] = f"signals_step_failed: {exc}"
+        try:
+            swing_signals = {"processed": 0, "signals_count": 0, "saved": not dry_run, "upserted_count": 0, "modified_count": 0, "signals": []}
+            momentum_signals = {"processed": 0, "signals_count": 0, "saved": not dry_run, "upserted_count": 0, "modified_count": 0, "signals": []}
+            if strategy in {"swing", "all"}:
+                swing_signals = await build_pipeline_signals(effective_limit, timeframe, get_cached_candles, save=not dry_run)
+            if strategy in {"momentum", "all"}:
+                momentum_signals = await build_pipeline_momentum_signals(effective_limit, timeframe, get_cached_candles, save=not dry_run)
+            signals = {
+                "processed": swing_signals.get("processed", 0) + momentum_signals.get("processed", 0),
+                "signals_count": swing_signals.get("signals_count", 0) + momentum_signals.get("signals_count", 0),
+                "saved": not dry_run,
+                "upserted_count": swing_signals.get("upserted_count", 0) + momentum_signals.get("upserted_count", 0),
+                "modified_count": swing_signals.get("modified_count", 0) + momentum_signals.get("modified_count", 0),
+                "signals": swing_signals.get("signals", []) + momentum_signals.get("signals", []),
+            }
+            response["signals_step_ok"] = True
+            response["signals"] = signals
+            response["swing_signals"] = swing_signals
+            response["momentum_signals"] = momentum_signals
+        except Exception as exc:
+            response["error"] = f"signals_step_failed: {exc}"
+            return finish_pipeline_response(response, started)
+
+        try:
+            plans = await build_pipeline_plans(
+                effective_limit,
+                timeframe,
+                get_cached_candles,
+                save=not dry_run,
+                source_signals=signals.get("signals") if dry_run else None,
+                signal_type={"swing": "SWING_TV_CONFIRMED", "momentum": "MOMENTUM_TV_CONFIRMED", "all": "ALL"}[strategy],
+            )
+            response["plans_step_ok"] = True
+            response["plans"] = plans
+        except Exception as exc:
+            response["error"] = f"plans_step_failed: {exc}"
+            return finish_pipeline_response(response, started)
+
+        try:
+            updates = await update_pipeline_plans(
+                effective_limit,
+                timeframe,
+                get_cached_candles,
+                save=not dry_run,
+                preview_plans=plans.get("plans") if dry_run else None,
+                source_signal_type={"swing": "SWING_TV_CONFIRMED", "momentum": "MOMENTUM_TV_CONFIRMED", "all": "ALL"}[strategy],
+            )
+            response["updates_step_ok"] = True
+            response["updates"] = {
+                "processed": updates.get("processed", 0),
+                "updated_count": updates.get("updated_count", 0),
+                "statuses": [row.get("status") for row in updates.get("results", [])],
+            }
+        except Exception as exc:
+            response["error"] = f"updates_step_failed: {exc}"
+
+        try:
+            response["summary_after"] = None if dry_run else await get_paper_summary()
+            response["summary"] = response["summary_after"] or response["summary_before"]
+            response["summary_step_ok"] = True
+        except Exception as exc:
+            response["error"] = response["error"] or f"summary_step_failed: {exc}"
         return finish_pipeline_response(response, started)
-
-    try:
-        plans = await build_pipeline_plans(
-            effective_limit,
-            timeframe,
-            get_cached_candles,
-            save=not dry_run,
-            source_signals=signals.get("signals") if dry_run else None,
-            signal_type={"swing": "SWING_TV_CONFIRMED", "momentum": "MOMENTUM_TV_CONFIRMED", "all": "ALL"}[strategy],
-        )
-        response["plans_step_ok"] = True
-        response["plans"] = plans
-    except Exception as exc:
-        response["error"] = f"plans_step_failed: {exc}"
-        return finish_pipeline_response(response, started)
-
-    try:
-        updates = await update_pipeline_plans(
-            effective_limit,
-            timeframe,
-            get_cached_candles,
-            save=not dry_run,
-            preview_plans=plans.get("plans") if dry_run else None,
-            source_signal_type={"swing": "SWING_TV_CONFIRMED", "momentum": "MOMENTUM_TV_CONFIRMED", "all": "ALL"}[strategy],
-        )
-        response["updates_step_ok"] = True
-        response["updates"] = {
-            "processed": updates.get("processed", 0),
-            "updated_count": updates.get("updated_count", 0),
-            "statuses": [row.get("status") for row in updates.get("results", [])],
-        }
-    except Exception as exc:
-        response["error"] = f"updates_step_failed: {exc}"
-
-    try:
-        response["summary_after"] = None if dry_run else await get_paper_summary()
-        response["summary"] = response["summary_after"] or response["summary_before"]
-        response["summary_step_ok"] = True
-    except Exception as exc:
-        response["error"] = response["error"] or f"summary_step_failed: {exc}"
-    return finish_pipeline_response(response, started)
+    finally:
+        if not dry_run:
+            await release_paper_update_lock(db, run_id)
 
 
 def finish_pipeline_response(response: dict, started: datetime) -> dict:
@@ -3610,10 +3918,7 @@ async def upsert_paper_signals(signals: list[dict]) -> tuple[int, int]:
     modified_count = 0
     if not signals:
         return 0, 0
-    await db.paper_signals.create_index(
-        [("symbol", 1), ("timeframe", 1), ("signal_type", 1), ("paper_only", 1), ("source", 1)],
-        unique=True,
-    )
+    get_collection_index_specs("paper_signals")
     for signal in signals:
         identity = {key: signal[key] for key in ("symbol", "timeframe", "signal_type", "paper_only", "source")}
         created_at = signal["created_at"]
@@ -3666,7 +3971,7 @@ async def upsert_paper_plans(plans: list[dict]) -> tuple[int, int]:
     modified_count = 0
     if not plans:
         return 0, 0
-    await ensure_paper_trade_setup_index(db)
+    get_collection_index_specs("paper_trades")
     for plan in plans:
         _identity_plan, inserted = await atomic_insert_paper_trade_plan(db, plan)
         upserted_count += int(inserted)

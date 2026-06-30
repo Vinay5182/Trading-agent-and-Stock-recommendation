@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 from datetime import datetime
+from typing import Any
+
+from pymongo.errors import DuplicateKeyError
+from services.redaction import redact_text, redact_value
 
 
 SYSTEM_ERROR_INDEXES = [
@@ -9,6 +16,20 @@ SYSTEM_ERROR_INDEXES = [
     ("symbol", "system_errors_symbol"),
     ("resolved", "system_errors_resolved"),
 ]
+
+
+SYSTEM_ERROR_DEDUP_KEY_VERSION = 2
+SYSTEM_ERROR_DEDUP_FIELDS = (
+    "component",
+    "operation",
+    "trade_id",
+    "setup_id",
+    "symbol",
+    "strategy_type",
+    "scheduler_job",
+    "exception_type",
+    "exception_message",
+)
 
 
 def _now() -> str:
@@ -30,27 +51,54 @@ def _error_identity(document: dict) -> dict:
     }
 
 
-async def ensure_system_error_indexes(db) -> None:
+def _first_meaningful_string(*values: Any) -> str | None:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value)
+        if text:
+            return text
+    return None
+
+
+def _canonical_json_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _canonical_json_value(value[key]) for key in sorted(value, key=str)}
+    if isinstance(value, (list, tuple)):
+        return [_canonical_json_value(item) for item in value]
+    return str(value)
+
+
+def canonical_json_dumps(value: Any) -> str:
+    normalized = _canonical_json_value(value)
+    return json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+
+
+def system_error_dedup_payload(document: dict) -> dict:
+    return {
+        "dedup_key_version": SYSTEM_ERROR_DEDUP_KEY_VERSION,
+        "identity": {field: _canonical_json_value(document.get(field)) for field in SYSTEM_ERROR_DEDUP_FIELDS},
+    }
+
+
+def generate_system_error_dedup_key(document: dict) -> str:
+    serialized = canonical_json_dumps(system_error_dedup_payload(document))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+async def ensure_system_error_indexes(db) -> dict | None:
     collection = getattr(db, "system_errors", None)
-    if collection is None or not hasattr(collection, "create_index"):
+    if collection is None:
         return
-    for field, name in SYSTEM_ERROR_INDEXES:
-        await collection.create_index(field, name=name)
-    await collection.create_index(
-        [
-            ("component", 1),
-            ("operation", 1),
-            ("trade_id", 1),
-            ("setup_id", 1),
-            ("symbol", 1),
-            ("strategy_type", 1),
-            ("scheduler_job", 1),
-            ("exception_type", 1),
-            ("exception_message", 1),
-            ("resolved", 1),
-        ],
-        name="system_errors_dedup_identity",
-    )
+    from services.mongo_indexes import get_collection_index_specs
+
+    return {"startup_owned": [spec.as_dict() for spec in get_collection_index_specs("system_errors")]}
 
 
 async def record_system_error(
@@ -65,6 +113,7 @@ async def record_system_error(
     symbol: str | None = None,
     strategy_type: str | None = None,
     scheduler_job: str | None = None,
+    context: dict | None = None,
 ) -> dict:
     collection = getattr(db, "system_errors", None)
     if collection is None or not hasattr(collection, "update_one"):
@@ -75,25 +124,37 @@ async def record_system_error(
     document = {
         "component": component,
         "operation": operation,
-        "trade_id": str(trade_id or trade.get("_id") or trade.get("paper_trade_id") or "") or None,
-        "setup_id": setup_id or trade.get("setup_id"),
-        "symbol": symbol or trade.get("symbol"),
-        "strategy_type": strategy_type or trade.get("strategy_type") or trade.get("source_signal_type"),
-        "scheduler_job": scheduler_job,
+        "trade_id": _first_meaningful_string(trade_id, trade.get("_id"), trade.get("paper_trade_id")),
+        "setup_id": _first_meaningful_string(setup_id, trade.get("setup_id")),
+        "symbol": _first_meaningful_string(symbol, trade.get("symbol")),
+        "strategy_type": _first_meaningful_string(strategy_type, trade.get("strategy_type"), trade.get("source_signal_type")),
+        "scheduler_job": _first_meaningful_string(scheduler_job),
         "exception_type": type(exception).__name__,
-        "exception_message": str(exception),
+        "exception_message": redact_text(exception),
         "timestamp": now,
         "resolved": False,
         "last_seen_at": now,
     }
+    if context:
+        document["context"] = redact_value(context)
+    document["dedup_key"] = generate_system_error_dedup_key(document)
+    document["dedup_key_version"] = SYSTEM_ERROR_DEDUP_KEY_VERSION
     identity = _error_identity(document)
-    await collection.update_one(
-        identity,
-        {
-            "$set": {key: value for key, value in document.items() if key != "timestamp"},
-            "$setOnInsert": {"timestamp": now},
-            "$inc": {"occurrence_count": 1},
-        },
-        upsert=True,
-    )
-    return {"recorded": True, "identity": identity}
+    query = {"dedup_key": document["dedup_key"]}
+    update = {
+        "$set": {key: value for key, value in document.items() if key != "timestamp"},
+        "$setOnInsert": {"timestamp": now},
+        "$inc": {"occurrence_count": 1},
+    }
+    try:
+        await collection.update_one(query, update, upsert=True)
+    except DuplicateKeyError:
+        await collection.update_one(
+            query,
+            {
+                "$set": {key: value for key, value in document.items() if key not in {"timestamp", "dedup_key"}},
+                "$inc": {"occurrence_count": 1},
+            },
+            upsert=False,
+        )
+    return {"recorded": True, "identity": identity, "dedup_key": document["dedup_key"]}

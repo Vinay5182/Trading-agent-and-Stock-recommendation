@@ -141,27 +141,19 @@ def migration_setup_identity_fields(trade: dict) -> dict:
 
 
 async def ensure_paper_trade_setup_index(db) -> dict:
+    from services.mongo_indexes import get_index_spec
+
+    spec = get_index_spec("paper_trades", "paper_trades_setup_id_unique_v1")
     collection = getattr(db, "paper_trades", None)
     if collection is None or not hasattr(collection, "create_index"):
         return {"created": False, "reason": "NO_PAPER_TRADES_COLLECTION"}
-    await collection.create_index(
-        [("setup_id", 1)],
-        unique=True,
-        name="paper_trades_setup_id_unique_v1",
-        partialFilterExpression={
-            "paper_only": True,
-            "setup_id": {"$exists": True, "$type": "string", "$gt": ""},
-        },
-    )
+    await collection.create_index(spec.create_keys(), **spec.create_options())
     return {
         "created": True,
-        "name": "paper_trades_setup_id_unique_v1",
-        "fields": ["setup_id"],
-        "unique": True,
-        "partialFilterExpression": {
-            "paper_only": True,
-            "setup_id": {"$exists": True, "$type": "string", "$gt": ""},
-        },
+        "name": spec.name,
+        "fields": [field for field, _direction in spec.keys],
+        "unique": spec.unique,
+        "partialFilterExpression": spec.partial_filter,
     }
 
 

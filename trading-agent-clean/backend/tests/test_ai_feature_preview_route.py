@@ -11,6 +11,16 @@ from fastapi.testclient import TestClient
 from ai.features import OUTCOME_FIELDS
 from main import app
 from routes import ai as ai_routes
+from security.operator_intent import OPERATOR_INTENT_HEADER, OPERATOR_INTENT_VALUE
+
+
+OPERATOR_HEADERS = {OPERATOR_INTENT_HEADER: OPERATOR_INTENT_VALUE}
+
+
+def trusted_client() -> TestClient:
+    client = TestClient(app)
+    client.headers.update(OPERATOR_HEADERS)
+    return client
 
 
 def matches_query(row: dict, query: dict | None) -> bool:
@@ -183,6 +193,7 @@ class FakeDB:
                     "paper_pnl_percent": 24.0,
                     "exit_price": 156.0,
                     "exit_reason": "TARGET_2_HIT",
+                    "created_at": "2026-01-01T09:00:00",
                     "status_updated_at": "2026-01-05T15:30:00",
                     "updated_at": "2026-01-05T15:30:00",
                 }
@@ -273,7 +284,7 @@ def configure_backfill_trade(db: FakeDB, *, missing_candidate: bool = False) -> 
 def test_ai_feature_preview_endpoint_is_read_only_and_no_outcome_leakage(monkeypatch) -> None:
     db = FakeDB()
     monkeypatch.setattr(ai_routes, "get_database", lambda: db)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.get("/api/ai/features/preview?strategy_type=momentum&limit=10&timeframe=1D")
 
@@ -325,7 +336,7 @@ def test_ai_feature_preview_paper_trades_source_is_linked_without_candidate_flag
     db = FakeDB()
     db.scored_candidates.rows[0]["momentum_candidate"] = False
     monkeypatch.setattr(ai_routes, "get_database", lambda: db)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.get(
         "/api/ai/features/preview?strategy_type=momentum&limit=10&timeframe=1D&source=paper_trades"
@@ -366,7 +377,7 @@ def test_ai_feature_preview_backfill_excludes_sources_updated_after_trade_and_te
     db = FakeDB()
     configure_backfill_trade(db)
     monkeypatch.setattr(ai_routes, "get_database", lambda: db)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.get(
         "/api/ai/features/preview?source=paper_trades_backfill&terminal_only=true"
@@ -408,7 +419,7 @@ def test_ai_feature_preview_backfill_allows_minimal_snapshot_without_current_can
     db = FakeDB()
     configure_backfill_trade(db, missing_candidate=True)
     monkeypatch.setattr(ai_routes, "get_database", lambda: db)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.get("/api/ai/features/preview?source=paper_trades_backfill")
 
@@ -427,7 +438,7 @@ def test_ai_feature_preview_backfill_uses_only_full_safe_pre_trade_sources(monke
     db.paper_trades.rows[0]["created_at"] = "2026-01-02T09:00:00"
     db.paper_signals.rows[0]["created_at"] = "2026-01-01T09:22:00"
     monkeypatch.setattr(ai_routes, "get_database", lambda: db)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.get("/api/ai/features/preview?source=paper_trades_backfill")
 
@@ -445,7 +456,7 @@ def test_ai_feature_preview_defaults_to_excluding_unlinked_snapshots(monkeypatch
     db = FakeDB()
     add_unlinked_candidate(db)
     monkeypatch.setattr(ai_routes, "get_database", lambda: db)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.get("/api/ai/features/preview?strategy_type=momentum&limit=10&timeframe=1D")
 
@@ -462,7 +473,7 @@ def test_ai_feature_preview_allows_unlinked_snapshots_only_when_explicit(monkeyp
     db = FakeDB()
     add_unlinked_candidate(db)
     monkeypatch.setattr(ai_routes, "get_database", lambda: db)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.get(
         "/api/ai/features/preview?strategy_type=momentum&limit=10&timeframe=1D&linked_only=false"
@@ -483,18 +494,19 @@ def test_ai_feature_preview_rejects_unknown_strategy_without_db_access(monkeypat
         raise AssertionError("Invalid preview requests should not touch the database")
 
     monkeypatch.setattr(ai_routes, "get_database", fail_get_database)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.get("/api/ai/features/preview?strategy_type=breakout")
 
     assert response.status_code == 400
-    assert response.json()["detail"] == "strategy_type must be swing or momentum"
+    assert response.json()["code"] == "HTTP_400"
+    assert response.json()["message"] == "strategy_type must be swing or momentum"
 
 
 def test_ai_feature_save_defaults_to_dry_run_and_writes_nothing(monkeypatch) -> None:
     db = FakeSaveDB()
     monkeypatch.setattr(ai_routes, "get_database", lambda: db)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.post("/api/ai/features/save?strategy_type=momentum&limit=10&timeframe=1D")
 
@@ -520,7 +532,7 @@ def test_ai_feature_save_paper_trades_source_dry_run_writes_nothing(monkeypatch)
     db = FakeSaveDB()
     db.scored_candidates.rows[0]["momentum_candidate"] = False
     monkeypatch.setattr(ai_routes, "get_database", lambda: db)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.post(
         "/api/ai/features/save?strategy_type=momentum&limit=10&timeframe=1D&source=paper_trades"
@@ -545,7 +557,7 @@ def test_ai_feature_save_backfill_dry_run_writes_nothing(monkeypatch) -> None:
     db = FakeSaveDB()
     configure_backfill_trade(db)
     monkeypatch.setattr(ai_routes, "get_database", lambda: db)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.post(
         "/api/ai/features/save?source=paper_trades_backfill&terminal_only=true"
@@ -569,7 +581,7 @@ def test_ai_feature_save_dry_run_allows_unlinked_snapshots_only_when_explicit(mo
     db = FakeSaveDB()
     add_unlinked_candidate(db)
     monkeypatch.setattr(ai_routes, "get_database", lambda: db)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.post(
         "/api/ai/features/save?strategy_type=momentum&limit=10&timeframe=1D&linked_only=false"
@@ -595,7 +607,7 @@ def test_ai_feature_save_real_mode_saves_without_outcome_or_paper_trade_writes(m
     db = FakeSaveDB()
     add_unlinked_candidate(db)
     monkeypatch.setattr(ai_routes, "get_database", lambda: db)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.post(
         "/api/ai/features/save?strategy_type=momentum&limit=10&timeframe=1D&dry_run=false"
@@ -621,7 +633,7 @@ def test_ai_feature_save_real_mode_saves_without_outcome_or_paper_trade_writes(m
     assert "paper_pnl_percent" not in stored
     assert "exit_price" not in stored
     assert "exit_reason" not in stored
-    assert db.ai_feature_snapshots.create_index_calls[0][1]["unique"] is True
+    assert db.ai_feature_snapshots.create_index_calls == []
     assert db.ai_feature_snapshots.update_calls == []
     assert db.ai_feature_snapshots.delete_calls == []
     assert len(db.paper_trades.find_one_calls) == 2
@@ -635,7 +647,7 @@ def test_ai_feature_save_paper_trades_source_saves_linked_snapshot_and_prevents_
     db = FakeSaveDB()
     db.scored_candidates.rows[0]["momentum_candidate"] = False
     monkeypatch.setattr(ai_routes, "get_database", lambda: db)
-    client = TestClient(app)
+    client = trusted_client()
     endpoint = (
         "/api/ai/features/save?strategy_type=momentum&limit=10&timeframe=1D"
         "&source=paper_trades&dry_run=false"
@@ -670,7 +682,7 @@ def test_ai_feature_save_backfill_writes_only_snapshot_and_prevents_duplicate(mo
     db = FakeSaveDB()
     configure_backfill_trade(db)
     monkeypatch.setattr(ai_routes, "get_database", lambda: db)
-    client = TestClient(app)
+    client = trusted_client()
     endpoint = (
         "/api/ai/features/save?source=paper_trades_backfill"
         "&strategy_type=momentum&timeframe=1D&terminal_only=true&dry_run=false"
@@ -708,7 +720,7 @@ def test_ai_feature_save_backfill_writes_only_snapshot_and_prevents_duplicate(mo
 def test_ai_feature_save_prevents_duplicate_snapshot_inserts(monkeypatch) -> None:
     db = FakeSaveDB()
     monkeypatch.setattr(ai_routes, "get_database", lambda: db)
-    client = TestClient(app)
+    client = trusted_client()
     endpoint = "/api/ai/features/save?strategy_type=momentum&limit=10&timeframe=1D&dry_run=false"
 
     first = client.post(endpoint)

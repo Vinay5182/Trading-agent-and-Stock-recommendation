@@ -8,6 +8,16 @@ from fastapi.testclient import TestClient
 
 from main import app
 from routes import paper
+from security.operator_intent import OPERATOR_INTENT_HEADER, OPERATOR_INTENT_VALUE
+
+
+OPERATOR_HEADERS = {OPERATOR_INTENT_HEADER: OPERATOR_INTENT_VALUE}
+
+
+def trusted_client() -> TestClient:
+    client = TestClient(app)
+    client.headers.update(OPERATOR_HEADERS)
+    return client
 
 
 def make_trade(symbol: str, status: str = "WAITING_FOR_ENTRY") -> dict:
@@ -289,7 +299,7 @@ def test_dry_run_stores_exact_approvable_transition_metadata(monkeypatch) -> Non
 def test_unbound_real_update_creates_approval_required_run_log_without_writes(monkeypatch) -> None:
     db = patch_fake_db(monkeypatch, [make_trade("WAIT1"), make_trade("WAIT2")])
     monkeypatch.setattr(paper, "TradingViewClient", FakeTradingViewEntryClient)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.post("/api/paper/update-trades?dry_run=false&max_trades=6&max_writes=1")
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import calendar
 import csv
 import sys
@@ -34,6 +35,7 @@ INTERVALS = {"4H": "240", "1H": "60", "15M": "15", "5M": "5"}
 sys.path.insert(0, str(BACKEND_DIR))
 
 from tv_client import TradingViewClient, tradingview_url  # noqa: E402
+from services.tradingview_manager import TradingViewPreflightError, tradingview_manager  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -314,20 +316,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
-    selected = {value.strip().upper() for value in args.only}
-    jobs = [job for job in EXPORT_JOBS if not selected or job.key in selected]
-    unknown = sorted(selected - {job.key for job in EXPORT_JOBS})
-    if unknown:
-        print(f"Unknown --only job(s): {', '.join(unknown)}", file=sys.stderr)
-        return 2
+def manager_timeout_seconds(args: argparse.Namespace, jobs: list[ExportJob]) -> int:
+    per_job = args.navigation_timeout + (args.history_attempts * args.history_wait_seconds) + 30
+    return max(60, len(jobs) * per_job)
+
+
+def export_jobs_with_owned_client(
+    args: argparse.Namespace,
+    jobs: list[ExportJob],
+) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[dict[str, str]]]:
     client = TradingViewClient(args.port)
     try:
         client.connect_to_debug_port()
     except Exception as exc:
-        print(f"Cannot connect to existing TradingView CDP port {args.port}: {exc}", file=sys.stderr)
-        return 1
+        raise RuntimeError(f"Cannot connect to existing TradingView CDP port {args.port}: {exc}") from exc
 
     results = []
     failures = []
@@ -348,6 +350,38 @@ def main() -> int:
         except Exception as exc:
             failures.append({"job": job.key, "error": str(exc)})
             print(f"FAILED {job.symbol} {job.timeframe}: {exc}", file=sys.stderr)
+    return results, failures, warnings
+
+
+def main() -> int:
+    args = parse_args()
+    selected = {value.strip().upper() for value in args.only}
+    jobs = [job for job in EXPORT_JOBS if not selected or job.key in selected]
+    unknown = sorted(selected - {job.key for job in EXPORT_JOBS})
+    if unknown:
+        print(f"Unknown --only job(s): {', '.join(unknown)}", file=sys.stderr)
+        return 2
+
+    try:
+        results, failures, warnings = asyncio.run(
+            tradingview_manager.run_sync(
+                "scripts.export_tradingview_candles",
+                export_jobs_with_owned_client,
+                args,
+                jobs,
+                timeout_seconds=manager_timeout_seconds(args, jobs),
+                retries=0,
+            )
+        )
+    except TradingViewPreflightError as exc:
+        print(f"Cannot start TradingView export: {exc.code}: {exc.message}", file=sys.stderr)
+        return 1
+    except TimeoutError as exc:
+        print(f"TradingView export timed out: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"TradingView export failed before completion: {exc}", file=sys.stderr)
+        return 1
 
     print("\nExport summary")
     for result in results:

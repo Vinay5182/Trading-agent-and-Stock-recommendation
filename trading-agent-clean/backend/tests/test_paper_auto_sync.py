@@ -258,6 +258,9 @@ def paper_signal_row(symbol: str, *, source_id: str | None = None) -> dict:
 
 
 class FakeTradingViewClient:
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
     def connect_to_debug_port(self) -> bool:
         return True
 
@@ -426,7 +429,8 @@ def test_setup_id_unique_index_excludes_missing_and_empty_setup_id_documents() -
 def test_build_paper_plans_concurrent_calls_create_one_logical_trade(monkeypatch) -> None:
     db = FakeDb(signals=[paper_signal_row("BUILD")])
     monkeypatch.setattr(paper, "get_database", lambda: db)
-    monkeypatch.setattr(paper, "TradingViewClient", FakeTradingViewClient)
+    import tv_client
+    monkeypatch.setattr(tv_client, "TradingViewClient", FakeTradingViewClient)
 
     async def run_twice():
         return await asyncio.gather(

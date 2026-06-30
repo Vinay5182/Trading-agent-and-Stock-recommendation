@@ -12,7 +12,7 @@ from services.paper_identity import (
     paper_trade_setup_filter,
     source_fields_from_saved_row,
 )
-from services.paper_migration import ensure_paper_trade_setup_index
+from services.position_sizing import calculate_proposed_sizing
 from tv_confirmation import PAPER_PLAN_FIELDS
 
 
@@ -119,20 +119,32 @@ def _has_plan_levels(row: dict) -> bool:
     return all(value is not None for value in values) and values[0] > values[1]
 
 
+def is_current_schema(row: dict) -> bool:
+    has_tv_status = any(row.get(f) is not None for f in ("tv_status", "status", "final_status"))
+    has_plan_valid = row.get("paper_plan_valid") is not None
+    has_grade = row.get("trade_quality_grade") is not None
+    has_levels = _has_plan_levels(row)
+    return bool(has_tv_status and has_plan_valid and has_grade and has_levels)
+
+
 def is_trade_ready_saved_row(row: dict) -> bool:
     risk_summary = row.get("risk_summary") if isinstance(row.get("risk_summary"), dict) else {}
     trap_status = str(row.get("trap_status") or risk_summary.get("trap_status") or "").upper()
-    return (
+    meets_core = (
         _clean_grade(row.get("trade_quality_grade")) in TRADE_READY_GRADES
         and str(row.get("tv_status") or row.get("status") or row.get("final_status") or "").upper()
         in TRADE_READY_STATUSES
         and row.get("paper_plan_valid") is True
-        and row.get("trade_allowed") is not False
         and not _has_trade_ready_blocker(row)
         and "DANGER" not in trap_status
         and not any("HIGH" in _risk_value(row, field) for field in HIGH_RISK_FIELDS)
         and _has_plan_levels(row)
     )
+    if not meets_core:
+        return False
+    if is_current_schema(row):
+        return True
+    return row.get("trade_allowed") is not False
 
 
 def _source_type_for_saved_collection(collection_name: str) -> str:
@@ -148,9 +160,24 @@ def _paper_docs_from_saved_row(row: dict, source_signal_type: str, source_collec
     target_1 = _number(_saved_plan_value(row, "target_1"))
     target_2 = _number(_saved_plan_value(row, "target_2"))
     target_3 = _number(_saved_plan_value(row, "target_3"))
-    risk_per_share = entry - stop
-    risk_amount = 1000
-    quantity = floor(risk_amount / risk_per_share)
+    grade = _clean_grade(row.get("trade_quality_grade"))
+
+    # Calculate proposed baseline sizing (ignoring current portfolio allocation)
+    sizing = calculate_proposed_sizing(
+        entry_price=entry or 0.0,
+        stop_loss=stop or 0.0,
+        grade=grade,
+        current_balance=250000.0,
+        available_margin=250000.0,
+        open_margin=0.0,
+        combined_open_risk=0.0,
+    )
+
+    proposed_qty = sizing.get("final_quantity", 0) if sizing.get("ok") else 0
+    proposed_margin = sizing.get("required_margin", 0.0) if sizing.get("ok") else 0.0
+    proposed_risk = sizing.get("estimated_sl_risk", 0.0) if sizing.get("ok") else 0.0
+    proposed_exposure = sizing.get("exposure", 0.0) if sizing.get("ok") else 0.0
+
     source_created_at = row.get("created_at") or now
     source_updated_at = row.get("updated_at") or source_created_at
     source_fields = source_fields_from_saved_row(row, source_collection)
@@ -159,7 +186,7 @@ def _paper_docs_from_saved_row(row: dict, source_signal_type: str, source_collec
         "tradingview_symbol": row.get("tradingview_symbol") or row.get("requested_tradingview_symbol"),
         "timeframe": row.get("timeframe") or "1D",
         "paper_only": True,
-        "trade_quality_grade": _clean_grade(row.get("trade_quality_grade")),
+        "trade_quality_grade": grade,
         "confidence_score": row.get("confidence_score"),
         "source": "saved_tv_confirmations",
         "updated_at": source_updated_at,
@@ -201,7 +228,6 @@ def _paper_docs_from_saved_row(row: dict, source_signal_type: str, source_collec
         "target_1": target_1,
         "target_2": target_2,
         "target_3": target_3,
-        "risk_per_share": risk_per_share,
         "risk_reward": row.get("paper_rr_1"),
         "risk_reward_1": row.get("paper_rr_1"),
         "risk_reward_2": row.get("paper_rr_2"),
@@ -210,11 +236,24 @@ def _paper_docs_from_saved_row(row: dict, source_signal_type: str, source_collec
         "next_action_for_paper_trade": row.get("next_action_for_paper_trade"),
         "invalidation_condition": row.get("invalidation_condition"),
         "avoid_condition": row.get("invalidation_condition"),
-        "paper_capital": 100000,
-        "risk_percent": 1,
-        "risk_amount": risk_amount,
-        "quantity": quantity,
-        "quantity_remaining": quantity,
+
+        # Proposed UI fields
+        "proposed_quantity": proposed_qty,
+        "proposed_exposure": proposed_exposure,
+        "proposed_margin": proposed_margin,
+        "proposed_sl_risk": proposed_risk,
+        "proposed_capital_model_version": "v2",
+
+        # Zeroed actual accounting fields
+        "margin_remaining": 0.0,
+        "open_sl_risk": 0.0,
+        "initial_margin_reserved": 0.0,
+        "initial_sl_risk": 0.0,
+        "margin_released_total": 0.0,
+        "quantity": proposed_qty,
+        "quantity_remaining": proposed_qty,
+        "state_version": 1,
+
         "partial_exit_1": None,
         "partial_exit_2": None,
         "partial_exit_3": None,
@@ -253,33 +292,16 @@ async def _load_trade_ready_saved_rows(db, index_name: str) -> list[tuple[dict, 
 
 
 async def _ensure_sync_indexes(db) -> list[str]:
-    warnings = []
-    for collection, name in ((db.paper_signals, "paper_signal_auto_sync_dedupe_v2"),):
-        create_index = getattr(collection, "create_index", None)
-        if create_index is None:
-            continue
-        try:
-            await create_index(
-                [("symbol", 1), ("source_signal_type", 1), ("paper_only", 1)],
-                unique=True,
-                name=name,
-                partialFilterExpression={
-                    "paper_only": True,
-                    "source": "saved_tv_confirmations",
-                },
-            )
-        except Exception as exc:
-            warnings.append(f"{name}: {exc}")
-    try:
-        await ensure_paper_trade_setup_index(db)
-    except Exception as exc:
-        warnings.append(f"paper_trades_setup_id_unique_v1: {exc}")
-    return warnings
+    from services.mongo_indexes import get_collection_index_specs
+
+    get_collection_index_specs("paper_signals")
+    get_collection_index_specs("paper_trades")
+    return []
 
 
-async def sync_trade_ready(index_name: str = "BROAD_MARKET_750", db_override=None) -> dict:
+async def sync_trade_ready(index_name: str = "BROAD_MARKET_750", db_override=None, dry_run: bool = False) -> dict:
     clean_index = (index_name or "BROAD_MARKET_750").strip().upper()
-    logger.info("ENTER sync_trade_ready() index=%s collections=paper_signals,paper_trades", clean_index)
+    logger.info("ENTER sync_trade_ready() index=%s collections=paper_signals,paper_trades dry_run=%s", clean_index, dry_run)
     if _SYNC_LOCK.locked():
         logger.warning("sync_trade_ready() skipped: concurrent sync lock is active")
         return {
@@ -303,7 +325,7 @@ async def sync_trade_ready(index_name: str = "BROAD_MARKET_750", db_override=Non
 
     async with _SYNC_LOCK:
         db = db_override or get_database()
-        index_warnings = await _ensure_sync_indexes(db)
+        index_warnings = await _ensure_sync_indexes(db) if not dry_run else []
         trade_ready_rows = await _load_trade_ready_saved_rows(db, clean_index)
         logger.info("sync_trade_ready() rows found=%d", len(trade_ready_rows))
         now = datetime.now(timezone.utc).isoformat()
@@ -319,30 +341,40 @@ async def sync_trade_ready(index_name: str = "BROAD_MARKET_750", db_override=Non
                 existing_signal = await db.paper_signals.find_one(signal_identity, {"_id": 1})
                 signal_update = {key: value for key, value in signal.items() if key != "created_at"}
                 if existing_signal:
-                    result = await db.paper_signals.update_one({"_id": existing_signal["_id"]}, {"$set": signal_update})
-                    signals_updated += int(getattr(result, "modified_count", 0))
+                    if not dry_run:
+                        result = await db.paper_signals.update_one({"_id": existing_signal["_id"]}, {"$set": signal_update})
+                        signals_updated += int(getattr(result, "modified_count", 0))
+                    else:
+                        signals_updated += 1
                 else:
                     try:
-                        result = await db.paper_signals.update_one(
-                            signal_identity,
-                            {"$setOnInsert": signal},
-                            upsert=True,
-                        )
-                        signals_upserted += 1 if getattr(result, "upserted_id", None) is not None else 0
+                        if not dry_run:
+                            result = await db.paper_signals.update_one(
+                                signal_identity,
+                                {"$setOnInsert": signal},
+                                upsert=True,
+                            )
+                            signals_upserted += 1 if getattr(result, "upserted_id", None) is not None else 0
+                        else:
+                            signals_upserted += 1
                     except DuplicateKeyError:
                         existing_signal = await db.paper_signals.find_one(signal_identity, {"_id": 1})
                         if existing_signal:
-                            result = await db.paper_signals.update_one({"_id": existing_signal["_id"]}, {"$set": signal_update})
-                            signals_updated += int(getattr(result, "modified_count", 0))
+                            if not dry_run:
+                                result = await db.paper_signals.update_one({"_id": existing_signal["_id"]}, {"$set": signal_update})
+                                signals_updated += int(getattr(result, "modified_count", 0))
+                            else:
+                                signals_updated += 1
 
                 existing_trade = await db.paper_trades.find_one(trade_identity)
                 if existing_trade is None:
                     existing_trade = await db.paper_trades.find_one(legacy_paper_trade_identity(trade))
                     if existing_trade and not existing_trade.get("setup_id"):
-                        await db.paper_trades.update_one(
-                            {"_id": existing_trade["_id"], "paper_only": True},
-                            {"$set": {key: value for key, value in trade.items() if key in {"setup_id", "setup_identity", "canonical_setup_id", "setup_date", "source_confirmation_id", "source_collection"}}},
-                        )
+                        if not dry_run:
+                            await db.paper_trades.update_one(
+                                {"_id": existing_trade["_id"], "paper_only": True},
+                                {"$set": {key: value for key, value in trade.items() if key in {"setup_id", "setup_identity", "canonical_setup_id", "setup_date", "source_confirmation_id", "source_collection"}}},
+                            )
                 if existing_trade:
                     if _is_terminal_trade(existing_trade):
                         completed_protected += 1
@@ -350,12 +382,15 @@ async def sync_trade_ready(index_name: str = "BROAD_MARKET_750", db_override=Non
                         existing_protected += 1
                     continue
 
-                result = await db.paper_trades.update_one(
-                    trade_identity,
-                    {"$setOnInsert": trade},
-                    upsert=True,
-                )
-                trades_upserted += 1 if getattr(result, "upserted_id", None) is not None else 0
+                if not dry_run:
+                    result = await db.paper_trades.update_one(
+                        trade_identity,
+                        {"$setOnInsert": trade},
+                        upsert=True,
+                    )
+                    trades_upserted += 1 if getattr(result, "upserted_id", None) is not None else 0
+                else:
+                    trades_upserted += 1
             except DuplicateKeyError:
                 existing_protected += 1
             except Exception as exc:

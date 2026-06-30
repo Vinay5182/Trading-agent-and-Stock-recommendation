@@ -1173,7 +1173,8 @@ def _empty_swing_result(symbol: str | None, timeframe: str, status: str, reason:
 
 
 def confirm_symbol_timeframe(symbol: str, timeframe: str) -> dict:
-    client = TradingViewClient(settings.TRADINGVIEW_DEBUG_PORT)
+    from services.tradingview_manager import tradingview_manager
+    client = tradingview_manager.get_client(require_attached_tab=True)
     result = {
         "symbol": symbol,
         "timeframe": timeframe,
@@ -1257,7 +1258,8 @@ def confirm_swing_symbol_timeframe(
     candidate: dict | None = None,
     min_candles: int = 80,
 ) -> dict:
-    client = TradingViewClient(settings.TRADINGVIEW_DEBUG_PORT)
+    from services.tradingview_manager import tradingview_manager
+    client = tradingview_manager.get_client(require_attached_tab=True)
     result = _empty_swing_result(symbol, timeframe, "TECHNICAL_FAILED", "TV_ERROR")
     try:
         if not symbol:
@@ -1998,7 +2000,8 @@ def confirm_swing_symbol_timeframes(
     candidate: dict | None = None,
     attached_target_id: str | None = None,
 ) -> dict:
-    client = TradingViewClient(settings.TRADINGVIEW_DEBUG_PORT, attached_target_id=attached_target_id, require_attached_tab=True)
+    from services.tradingview_manager import tradingview_manager
+    client = tradingview_manager.get_client(require_attached_tab=True)
     client.set_deadline(settings.TRADINGVIEW_SYMBOL_TIMEOUT_SECONDS)
     candidate = candidate or {}
     symbol_meta = _prepare_tradingview_symbol(symbol, candidate)
@@ -2368,7 +2371,8 @@ def confirm_swing_symbol_timeframes(
 
 
 def confirm_momentum_symbol_timeframe(symbol: str, timeframe: str) -> dict:
-    client = TradingViewClient(settings.TRADINGVIEW_DEBUG_PORT)
+    from services.tradingview_manager import tradingview_manager
+    client = tradingview_manager.get_client(require_attached_tab=True)
     result = {"symbol": symbol, "timeframe": timeframe, "momentum_confirmed": False, "reason": None, "diagnostics": {}}
     try:
         client.connect_to_debug_port()
@@ -2561,7 +2565,8 @@ def confirm_momentum_symbol_timeframes(
     candidate: dict | None = None,
     attached_target_id: str | None = None,
 ) -> dict:
-    client = TradingViewClient(settings.TRADINGVIEW_DEBUG_PORT, attached_target_id=attached_target_id, require_attached_tab=True)
+    from services.tradingview_manager import tradingview_manager
+    client = tradingview_manager.get_client(require_attached_tab=True)
     client.set_deadline(settings.TRADINGVIEW_SYMBOL_TIMEOUT_SECONDS)
     candidate = candidate or {}
     symbol_meta = _prepare_tradingview_symbol(symbol, candidate)

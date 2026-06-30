@@ -96,6 +96,8 @@ def fake_db() -> SimpleNamespace:
         momentum_tv_confirmations=FakeCollection(),
         scan_runs=FakeCollection(),
         scan_rows=FakeCollection(),
+        pipeline_run_locks=FakeCollection(),
+        pipeline_run_status=FakeCollection(),
         paper_update_runs=FakeCollection(),
         scheduler_status=FakeCollection(),
         system_errors=FakeCollection(),
@@ -124,7 +126,10 @@ def test_run_scan_uses_real_quote_rows_and_persists_scan_rows(monkeypatch) -> No
             ),
         )
 
-        result = await scan.run_scan(scan.ScanRequest(selected_index="DEFAULT_UNIVERSE", limit=1))
+        result = await scan.run_scan(
+            scan.ScanRequest(selected_index="DEFAULT_UNIVERSE", limit=1, dry_run=False),
+            operator_intent="operator-write-v1",
+        )
         rows = await scan.get_scan_rows(result["scan_run_id"], limit=100)
 
         assert result["rows_count"] == 1

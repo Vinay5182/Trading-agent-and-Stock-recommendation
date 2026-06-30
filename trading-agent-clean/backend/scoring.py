@@ -1,3 +1,12 @@
+from __future__ import annotations
+
+import math
+from typing import Any
+
+
+SCORING_VERSION = "score_v2_strict_numeric"
+INVALID_SCORE_INPUT = "INVALID_SCORE_INPUT"
+
 REQUIRED_FIELDS = (
     "symbol",
     "current_price",
@@ -12,13 +21,84 @@ REQUIRED_FIELDS = (
     "thirty_day_change_percent",
 )
 
-
-def _missing_fields(row: dict) -> list[str]:
-    return [field for field in REQUIRED_FIELDS if row.get(field) is None]
+NUMERIC_SCORE_FIELDS = tuple(field for field in REQUIRED_FIELDS if field != "symbol")
 
 
-def _num(row: dict, field: str) -> float:
-    return float(row.get(field) or 0)
+def normalize_score_number(value: Any) -> tuple[float | None, str | None]:
+    if value is None:
+        return None, "MISSING"
+    if isinstance(value, bool):
+        return None, "BOOLEAN_NOT_NUMERIC"
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped == "":
+            return None, "MISSING"
+        try:
+            number = float(stripped.replace(",", ""))
+        except ValueError:
+            return None, "INVALID_NUMERIC_TEXT"
+    elif isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        return None, "INVALID_NUMERIC_TYPE"
+    if not math.isfinite(number):
+        return None, "NON_FINITE_NUMBER"
+    return number, None
+
+
+def validate_score_inputs(row: dict) -> dict:
+    normalized: dict[str, float] = {}
+    missing_fields: list[str] = []
+    invalid_fields: list[dict[str, str]] = []
+    if not row.get("symbol"):
+        missing_fields.append("symbol")
+    for field in NUMERIC_SCORE_FIELDS:
+        number, reason = normalize_score_number(row.get(field))
+        if reason == "MISSING":
+            missing_fields.append(field)
+        elif reason:
+            invalid_fields.append({"field": field, "reason": reason})
+        else:
+            normalized[field] = number
+    return {
+        "ok": not missing_fields and not invalid_fields,
+        "normalized": normalized,
+        "missing_fields": missing_fields,
+        "invalid_fields": invalid_fields,
+    }
+
+
+def normalized_score_fields(row: dict) -> dict[str, float | None]:
+    validation = validate_score_inputs(row)
+    normalized = validation["normalized"]
+    return {field: normalized.get(field) for field in NUMERIC_SCORE_FIELDS}
+
+
+def _invalid_result(validation: dict, *, strategy: str) -> dict:
+    breakdown = {
+        "validation_code": INVALID_SCORE_INPUT,
+        "missing_fields": validation["missing_fields"],
+        "invalid_fields": validation["invalid_fields"],
+    }
+    if strategy == "swing":
+        return {
+            "score": 0,
+            "nse_score": 0,
+            "selected_for_tv": False,
+            "swing_candidate": False,
+            "swing_status": "SWING_INVALID_DATA",
+            "score_breakdown": breakdown,
+        }
+    return {
+        "momentum_score": 0,
+        "momentum_candidate": False,
+        "momentum_status": "MOMENTUM_INVALID_DATA",
+        "score_breakdown": breakdown,
+    }
+
+
+def _num(validation: dict, field: str) -> float:
+    return float(validation["normalized"][field])
 
 
 def _band(value: float, bands: tuple[tuple[float, int], ...]) -> int:
@@ -36,25 +116,18 @@ def _range_position(current_price: float, day_high: float, day_low: float) -> fl
 
 
 def score_swing_row(row: dict) -> dict:
-    missing = _missing_fields(row)
-    if missing:
-        return {
-            "score": 0,
-            "nse_score": 0,
-            "selected_for_tv": False,
-            "swing_candidate": False,
-            "swing_status": "SWING_INVALID_DATA",
-            "score_breakdown": {"missing_fields": missing},
-        }
+    validation = validate_score_inputs(row)
+    if not validation["ok"]:
+        return _invalid_result(validation, strategy="swing")
 
-    current_price = _num(row, "current_price")
-    previous_close = _num(row, "previous_close")
-    open_price = _num(row, "open_price")
-    day_high = _num(row, "day_high")
-    traded_value = _num(row, "traded_value")
-    change_percent = _num(row, "change_percent")
-    relative_volume = _num(row, "relative_volume")
-    thirty_day_change = _num(row, "thirty_day_change_percent")
+    current_price = _num(validation, "current_price")
+    previous_close = _num(validation, "previous_close")
+    open_price = _num(validation, "open_price")
+    day_high = _num(validation, "day_high")
+    traded_value = _num(validation, "traded_value")
+    change_percent = _num(validation, "change_percent")
+    relative_volume = _num(validation, "relative_volume")
+    thirty_day_change = _num(validation, "thirty_day_change_percent")
 
     price_strength = _band(change_percent, ((5, 24), (3, 21), (2, 18), (1, 14), (0.0000001, 8)))
     high_ratio = current_price / day_high if day_high > 0 else 0
@@ -99,25 +172,20 @@ def score_swing_row(row: dict) -> dict:
 
 
 def score_momentum_row(row: dict) -> dict:
-    missing = _missing_fields(row)
-    if missing:
-        return {
-            "momentum_score": 0,
-            "momentum_candidate": False,
-            "momentum_status": "MOMENTUM_INVALID_DATA",
-            "score_breakdown": {"missing_fields": missing},
-        }
+    validation = validate_score_inputs(row)
+    if not validation["ok"]:
+        return _invalid_result(validation, strategy="momentum")
 
-    current_price = _num(row, "current_price")
-    previous_close = _num(row, "previous_close")
-    open_price = _num(row, "open_price")
-    day_high = _num(row, "day_high")
-    day_low = _num(row, "day_low")
-    traded_volume = _num(row, "traded_volume")
-    traded_value = _num(row, "traded_value")
-    change_percent = _num(row, "change_percent")
-    relative_volume = _num(row, "relative_volume")
-    thirty_day_change = _num(row, "thirty_day_change_percent")
+    current_price = _num(validation, "current_price")
+    previous_close = _num(validation, "previous_close")
+    open_price = _num(validation, "open_price")
+    day_high = _num(validation, "day_high")
+    day_low = _num(validation, "day_low")
+    traded_volume = _num(validation, "traded_volume")
+    traded_value = _num(validation, "traded_value")
+    change_percent = _num(validation, "change_percent")
+    relative_volume = _num(validation, "relative_volume")
+    thirty_day_change = _num(validation, "thirty_day_change_percent")
 
     if current_price <= 0 or change_percent > 12 or thirty_day_change > 60:
         return {
@@ -178,10 +246,13 @@ def score_momentum_row(row: dict) -> dict:
 
 
 def score_market_data_row(row: dict) -> dict:
+    validation = validate_score_inputs(row)
+    normalized = normalized_score_fields(row)
     swing = score_swing_row(row)
     momentum = score_momentum_row(row)
     return {
         "symbol": row.get("symbol"),
+        "score_version": SCORING_VERSION,
         "score": swing["score"],
         "nse_score": swing["nse_score"],
         "selected_for_tv": swing["selected_for_tv"],
@@ -190,6 +261,12 @@ def score_market_data_row(row: dict) -> dict:
         "momentum_score": momentum["momentum_score"],
         "momentum_candidate": momentum["momentum_candidate"],
         "momentum_status": momentum["momentum_status"],
+        "score_input_valid": validation["ok"],
+        "score_input_errors": {
+            "missing_fields": validation["missing_fields"],
+            "invalid_fields": validation["invalid_fields"],
+        },
+        "normalized_score_inputs": normalized,
         "score_breakdown": {
             "swing": swing["score_breakdown"],
             "momentum": momentum["score_breakdown"],

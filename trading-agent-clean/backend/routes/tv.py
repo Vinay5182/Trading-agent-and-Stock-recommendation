@@ -1,9 +1,10 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from config import settings
-from services.tradingview_manager import tradingview_manager
-from tv_client import TradingViewClient, validate_symbol, validate_timeframe
+from security.operator_intent import require_operator_intent
+from services.tradingview_manager import TradingViewPreflightError, tradingview_manager
+from tv_client import validate_symbol, validate_timeframe
 
 
 router = APIRouter()
@@ -17,13 +18,17 @@ class TVTestRequest(BaseModel):
 
 
 @router.post("/test-symbol")
-async def test_symbol(request: TVTestRequest) -> dict:
+async def test_symbol(
+    request: TVTestRequest,
+    _operator_intent: None = Depends(require_operator_intent),
+) -> dict:
     return await tradingview_manager.run_sync(
         "tv.test_symbol",
         _test_symbol_sync,
         request,
         timeout_seconds=settings.TRADINGVIEW_SYMBOL_TIMEOUT_SECONDS,
         retries=1,
+        require_preflight=True,
     )
 
 
@@ -34,16 +39,25 @@ async def runtime_status() -> dict:
 
 @router.get("/attachable-tabs")
 async def attachable_tabs() -> dict:
-    return await tradingview_manager.run_sync(
-        "tv.list_attachable_tabs",
-        _list_attachable_tabs_sync,
-        timeout_seconds=25,
-        retries=0,
-    )
+    try:
+        return await tradingview_manager.run_read_only_inspection(
+            "tv.list_attachable_tabs",
+            _list_attachable_tabs_sync,
+            timeout_seconds=25,
+        )
+    except TradingViewPreflightError as exc:
+        if exc.code == "TV_MANAGER_BUSY":
+            return _attachable_tabs_busy_payload(exc)
+        _raise_tradingview_preflight_http(exc)
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail={"code": "TV_DISCOVERY_TIMEOUT", "message": str(exc)}) from exc
 
 
 @router.post("/attach-tab")
-async def attach_tab(target_id: str = Query(...)) -> dict:
+async def attach_tab(
+    target_id: str = Query(...),
+    _operator_intent: None = Depends(require_operator_intent),
+) -> dict:
     try:
         return await tradingview_manager.run_sync(
             "tv.attach_tab",
@@ -54,44 +68,89 @@ async def attach_tab(target_id: str = Query(...)) -> dict:
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except TradingViewPreflightError as exc:
+        _raise_tradingview_preflight_http(exc)
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail={"code": "TV_ATTACH_TIMEOUT", "message": str(exc)}) from exc
 
 
 @router.post("/detach-tab")
-async def detach_tab() -> dict:
-    tradingview_manager.detach_target()
-    return {"attached": False, "attached_target": None}
+async def detach_tab(_operator_intent: None = Depends(require_operator_intent)) -> dict:
+    try:
+        return await tradingview_manager.detach_target_serialized()
+    except TradingViewPreflightError as exc:
+        _raise_tradingview_preflight_http(exc)
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail={"code": "TV_DETACH_TIMEOUT", "message": str(exc)}) from exc
 
 
 def _list_attachable_tabs_sync() -> dict:
-    client = TradingViewClient(settings.TRADINGVIEW_DEBUG_PORT)
+    client = tradingview_manager.get_client()
     client.connect_to_debug_port()
-    targets = client.list_attachable_chart_targets()
-    auto_attached = False
+    list_targets = getattr(client, "list_attachable_chart_targets", None) or client.list_attachable_targets
+    targets = list_targets()
     attached = tradingview_manager.attached_target_snapshot()
-    if attached and not any(target.get("target_id") == attached.get("target_id") for target in targets):
-        tradingview_manager.clear_attachment_if_target(attached.get("target_id"))
-        attached = None
-    if len(targets) == 1 and not attached:
-        attached = tradingview_manager.attach_target(targets[0])
-        auto_attached = True
+    attached_target_id = attached.get("target_id") if attached else None
+    target_ids = {str(target.get("target_id")) for target in targets if target.get("target_id")}
+    attached_target_visible = bool(attached_target_id and str(attached_target_id) in target_ids)
     return {
         "targets": targets,
         "count": len(targets),
-        "auto_attached": auto_attached,
+        "auto_attached": False,
         "attached_target": attached,
-        "attached_target_id": attached.get("target_id") if attached else None,
-        "diagnostics": client.diagnostics,
+        "attached_target_id": attached_target_id,
+        "attached_target_visible": attached_target_visible,
+        "attached_target_stale": bool(attached_target_id and not attached_target_visible),
+        "manual_attachment_required": attached_target_id is None or not attached_target_visible,
+        "manager_busy": False,
+        "diagnostics": getattr(client, "diagnostics", {}),
     }
 
 
 def _attach_tab_sync(target_id: str) -> dict:
-    client = TradingViewClient(settings.TRADINGVIEW_DEBUG_PORT)
+    client = tradingview_manager.get_client()
     client.connect_to_debug_port()
     target = client.validate_attachable_target(target_id)
     if not target:
         raise ValueError("INVALID_TV_TARGET: target is not an attachable TradingView chart")
     attached = tradingview_manager.attach_target(target)
     return {"attached": True, "attached_target": attached, "attached_target_id": attached.get("target_id")}
+
+
+def _attachable_tabs_busy_payload(exc: TradingViewPreflightError) -> dict:
+    attached = tradingview_manager.attached_target_snapshot()
+    attached_target_id = attached.get("target_id") if attached else None
+    status = tradingview_manager.operation_status_snapshot()
+    return {
+        "targets": [],
+        "count": 0,
+        "auto_attached": False,
+        "attached_target": attached,
+        "attached_target_id": attached_target_id,
+        "attached_target_visible": False,
+        "attached_target_stale": False,
+        "manual_attachment_required": attached_target_id is None,
+        "manager_busy": True,
+        "queue_length": status["queue_length"],
+        "active_operation": status["active_operation"],
+        "target_listing_skipped": True,
+        "diagnostics": {
+            "code": exc.code,
+            "message": exc.message,
+        },
+    }
+
+
+def _raise_tradingview_preflight_http(exc: TradingViewPreflightError) -> None:
+    status_code = 409 if exc.code == "TV_MANAGER_BUSY" else 503
+    raise HTTPException(
+        status_code=status_code,
+        detail={
+            "code": exc.code,
+            "message": exc.message,
+            "details": exc.details,
+        },
+    )
 
 
 def _test_symbol_sync(request: TVTestRequest) -> dict:
@@ -130,11 +189,7 @@ def _test_symbol_sync(request: TVTestRequest) -> dict:
             raise ValueError("symbol or tradingview_symbol is required")
         validate_symbol(tradingview_symbol)
         validate_timeframe(request.timeframe)
-        client = TradingViewClient(
-            port,
-            attached_target_id=tradingview_manager.attached_target_id,
-            require_attached_tab=True,
-        )
+        client = tradingview_manager.get_client(require_attached_tab=True)
         result["connected"] = client.connect_to_debug_port()
         client.open_symbol(tradingview_symbol)
         if client.verify_symbol_loaded(tradingview_symbol):

@@ -1,6 +1,6 @@
 import hashlib
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Mapping
 
 
@@ -260,6 +260,56 @@ def ai_feature_snapshot_identity(snapshot: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
+def _parse_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif value not in (None, ""):
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+
+def get_doc_timestamp(doc: Mapping[str, Any]) -> datetime | None:
+    for key in ("created_at", "updated_at", "modified_at", "status_updated_at"):
+        val = doc.get(key)
+        if val:
+            parsed = _parse_timestamp(val)
+            if parsed:
+                return parsed
+    return None
+
+
+def get_prediction_horizon(strategy_type: str | None, timeframe: str | None) -> int:
+    strat = str(strategy_type or "").lower()
+    if "swing" in strat:
+        return 5 * 24 * 3600  # 5 days
+    return 1 * 24 * 3600  # 1 day
+
+
+def chronological_split(
+    rows: list[dict],
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+    time_key: str = "snapshot_time"
+) -> tuple[list[dict], list[dict], list[dict]]:
+    sorted_rows = sorted(
+        rows,
+        key=lambda r: str(r.get(time_key) or r.get("feature_as_of") or "")
+    )
+    n = len(sorted_rows)
+    train_end = int(n * train_ratio)
+    val_end = int(n * (train_ratio + val_ratio))
+
+    train = sorted_rows[:train_end]
+    val = sorted_rows[train_end:val_end]
+    test = sorted_rows[val_end:]
+    return train, val, test
+
+
 def build_ai_feature_snapshot(
     scored_candidate: Mapping[str, Any],
     market_data: Mapping[str, Any] | None = None,
@@ -285,6 +335,41 @@ def build_ai_feature_snapshot(
         )
     )
 
+    as_of_str = snapshot_time or utc_now_iso()
+    as_of_dt = _parse_timestamp(as_of_str)
+    if not as_of_dt:
+        raise ValueError("Invalid snapshot_time / as_of timestamp")
+
+    timestamps = []
+
+    def check_doc(doc, name):
+        if doc:
+            real_keys = [k for k in doc.keys() if k not in ("strategy_type", "timeframe")]
+            if real_keys:
+                ts = get_doc_timestamp(doc)
+                if not ts:
+                    raise ValueError(f"Source document '{name}' is missing a valid timestamp")
+                if ts > as_of_dt:
+                    raise ValueError(f"Source document '{name}' has a future timestamp {ts.isoformat()} relative to as_of {as_of_str}")
+                timestamps.append(ts)
+
+    check_doc(scored_candidate, "scored_candidate")
+    check_doc(market_data, "market_data")
+    check_doc(tv_confirmation, "tv_confirmation")
+    check_doc(paper_signal, "paper_signal")
+
+    if paper_trade:
+        real_keys = [k for k in paper_trade.keys() if k not in ("strategy_type", "timeframe")]
+        if real_keys:
+            created_at_dt = get_doc_timestamp(paper_trade)
+            if not created_at_dt:
+                raise ValueError("Source document 'paper_trade' is missing a valid timestamp")
+            if created_at_dt > as_of_dt:
+                raise ValueError("Source document 'paper_trade' has a future timestamp relative to as_of")
+            timestamps.append(created_at_dt)
+
+    max_source_ts = max(timestamps) if timestamps else as_of_dt
+
     trend_score = _first_number(
         scored_candidate.get("trend_score"),
         tv_confirmation.get("trend_score"),
@@ -297,6 +382,10 @@ def build_ai_feature_snapshot(
         paper_signal.get("volume_score"),
         _breakdown_sum(breakdown, VOLUME_BREAKDOWN_KEYS.get(strategy_type or "", ())),
     )
+
+    setup_status = _setup_status(strategy_type, scored_candidate, tv_confirmation, paper_signal, paper_trade)
+    if setup_status in CLOSED_TRADE_STATUSES:
+        setup_status = "ACTIVE"
 
     snapshot = {
         "feature_snapshot_version": 1,
@@ -318,7 +407,7 @@ def build_ai_feature_snapshot(
             scored_candidate.get("timeframe"),
             market_data.get("timeframe"),
         ),
-        "snapshot_time": snapshot_time or utc_now_iso(),
+        "snapshot_time": as_of_str,
         "data_source_ids": _source_ids(scored_candidate, market_data, tv_confirmation, paper_signal, paper_trade),
         "rule_score": _first_number(
             scored_candidate.get("rule_score"),
@@ -339,7 +428,7 @@ def build_ai_feature_snapshot(
             paper_signal.get("risk_score"),
             paper_trade.get("risk_score"),
         ),
-        "setup_status": _setup_status(strategy_type, scored_candidate, tv_confirmation, paper_signal, paper_trade),
+        "setup_status": setup_status,
         "entry_price": _first_number(
             paper_trade.get("entry_price"),
             paper_signal.get("entry"),
@@ -370,6 +459,21 @@ def build_ai_feature_snapshot(
         ),
         "paper_trade_id": _document_id(paper_trade),
     }
+
+    horizon = get_prediction_horizon(strategy_type, snapshot["timeframe"])
+    snapshot.update({
+        "feature_as_of": as_of_str,
+        "maximum_source_timestamp": max_source_ts.isoformat(),
+        "label_timestamp": None,
+        "prediction_horizon": horizon,
+        "source_identity": {
+            "symbol": snapshot["symbol"],
+            "strategy_type": strategy_type,
+            "timeframe": snapshot["timeframe"],
+            "exchange": snapshot["exchange"],
+        }
+    })
+
     snapshot.update({field: None for field in OUTCOME_FIELDS})
     return snapshot
 
@@ -398,6 +502,25 @@ def build_closed_paper_trade_outcome(
     if not is_closed_paper_trade(paper_trade):
         raise ValueError("Paper outcome can only be attached after the paper trade closes.")
     statuses = _status_values(paper_trade)
+
+    exit_time = _first_value(
+        paper_trade.get("exit_time"),
+        paper_trade.get("closed_at"),
+        paper_trade.get("status_updated_at"),
+        paper_trade.get("updated_at"),
+    )
+    if not exit_time:
+        raise ValueError("Paper trade exit time is missing")
+    exit_dt = _parse_timestamp(exit_time)
+    if not exit_dt:
+        raise ValueError("Paper trade exit time is invalid")
+
+    created_at_val = paper_trade.get("created_at")
+    if created_at_val:
+        created_dt = _parse_timestamp(created_at_val)
+        if created_dt and exit_dt <= created_dt:
+            raise ValueError("Outcome exit time must occur strictly after trade creation time")
+
     terminal_status = next(
         (
             str(value)
@@ -410,12 +533,6 @@ def build_closed_paper_trade_outcome(
     paper_pnl_percent = _number(paper_trade.get("paper_pnl_percent"))
     realized_pnl = _number(paper_trade.get("realized_pnl"))
     exit_price = _number(paper_trade.get("exit_price"))
-    exit_time = _first_value(
-        paper_trade.get("exit_time"),
-        paper_trade.get("closed_at"),
-        paper_trade.get("status_updated_at"),
-        paper_trade.get("updated_at"),
-    )
     result_label = _outcome_label(statuses, _first_number(paper_pnl, realized_pnl))
     return {
         "outcome_status": terminal_status,
@@ -443,6 +560,18 @@ def attach_closed_paper_trade_outcome(
     *,
     outcome_time: str | None = None,
 ) -> dict[str, Any]:
+    feature_as_of = snapshot.get("feature_as_of") or snapshot.get("snapshot_time")
+    horizon = snapshot.get("prediction_horizon") or 0
+    outcome = build_closed_paper_trade_outcome(paper_trade, outcome_time=outcome_time)
+
+    exit_time = outcome.get("exit_time")
+    if feature_as_of and exit_time:
+        feature_dt = _parse_timestamp(feature_as_of)
+        exit_dt = _parse_timestamp(exit_time)
+        if feature_dt and exit_dt and exit_dt <= feature_dt + timedelta(seconds=horizon):
+            raise ValueError("Outcome exit time must occur strictly after feature snapshot and prediction horizon")
+
     updated = dict(snapshot)
-    updated.update(build_closed_paper_trade_outcome(paper_trade, outcome_time=outcome_time))
+    updated.update(outcome)
+    updated["label_timestamp"] = exit_time
     return updated

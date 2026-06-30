@@ -1,10 +1,10 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
-  API_BASE, attachTradingViewTab, buildMomentumSignals, buildPaperPlans, buildSwingSignals, detachTradingViewTab,
+  API_BASE, attachTradingViewTab, detachTradingViewTab,
   getAiDataCollectionStatus, getAiFeatureDatasetSummary, getAiFeatureSnapshots, getAiOutcomePreview, getDashboardPaperEquity, getHealth, getMarketDataSymbol, getMarketLoadProgress, getMomentumCandidates, getMomentumPrecheck,
   getMomentumSummary, getMomentumTvConfirmed, getPaperHistory, getPaperOpenTrades, getPaperSummary, getPaperUpdateLock, getPaperUpdateProgress, getPaperUpdateRuns, getPaperUpdateSchedulerStatus, getScanRows, getScoreSummary, getSettings, getSwingCandidates, getSystemRuntimeInfo,
-  getSwingPrecheck, getSwingSummary, getSwingTvConfirmed, getTradingViewAttachableTabs, getTradingViewRuntimeStatus, isRequestCancellation, momentumTvConfirm, loadAllMarketData, runPaperPipeline, runScan, runScoring,
-  swingTvConfirm, testTvSymbol,
+  getSwingPrecheck, getSwingSummary, getSwingTvConfirmed, getTradingViewAttachableTabs, getTradingViewRuntimeStatus, isRequestCancellation, momentumTvConfirm, loadAllMarketData, runPaperPipeline, runScoring,
+  swingTvConfirm, testTvSymbol, tradingViewBadge, deriveTradingViewBusy, isBatchReady,
 } from "./api";
 import { aiDataCollectionChecklist, aiOutcomeEligibleRows, aiOutcomeSkippedRows, aiSnapshotDisplayRows } from "./aiDataset";
 
@@ -26,6 +26,10 @@ const arr = (value, keys = []) => {
   const key = keys.find((name) => Array.isArray(value?.[name]));
   return key ? value[key] : [];
 };
+const settledValue = (result, fallback = null) => result?.status === "fulfilled" ? result.value : fallback;
+const settledErrors = (entries) => entries
+  .filter((entry) => entry.result?.status === "rejected" && !isRequestCancellation(entry.result.reason))
+  .map((entry) => ({ endpoint: entry.endpoint, message: entry.result.reason?.message || String(entry.result.reason) }));
 const hasValue = (value) => {
   if (value === undefined || value === null) return false;
   if (typeof value === "string") {
@@ -63,13 +67,6 @@ const statusTone = (status = "") => {
   if (text.includes("CONFIRMED_SIGNAL") || text.includes("CONFIRMED") || text.includes("TARGET") || text.includes("ACTIVE") || text.includes("READY") || text.includes("VALID") || text.includes("BULLISH") || text === "LOW") return "green";
   if (text.includes("WAIT") || text.includes("PLAN") || text.includes("WATCH") || text.includes("NEUTRAL") || text === "MEDIUM") return "yellow";
   return "green";
-};
-const tradingViewBadge = (status) => {
-  if (!status) return { tone: "gray", label: "TradingView Unknown" };
-  if (status.last_error) return { tone: "red", label: "TradingView Error" };
-  if (status.worker_running) return { tone: "yellow", label: "TradingView Busy" };
-  if (status.connected) return { tone: "green", label: "TradingView Connected" };
-  return { tone: "gray", label: "TradingView Idle" };
 };
 const normalizeTradeQualityGrade = (grade = "") => {
   const text = String(grade || "").trim().toUpperCase().replace(/[\s-]+/g, "_");
@@ -367,12 +364,13 @@ function PaperUpdateRunHistory({ runs = [] }) {
 
 const summaryBreakdownRows = (values = {}) => Object.entries(values || {}).map(([label, count]) => ({ label, count }));
 
-function AiDatasetSummary({ summary, snapshots, outcomePreview, collectionStatus, filters, onFiltersChange, onRefresh, loading }) {
+function AiDatasetSummary({ summary, snapshots, outcomePreview, collectionStatus, filters, onFiltersChange, onRefresh, loading, errors = [] }) {
   const readyForModelTraining = summary?.ready_for_model_training === true;
   const readinessReasons = Array.isArray(summary?.readiness_reason) ? summary.readiness_reason : [];
   const checklist = aiDataCollectionChecklist(summary, outcomePreview);
   return <Card title="AI Dataset Summary" eyebrow="read-only dataset tracking">
     <div className="warningText">{readyForModelTraining ? "Dataset readiness checks passed. No AI model is running." : "AI model training is not ready yet."}</div>
+    {errors.length ? <div className="datasetTrackingReminder">Some dataset panels could not refresh: {errors.map((item) => item.endpoint).join(", ")}.</div> : null}
     {readinessReasons.length ? <ul className="readinessReasonList">{readinessReasons.map((reason) => <li key={reason}>{reason}</li>)}</ul> : null}
     <div className="datasetTrackingReminder">This dashboard is for dataset tracking only. It does not generate predictions or trade recommendations.</div>
     <div className="formGrid aiDatasetFilters">
@@ -498,37 +496,38 @@ function DashboardPortfolio({ data }) {
     Strategy: row.strategy || "",
     "Exit Date": row.exit_date || "",
     Reason: row.exit_reason || "",
+    "Original Margin": money(rowNumber(row, "initial_margin_reserved")),
+    "Total Released": money(rowNumber(row, "margin_released_total")),
     "Realized P&L": money(rowNumber(row, "realized_pnl")),
-    "Profit %": pct(rowNumber(row, "profit_percent")),
-    RR: rowNumber(row, "RR"),
+    "Cash Returned": money(rowNumber(row, "cash_returned_on_final_exit")),
   }));
   const openRows = exposureRows.map((row) => ({
     Symbol: row.symbol || "",
     Strategy: row.strategy || "",
     Status: row.status || "",
-    Entry: rowNumber(row, "entry_price"),
-    Qty: rowNumber(row, "quantity_remaining"),
-    Exposure: money(rowNumber(row, "effective_exposure")),
-    Margin: money(rowNumber(row, "margin_used")),
-    "Broker Funded": money(rowNumber(row, "broker_funded")),
-    "Available After": money(rowNumber(row, "available_margin_after_trade")),
+    "Original Qty": rowNumber(row, "original_quantity"),
+    "Remaining Qty": rowNumber(row, "quantity_remaining"),
+    "Original Margin": money(rowNumber(row, "initial_margin_reserved")),
+    "Remaining Margin": money(rowNumber(row, "margin_remaining")),
+    "Margin Released": money(rowNumber(row, "margin_released_total")),
+    "Realized P&L": money(rowNumber(row, "realized_pnl")),
     "Unrealized P&L": money(rowNumber(row, "unrealized_pnl")),
   }));
   return <>
     <div className="statsGrid dashboardPortfolioGrid">
-      <StatCard label="Starting Balance" value={money(numberField("starting_virtual_balance"))} />
-      <StatCard label="Current Virtual Balance" value={money(numberField("current_virtual_balance"))} />
-      <StatCard label="Open Margin Used" value={money(numberField("open_margin_used"))} tone="yellow" />
-      <StatCard label="Available Margin" value={money(numberField("available_margin"))} />
-      <StatCard label="Maximum Buying Power" value={money(numberField("max_buying_power"))} />
-      <StatCard label="Available Buying Power" value={money(numberField("available_buying_power"))} />
-      <StatCard label="Effective Exposure" value={money(numberField("effective_exposure"))} tone="yellow" />
-      <StatCard label="Broker Funded Amount" value={money(numberField("broker_funded"))} tone="yellow" />
-      <StatCard label="Buying Power Usage %" value={pct(numberField("buying_power_usage_percent"))} tone="yellow" />
-      <StatCard label="Realized P&L" value={money(numberField("realized_pnl"))} />
+      <StatCard label="Starting Virtual Capital" value={money(numberField("starting_virtual_capital"))} />
+      <StatCard label="Settled Balance" value={money(numberField("settled_balance"))} />
+      <StatCard label="Reserved Margin" value={money(numberField("reserved_margin"))} tone="yellow" />
+      <StatCard label="Available Cash" value={money(numberField("available_cash"))} />
       <StatCard label="Unrealized P&L" value={money(numberField("unrealized_pnl"))} tone="yellow" />
-      <StatCard label="Total P&L" value={money(numberField("total_pnl"))} />
-      <StatCard label="Virtual Return %" value={pct(numberField("virtual_return_percent"))} />
+      <StatCard label="Total Equity" value={money(numberField("total_equity"))} />
+      <StatCard label="Total Realized P&L" value={money(numberField("total_realized_pnl"))} />
+      <StatCard label="Effective Open Exposure" value={money(numberField("effective_open_exposure"))} tone="yellow" />
+      <StatCard label="Broker Funded Exposure" value={money(numberField("broker_funded_exposure"))} tone="yellow" />
+      <StatCard label="Active/Partial Trade Count" value={data?.active_partial_trade_count || "0 / 0"} />
+      <StatCard label="Total Margin Released" value={money(numberField("total_margin_released"))} />
+      <StatCard label="Capital Returned From Latest Exits" value={money(numberField("capital_returned_from_latest_exits"))} />
+
       <StatCard label="Drawdown" value={pct(numberField("drawdown_percent"))} tone={numberField("drawdown_percent") > 0 ? "red" : "green"} />
       <StatCard label="Win Rate" value={pct(numberField("win_rate_percent"))} tone="yellow" />
       <StatCard label="Profit Factor" value={fmt(numberField("profit_factor"))} />
@@ -541,16 +540,30 @@ function DashboardPortfolio({ data }) {
       <StatCard label="Ambiguous" value={countField("ambiguous")} tone="yellow" />
     </div>
     <div className="twoGrid">
+      <Card title="Capital Flow" eyebrow="Accounting reconciliation">
+        <div style={{ padding: "12px", fontSize: "14px", lineHeight: "1.8" }}>
+          <div><strong>Starting Capital:</strong> {money(numberField("starting_virtual_capital"))}</div>
+          <div><strong>− Reserved Margin:</strong> {money(numberField("reserved_margin"))}</div>
+          <div><strong>+ Realized P&L:</strong> {money(numberField("total_realized_pnl"))}</div>
+          <hr style={{ border: "0", borderTop: "1px solid var(--border)", margin: "8px 0" }} />
+          <div><strong>= Available Cash:</strong> {money(numberField("available_cash"))}</div>
+          <div style={{ marginTop: "12px", fontWeight: "bold" }}>
+            Total Equity = Settled Balance ({money(numberField("settled_balance"))}) + Unrealized P&L ({money(numberField("unrealized_pnl"))}) = {money(numberField("total_equity"))}
+          </div>
+        </div>
+      </Card>
       <Card title="Equity Curve" eyebrow="trade_journal"><MiniLineChart points={data?.equity_curve} /></Card>
-      <Card title="Monthly P&L" eyebrow="trade_journal"><MiniBarChart rows={monthlyRows} /></Card>
     </div>
     <div className="twoGrid">
+      <Card title="Monthly P&L" eyebrow="trade_journal"><MiniBarChart rows={monthlyRows} /></Card>
       <Card title="Swing vs Momentum" eyebrow="completed performance"><MiniTable rows={comparisonRows} columns={["Strategy", "Trades", "Win %", "Profit Factor", "Average RR"]} /></Card>
-      <Card title="Recent Completed Trades" eyebrow="trade_journal"><MiniTable rows={recentRows} columns={["Symbol", "Strategy", "Exit Date", "Reason", "Realized P&L", "Profit %", "RR"]} /></Card>
     </div>
-    <Card title="Open-Position Exposure" eyebrow="paper_trades">
-      <MiniTable rows={openRows} columns={["Symbol", "Strategy", "Status", "Entry", "Qty", "Exposure", "Margin", "Broker Funded", "Available After", "Unrealized P&L"]} />
-    </Card>
+    <div className="twoGrid">
+      <Card title="Recent Completed Trades" eyebrow="trade_journal"><MiniTable rows={recentRows} columns={["Symbol", "Strategy", "Exit Date", "Reason", "Original Margin", "Total Released", "Realized P&L", "Cash Returned"]} /></Card>
+      <Card title="Open-Position Exposure" eyebrow="paper_trades">
+        <MiniTable rows={openRows} columns={["Symbol", "Strategy", "Status", "Original Qty", "Remaining Qty", "Original Margin", "Remaining Margin", "Margin Released", "Realized P&L", "Unrealized P&L"]} />
+      </Card>
+    </div>
   </>;
 }
 
@@ -567,6 +580,8 @@ function Dashboard({
   aiOutcomePreview,
   aiDataCollectionStatus,
   aiDatasetFilters,
+  aiDatasetErrors,
+  dashboardErrors,
   paperUpdateProgress,
   paperUpdateRuns,
   paperUpdateLock,
@@ -585,6 +600,16 @@ function Dashboard({
       <div className="heroActions"><ActionButton onClick={onSummary} disabled={loading}>Load Summary</ActionButton><ActionButton onClick={onDryRun} disabled={loading}>Pipeline Dry Run</ActionButton><ActionButton onClick={onSaveRun} disabled={loading}>Save Paper Run</ActionButton></div>
     </section>
     <div className="warningText">Save mode updates PAPER records only. No broker orders. No live trading.</div>
+    {dashboardErrors && dashboardErrors.length > 0 && (
+      <div className="errorSummary warningText" style={{ color: "var(--red)" }}>
+        <strong>Some dashboard panels could not refresh:</strong>
+        <ul style={{ margin: "5px 0 0 20px", padding: 0 }}>
+          {dashboardErrors.map((err, idx) => (
+            <li key={idx}>{err.endpoint}: {err.message}</li>
+          ))}
+        </ul>
+      </div>
+    )}
     <DashboardPortfolio data={dashboardEquity} />
     <DashboardHealthPanel health={health} tradingViewStatus={tvRuntimeStatus} schedulerStatus={paperUpdateScheduler} />
     <div className="statsGrid">
@@ -600,7 +625,7 @@ function Dashboard({
       <StatCard label="Swing Candidates" value={swingSummary?.swing_candidates_count ?? scoreSummary?.swing_candidates_count ?? 0} tone="yellow" />
       <StatCard label="Momentum Candidates" value={momentumSummary?.momentum_candidates_count ?? scoreSummary?.momentum_candidates_count ?? 0} />
     </div>
-    <AiDatasetSummary summary={aiDatasetSummary} snapshots={aiFeatureSnapshots} outcomePreview={aiOutcomePreview} collectionStatus={aiDataCollectionStatus} filters={aiDatasetFilters} onFiltersChange={onAiDatasetFiltersChange} onRefresh={onAiDatasetRefresh} loading={aiDatasetLoading} />
+    <AiDatasetSummary summary={aiDatasetSummary} snapshots={aiFeatureSnapshots} outcomePreview={aiOutcomePreview} collectionStatus={aiDataCollectionStatus} filters={aiDatasetFilters} onFiltersChange={onAiDatasetFiltersChange} onRefresh={onAiDatasetRefresh} loading={aiDatasetLoading} errors={aiDatasetErrors} />
     <PaperAutomationStatus
       progress={paperUpdateProgress}
       schedulerStatus={paperUpdateScheduler}
@@ -629,14 +654,45 @@ const DASHBOARD_REFRESH_MS = 30000;
 const GLOBAL_HEALTH_REFRESH_MS = 30000;
 const BATCH_TV_RUNTIME_REFRESH_MS = 2000;
 
+function sanitizeErrorMessage(str) {
+  if (!str) return "";
+  const cleanStr = String(str);
+  if (/<[a-z][\s\S]*>/i.test(cleanStr) || cleanStr.includes("<!DOCTYPE") || cleanStr.includes("<html")) {
+    return "[RAW_HTML_RESPONSE]";
+  }
+  let clean = cleanStr.replace(/[A-Za-z]:\\[^:\n]+/g, "[PATH]");
+  clean = clean.replace(/\/[a-zA-Z0-9_\-\.\/]+/g, (match) => {
+    if (match.includes("/") && match.split("/").length > 2) {
+      return "[PATH]";
+    }
+    return match;
+  });
+  clean = clean.replace(/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g, "[IP]");
+  clean = clean.replace(/mongodb(\+srv)?:\/\/[^\s"'`>]+/gi, "[MONGO_URI]");
+  clean = clean.replace(/(?:key|secret|token|password|credential|auth)[^\s"'`>:=]*[:=]\s*[^\s"'`>]+/gi, (match) => {
+    const parts = match.split(/[:=]/);
+    return `${parts[0]}: [REDACTED]`;
+  });
+  if (clean.length > 1000) {
+    clean = clean.slice(0, 1000) + "... [TRUNCATED]";
+  }
+  return clean;
+}
+
 function formatActionError(err, actionName = "request") {
   if (isRequestCancellation(err)) return "";
   const status = err?.status ? `HTTP ${err.status}` : "HTTP status unavailable";
-  const message = err?.message || String(err);
-  const body = err?.responseBody ? JSON.stringify(err.responseBody, null, 2) : err?.rawBody || "";
+  const rawMessage = err?.message || String(err);
+  const message = sanitizeErrorMessage(rawMessage);
+  const safeBodyText = err?.responseBody
+    ? [err.responseBody.message, err.responseBody.detail, err.responseBody.error]
+        .filter((x) => typeof x === "string" && x)
+        .map(sanitizeErrorMessage)
+        .join("; ")
+    : "";
   const actionText = String(actionName || "").toLowerCase();
-  const shouldShowTvHint = actionText.includes("tv") || /tradingview|debug|connection|fetch|timeout|network/i.test(`${message} ${body}`);
-  return `${status}\nMessage: ${message}${body ? `\nResponse body:\n${body}` : ""}${shouldShowTvHint ? `\nHint: ${TRADINGVIEW_ERROR_HINT}` : ""}`;
+  const shouldShowTvHint = actionText.includes("tv") || /tradingview|debug|connection|fetch|timeout|network/i.test(`${message} ${safeBodyText}`);
+  return `${status}\nMessage: ${message}${safeBodyText ? `\nDetail: ${safeBodyText}` : ""}${shouldShowTvHint ? `\nHint: ${TRADINGVIEW_ERROR_HINT}` : ""}`;
 }
 
 function tvRows(data) {
@@ -662,14 +718,34 @@ function normalizeSavedTvResponse(data, fallbackLimit = 20) {
 
 function normalizeSearchSymbol(input) {
   const raw = String(input || "").trim().toUpperCase();
-  if (!raw) return { exchange: "NSE", symbol: "", tradingview_symbol: "" };
+  if (!raw || raw === "-" || raw === "UNDEFINED" || raw === "NULL") return { exchange: "NSE", symbol: "", tradingview_symbol: "" };
   if (raw.includes(":")) {
     const [exchange, ...parts] = raw.split(":");
     const symbol = parts.join(":").trim();
     const cleanExchange = exchange.trim() || "NSE";
+    if (!symbol || symbol === "-" || symbol === "UNDEFINED" || symbol === "NULL") {
+      return { exchange: cleanExchange, symbol: "", tradingview_symbol: "" };
+    }
     return { exchange: cleanExchange, symbol, tradingview_symbol: symbol ? `${cleanExchange}:${symbol}` : "" };
   }
   return { exchange: "NSE", symbol: raw, tradingview_symbol: `NSE:${raw}` };
+}
+
+const SUPPORTED_TIMEFRAMES = new Set(["1m", "3m", "5m", "15m", "30m", "45m", "1h", "2h", "3h", "4h", "1D", "1W", "1M"]);
+
+function normalizeTimeframe(p) {
+  const clean = String(p || "").trim();
+  if (!clean) return "";
+  if (/^\d+[mh]$/i.test(clean)) {
+    return clean.toLowerCase();
+  }
+  return clean.toUpperCase();
+}
+
+function validateTimeframes(input) {
+  const parts = String(input || "").split(",").map((p) => p.trim());
+  if (!parts.length || (parts.length === 1 && !parts[0])) return false;
+  return parts.every((p) => SUPPORTED_TIMEFRAMES.has(normalizeTimeframe(p)));
 }
 
 function firstRow(data) {
@@ -680,6 +756,10 @@ const SWING_MTF_TIMEFRAMES = "1W,1D,4H,1H";
 const MOMENTUM_MTF_TIMEFRAMES = "1D,4H,1H";
 const SWING_TV_BATCH_SIZE = 1;
 const MOMENTUM_TV_BATCH_SIZE = 1;
+const TV_BUSY_MAX_RETRIES = 3;
+const TV_BUSY_BASE_DELAY_MS = 2000;
+const isTvManagerBusy = (err) => err?.responseBody?.code === "TV_MANAGER_BUSY" || err?.responseBody?.retryable === true;
+const delay = (ms) => new Promise((resolve) => globalThis.setTimeout(resolve, ms));
 const SWING_CONFIRMED_STATUSES = new Set(["CONFIRMED_SIGNAL"]);
 const SWING_WAIT_WATCH_STATUSES = new Set(["WAIT_FOR_RETEST", "WATCH_FOR_PULLBACK", "WATCH_FOR_BREAKOUT"]);
 const MOMENTUM_CONFIRMED_STATUSES = new Set(["MOMENTUM_CONFIRMED"]);
@@ -774,9 +854,13 @@ function CandidateWatchlistGrid({ rows, selectedRow, onSelect, mode }) {
 }
 
 function rowSearchSymbol(row) {
+  if (!row) return "";
   const tv = String(row?.requested_tradingview_symbol || row?.tradingview_symbol || "").trim().toUpperCase();
   const symbol = String(row?.symbol || row?.canonical_symbol || "").trim().toUpperCase();
-  return tv || (symbol ? `NSE:${symbol}` : "");
+  const exchange = String(row?.exchange || "NSE").trim().toUpperCase();
+  if (tv) return tv;
+  if (!symbol || symbol === "-" || symbol === "UNDEFINED" || symbol === "NULL") return "";
+  return `${exchange}:${symbol}`;
 }
 
 function savedStatus(row) {
@@ -816,9 +900,13 @@ function TvResultSummaryPanel({ title, rows, mode, loaded, onOpenStock }) {
   const safeRows = Array.isArray(rows) ? rows : [];
   const confirmedRows = safeRows.filter((row) => confirmedStatuses.has(savedStatus(row)));
   const waitWatchRows = safeRows.filter((row) => waitWatchStatuses.has(savedStatus(row)));
-  const failedRows = sortByTradeQuality(safeRows.filter((row) => FAILED_STATUSES.has(savedStatus(row))));
   const confirmedWatchRows = sortByTradeQuality([...confirmedRows, ...waitWatchRows]);
-  const activeRows = openSection === "confirmed" ? confirmedWatchRows : openSection === "failed" ? failedRows : [];
+  const rejectedRows = sortByTradeQuality(safeRows.filter((row) => savedStatus(row) === "REJECTED"));
+  const technicalFailedRows = sortByTradeQuality(safeRows.filter((row) => savedStatus(row) === "TECHNICAL_FAILED"));
+
+  const activeRows = openSection === "confirmed" ? confirmedWatchRows :
+                     openSection === "rejected" ? rejectedRows :
+                     openSection === "failed" ? technicalFailedRows : [];
   if (!loaded) {
     return <Card title={title} eyebrow={mode === "momentum" ? "momentum_tv_confirmations" : "swing_tv_confirmations"}>
       <p className="muted">No saved TV results loaded. Run TV Confirm first or click Load Saved TV Results.</p>
@@ -829,14 +917,17 @@ function TvResultSummaryPanel({ title, rows, mode, loaded, onOpenStock }) {
       <button className={`savedSummaryCard ${openSection === "confirmed" ? "active" : ""}`} type="button" onClick={() => setOpenSection(openSection === "confirmed" ? null : "confirmed")}>
         <span>Confirmed / Watch</span><strong>{confirmedWatchRows.length}</strong>
       </button>
+      <button className={`savedSummaryCard ${openSection === "rejected" ? "active" : ""}`} type="button" onClick={() => setOpenSection(openSection === "rejected" ? null : "rejected")}>
+        <span>Strategy Rejected</span><strong>{rejectedRows.length}</strong>
+      </button>
       <button className={`savedSummaryCard ${openSection === "failed" ? "active" : ""}`} type="button" onClick={() => setOpenSection(openSection === "failed" ? null : "failed")}>
-        <span>Failed</span><strong>{failedRows.length}</strong>
+        <span>Technical Failed</span><strong>{technicalFailedRows.length}</strong>
       </button>
     </div>
     <p className="muted">{mode === "momentum" ? "Momentum" : "Swing"} TV rows available: {safeRows.length}</p>
     {safeRows.length === 0 && <p className="muted">No saved TV rows found.</p>}
     {openSection && <div className="savedResultList">
-      {activeRows.length ? activeRows.map((row, index) => <SavedResultCard key={`${row?.symbol || row?.tradingview_symbol || openSection}-${index}`} row={row} mode={mode} onOpenStock={onOpenStock} />) : <p className="muted">No {openSection} TV results.</p>}
+      {activeRows.length ? activeRows.map((row, index) => <SavedResultCard key={`${row?.symbol || row?.tradingview_symbol || openSection}-${index}`} row={row} mode={mode} onOpenStock={onOpenStock} />) : <p className="muted">No {openSection === "confirmed" ? "Confirmed / Watch" : openSection === "rejected" ? "Strategy Rejected" : "Technical Failed"} TV results.</p>}
     </div>}
   </Card>;
 }
@@ -871,6 +962,55 @@ function WeeklyHistoryNotice({ rows }) {
   if (!warningRows.length) return null;
   const symbols = warningRows.map((row) => row?.symbol || row?.tradingview_symbol).filter(Boolean).join(", ");
   return <div className="warningText">Weekly data insufficient. Daily used as higher-timeframe backup.{symbols ? ` ${symbols}` : ""}</div>;
+}
+
+function TvDiagnosticWarning({ status }) {
+  if (!status) return null;
+  if (status.preflight_ready === true) {
+    return <div className="tvDiagnosticReady" id="tv-diagnostic-ready">
+      <h3>TradingView Ready / Connected</h3>
+      <div className="tvDiagnosticReadyInfo">
+        <div><strong>Valid Chart Tabs Open:</strong> {status.valid_chart_target_count ?? 0}</div>
+        <div><strong>Chart Ready:</strong> Yes</div>
+      </div>
+    </div>;
+  }
+  const singleTabPending =
+    status.cdp_reachable &&
+    (status.valid_chart_target_count === 1) &&
+    !status.attached_target_id &&
+    !status.manual_attachment_required;
+  if (singleTabPending) {
+    return <div className="tvDiagnosticPending" id="tv-diagnostic-pending">
+      <h3>TradingView Chart Available</h3>
+      <p className="pendingMsg">One TradingView chart is available and will attach automatically when a TradingView operation runs.</p>
+      <div className="tvDiagnosticReadyInfo">
+        <div><strong>CDP Reachable (127.0.0.1:9222):</strong> Yes</div>
+        <div><strong>Valid Chart Tabs Open:</strong> 1</div>
+        <div><strong>Auto-Attach:</strong> Will attach on next operation</div>
+      </div>
+    </div>;
+  }
+  return <div className="actionableWarning" id="tv-diagnostic-warning">
+    <h3>TradingView Tab Selection / Attachment Required</h3>
+    <p className="warningMsg">{status.preflight_message || "TradingView chart is not ready or attached."}</p>
+    <div className="tvDiagnosticInfo">
+      <div><strong>CDP Reachable (127.0.0.1:9222):</strong> {status.cdp_reachable ? "Yes" : "No"}</div>
+      <div><strong>Valid Chart Tabs Open:</strong> {status.valid_chart_target_count ?? 0}</div>
+      <div><strong>Attached Tab ID:</strong> {status.attached_target_id || "None"}</div>
+      {status.attached_target && <>
+        <div><strong>Attached Tab Title:</strong> {status.attached_target.title || "None"}</div>
+        <div><strong>Attached Tab URL:</strong> {status.attached_target.url || "None"}</div>
+      </>}
+      <div><strong>Chart Ready (activeChart):</strong> {status.attached_target_ready ? "Yes" : "No"}</div>
+      {status.last_attachment_error && <div className="errorText"><strong>Last Error:</strong> {status.last_attachment_error}</div>}
+    </div>
+    <p className="instruction">
+      {status.manual_attachment_required
+        ? "Please go to the Settings tab, select an active TradingView chart, and click Attach."
+        : "Make sure TradingView Desktop is running with a chart tab open."}
+    </p>
+  </div>;
 }
 
 function BatchProgressNotice({ progress }) {
@@ -963,10 +1103,11 @@ function SwingTrading({
   onBatchConfirm,
   onStopBatch,
   onLoadSaved,
-  onSignals,
-  onPlans,
   onOpenStock,
   loading,
+  tvRuntimeStatus,
+  tvRuntimeLastUpdatedAt,
+  onRefreshTvStatus,
 }) {
   const [selectedSwingRow, setSelectedSwingRow] = useState(null);
   const resultRows = sortByTradeQuality(flattenMtfRows(latestSwingTvRows));
@@ -977,15 +1118,21 @@ function SwingTrading({
     onOpenStock?.(row);
   };
   return <div className="pageStack">
+    <TvDiagnosticWarning status={tvRuntimeStatus} />
     <div className="warningText">TradingView confirmation only. No broker orders. No live trading.</div>
     {candidatesStale && <div className="warningText">Swing candidates may be stale. Run Score Market Data.</div>}
     <div className="tradingActionPanel">
       <div className="buttonRow tradingButtonRow">
         <ActionButton onClick={onSummary} disabled={loading}>Load Swing Summary</ActionButton>
         <ActionButton onClick={onLoad} disabled={loading}>Load Swing Candidates</ActionButton>
+        <ActionButton onClick={onRefreshTvStatus} disabled={loading}>
+          {loading === "refresh tv status" ? "Refreshing Status..." : "Refresh TradingView Status"}
+        </ActionButton>
       </div>
       <div className="buttonRow tradingButtonRow tradingBatchActions">
-        <ActionButton onClick={onBatchConfirm} disabled={loading}>Run Swing TV Confirm in Batches</ActionButton>
+        <ActionButton onClick={onBatchConfirm} disabled={loading || !isBatchReady(tvRuntimeStatus, tvRuntimeLastUpdatedAt) || deriveTradingViewBusy(tvRuntimeStatus)}>
+          Run Swing TV Confirm in Batches
+        </ActionButton>
         <ActionButton onClick={onStopBatch} disabled={!swingBatchRunning || swingBatchStopRequested}>Stop After Current Batch</ActionButton>
         <ActionButton onClick={onLoadSaved} disabled={loading}>Load Saved Swing TV Results</ActionButton>
       </div>
@@ -995,6 +1142,17 @@ function SwingTrading({
     {swingBatchStopMessage && <div className="warningText">{swingBatchStopMessage}</div>}
     {swingBatchError && <div className="errorPanel">Batch {swingBatchError.batch_number} failed: {swingBatchError.message}</div>}
     <SummaryCards data={swingSummary} fields={["total_scored", "swing_candidates_count", "below_threshold_count", "invalid_count", "top_score"]} />
+    {swingTvRowsLoaded ? (
+      <div className="statsGrid compact" style={{ marginTop: "1rem", marginBottom: "1rem" }}>
+        <StatCard label="TV Confirmed / Watch" value={resultRows.filter((r) => SWING_CONFIRMED_STATUSES.has(savedStatus(r)) || SWING_WAIT_WATCH_STATUSES.has(savedStatus(r))).length} tone="green" />
+        <StatCard label="TV Rejected" value={resultRows.filter((r) => savedStatus(r) === "REJECTED").length} tone="red" />
+        <StatCard label="TV Technical Failed" value={resultRows.filter((r) => savedStatus(r) === "TECHNICAL_FAILED").length} tone="red" />
+      </div>
+    ) : (
+      <div className="warningText" style={{ marginTop: "1rem", marginBottom: "1rem" }}>
+        Saved Swing TV status counts are currently unavailable. Click "Load Saved Swing TV Results" to retrieve them.
+      </div>
+    )}
     <Card title="Swing Candidates" eyebrow="watchlist">
       {sortedSwingRows.length ? <CandidateWatchlistGrid rows={sortedSwingRows} selectedRow={selectedRow} onSelect={openSwingStock} mode="swing" /> : <p className="muted">Click Load Swing Candidates to view swing watchlist.</p>}
       {selectedRow && <div className="compactDetails">
@@ -1028,10 +1186,11 @@ function MomentumTrading({
   onBatchConfirm,
   onStopBatch,
   onLoadSaved,
-  onSignals,
-  onPlans,
   onOpenStock,
   loading,
+  tvRuntimeStatus,
+  tvRuntimeLastUpdatedAt,
+  onRefreshTvStatus,
 }) {
   const [selectedMomentumRow, setSelectedMomentumRow] = useState(null);
   const sortedMomentumRows = [...(Array.isArray(momentumRows) ? momentumRows : [])].sort((a, b) => Number(b?.momentum_score || 0) - Number(a?.momentum_score || 0));
@@ -1042,15 +1201,21 @@ function MomentumTrading({
     onOpenStock?.(row);
   };
   return <div className="pageStack">
+    <TvDiagnosticWarning status={tvRuntimeStatus} />
     <div className="warningText">Candidates are scanner outputs only. No broker orders. No live trading.</div>
     {candidatesStale && <div className="warningText">{MOMENTUM_SCORE_STALE_MESSAGE}</div>}
     <div className="tradingActionPanel">
       <div className="buttonRow tradingButtonRow">
         <ActionButton onClick={onSummary} disabled={loading}>Load Momentum Summary</ActionButton>
         <ActionButton onClick={onLoad} disabled={loading}>Load Momentum Candidates</ActionButton>
+        <ActionButton onClick={onRefreshTvStatus} disabled={loading}>
+          {loading === "refresh tv status" ? "Refreshing Status..." : "Refresh TradingView Status"}
+        </ActionButton>
       </div>
       <div className="buttonRow tradingButtonRow tradingBatchActions">
-        <ActionButton onClick={onBatchConfirm} disabled={loading}>Run Momentum TV Confirm in Batches</ActionButton>
+        <ActionButton onClick={onBatchConfirm} disabled={loading || !isBatchReady(tvRuntimeStatus, tvRuntimeLastUpdatedAt) || deriveTradingViewBusy(tvRuntimeStatus)}>
+          Run Momentum TV Confirm in Batches
+        </ActionButton>
         <ActionButton onClick={onStopBatch} disabled={!momentumBatchRunning || momentumBatchStopRequested}>Stop After Current Batch</ActionButton>
         <ActionButton onClick={onLoadSaved} disabled={loading}>Load Saved Momentum TV Results</ActionButton>
       </div>
@@ -1060,6 +1225,17 @@ function MomentumTrading({
     {momentumBatchStopMessage && <div className="warningText">{momentumBatchStopMessage}</div>}
     {momentumBatchError && <div className="errorPanel">Batch {momentumBatchError.batch_number} failed: {momentumBatchError.message}</div>}
     <SummaryCards data={momentumSummary} fields={["total_scored", "momentum_candidates_count", "below_threshold_count", "overextended_count", "invalid_count", "top_momentum_score"]} />
+    {momentumTvRowsLoaded ? (
+      <div className="statsGrid compact" style={{ marginTop: "1rem", marginBottom: "1rem" }}>
+        <StatCard label="TV Confirmed / Watch" value={resultRows.filter((r) => MOMENTUM_CONFIRMED_STATUSES.has(savedStatus(r)) || MOMENTUM_WAIT_WATCH_STATUSES.has(savedStatus(r))).length} tone="green" />
+        <StatCard label="TV Rejected" value={resultRows.filter((r) => savedStatus(r) === "REJECTED").length} tone="red" />
+        <StatCard label="TV Technical Failed" value={resultRows.filter((r) => savedStatus(r) === "TECHNICAL_FAILED").length} tone="red" />
+      </div>
+    ) : (
+      <div className="warningText" style={{ marginTop: "1rem", marginBottom: "1rem" }}>
+        Saved Momentum TV status counts are currently unavailable. Click "Load Saved Momentum TV Results" to retrieve them.
+      </div>
+    )}
     <Card title="Momentum Candidates" eyebrow="watchlist">
       {sortedMomentumRows.length ? <CandidateWatchlistGrid rows={sortedMomentumRows} selectedRow={selectedRow} onSelect={openMomentumStock} mode="momentum" /> : <p className="muted">Click Load Momentum Candidates to view momentum watchlist.</p>}
       {selectedRow && <div className="compactDetails">
@@ -1898,6 +2074,8 @@ export default function App() {
   const [aiOutcomePreview, setAiOutcomePreview] = useState(null);
   const [aiDataCollectionStatus, setAiDataCollectionStatus] = useState(null);
   const [aiDatasetFilters, setAiDatasetFilters] = useState({ strategyType: "", timeframe: "" });
+  const [aiDatasetErrors, setAiDatasetErrors] = useState([]);
+  const [dashboardErrors, setDashboardErrors] = useState([]);
   const [paperUpdateProgress, setPaperUpdateProgress] = useState(null);
   const [paperUpdateRuns, setPaperUpdateRuns] = useState([]);
   const [paperUpdateLock, setPaperUpdateLock] = useState(null);
@@ -1914,13 +2092,25 @@ export default function App() {
   const paperLiveAbortRef = useRef(null);
   const paperSafetyCycleRef = useRef(false);
   const paperSafetyAbortRef = useRef(null);
-  const tvRuntimeCycleRef = useRef(false);
-  const tvRuntimeAbortRef = useRef(null);
+  const tvRuntimeCycleRef = useRef(false); // tvRuntimeCycleRef.current
+  const tvActionInProgressRef = useRef(false);
+  const tvPollRequestRef = useRef(0);
+  const tvPollAbortRef = useRef(null);
+  const tvActionRequestRef = useRef(0);
+  const tvActionAbortRef = useRef(null);
+  const tvTabsRequestRef = useRef(0);
+  const tvTabsAbortRef = useRef(null);
+  const tvPollTimeoutRef = useRef(null);
   const stockDetailRequestRef = useRef(0);
   const stockDetailAbortRef = useRef(null);
+  const swingCandidatesAbortRef = useRef(null);
+  const momentumCandidatesAbortRef = useRef(null);
   const [tv, setTv] = useState({ symbol: "NSE:RELIANCE", timeframe: "1D" });
   const [tvResult, setTvResult] = useState(null);
   const [tvRuntimeStatus, setTvRuntimeStatus] = useState(null);
+  const [tvRuntimeLastUpdatedAt, setTvRuntimeLastUpdatedAt] = useState(null);
+  const [tvRuntimeLoading, setTvRuntimeLoading] = useState(false);
+  const [tvRuntimeRefreshError, setTvRuntimeRefreshError] = useState(null);
   const [tvAttachableTabs, setTvAttachableTabs] = useState(null);
   const [marketLoadResult, setMarketLoadResult] = useState(null);
   const [marketProgress, setMarketProgress] = useState(null);
@@ -1966,6 +2156,103 @@ export default function App() {
   const [stockSwingTimeframes, setStockSwingTimeframes] = useState(SWING_MTF_TIMEFRAMES);
   const [stockMomentumTimeframes, setStockMomentumTimeframes] = useState(MOMENTUM_MTF_TIMEFRAMES);
 
+  const fetchAndSetTvRuntimeStatusPoll = async (options = {}) => {
+    if (tvActionInProgressRef.current) return null;
+    const requestId = tvPollRequestRef.current + 1;
+    tvPollRequestRef.current = requestId;
+    const controller = new AbortController();
+    if (!options.signal) {
+      tvPollAbortRef.current = controller;
+    }
+    const signal = options.signal || controller.signal;
+    try {
+      const status = await getTradingViewRuntimeStatus({ ...options, signal });
+      if (requestId === tvPollRequestRef.current && !tvActionInProgressRef.current) {
+        setTvRuntimeStatus(status);
+        setTvRuntimeLastUpdatedAt(Date.now());
+        setTvRuntimeRefreshError(null);
+      }
+      return status;
+    } catch (err) {
+      const cancelled = isRequestCancellation(err) || signal.aborted;
+      if (requestId === tvPollRequestRef.current && !tvActionInProgressRef.current) {
+        if (!cancelled) {
+          setTvRuntimeRefreshError(err.message || String(err));
+        }
+      }
+      throw err;
+    } finally {
+      if (tvPollAbortRef.current === controller) {
+        tvPollAbortRef.current = null;
+      }
+    }
+  };
+
+  const fetchAndSetTvRuntimeStatusAction = async (options = {}) => {
+    const requestId = tvActionRequestRef.current + 1;
+    tvActionRequestRef.current = requestId;
+    if (options.manual === true || options.forceAbort === true) {
+      tvActionAbortRef.current?.abort();
+    }
+    const controller = new AbortController();
+    if (!options.signal) {
+      tvActionAbortRef.current = controller;
+    }
+    const signal = options.signal || controller.signal;
+    if (requestId === tvActionRequestRef.current) {
+      setTvRuntimeLoading(true);
+    }
+    try {
+      const status = await getTradingViewRuntimeStatus({ ...options, signal });
+      if (requestId === tvActionRequestRef.current) {
+        setTvRuntimeStatus(status);
+        setTvRuntimeLastUpdatedAt(Date.now());
+        setTvRuntimeRefreshError(null);
+        setTvRuntimeLoading(false);
+      }
+      return status;
+    } catch (err) {
+      const cancelled = isRequestCancellation(err) || signal.aborted;
+      if (requestId === tvActionRequestRef.current) {
+        setTvRuntimeLoading(false);
+        if (!cancelled) {
+          setTvRuntimeRefreshError(err.message || String(err));
+        }
+      }
+      throw err;
+    } finally {
+      if (tvActionAbortRef.current === controller) {
+        tvActionAbortRef.current = null;
+      }
+    }
+  };
+
+  const fetchAndSetTvAttachableTabs = async (options = {}) => {
+    const requestId = tvTabsRequestRef.current + 1;
+    tvTabsRequestRef.current = requestId;
+    if (options.manual === true || options.forceAbort === true) {
+      tvTabsAbortRef.current?.abort();
+    }
+    const controller = new AbortController();
+    if (!options.signal) {
+      tvTabsAbortRef.current = controller;
+    }
+    const signal = options.signal || controller.signal;
+    try {
+      const tabs = await getTradingViewAttachableTabs({ ...options, signal });
+      if (requestId === tvTabsRequestRef.current) {
+        setTvAttachableTabs(tabs);
+      }
+      return tabs;
+    } catch (err) {
+      throw err;
+    } finally {
+      if (tvTabsAbortRef.current === controller) {
+        tvTabsAbortRef.current = null;
+      }
+    }
+  };
+
   const act = async (name, fn) => {
     if (actionCycleRef.current) return null;
     actionCycleRef.current = true;
@@ -1997,13 +2284,12 @@ export default function App() {
         getHealth(requestOptions),
         includeSettings ? getSettings(requestOptions) : Promise.resolve(null),
         includeSettings ? getSystemRuntimeInfo(requestOptions) : Promise.resolve(null),
-        includeRuntime ? getTradingViewRuntimeStatus(requestOptions) : Promise.resolve(null),
+        includeRuntime ? fetchAndSetTvRuntimeStatusAction(requestOptions) : Promise.resolve(null),
       ]);
       if (!isCancelled()) {
         setHealth({ online: healthData?.status === "ok", status: healthData?.status || "unknown" });
         if (settingsData) setSettings(settingsData);
         if (systemRuntime) setSystemRuntimeInfo(systemRuntime);
-        if (tradingViewStatus) setTvRuntimeStatus(tradingViewStatus);
       }
       return { health: healthData, settings: settingsData, system_runtime: systemRuntime, tradingview_runtime: tradingViewStatus };
     } catch (err) {
@@ -2027,7 +2313,7 @@ export default function App() {
     dashboardRefreshAbortRef.current = controller;
     const requestOptions = { signal: controller.signal };
     try {
-      const [equity, paperSummary, scoreData, swingData, momentumData, progress, runs, lock, scheduler, tradingViewStatus] = await Promise.all([
+      const results = await Promise.allSettled([
         getDashboardPaperEquity(requestOptions),
         getPaperSummary(requestOptions),
         getScoreSummary("BROAD_MARKET_750", requestOptions),
@@ -2037,21 +2323,46 @@ export default function App() {
         getPaperUpdateRuns(10, requestOptions),
         getPaperUpdateLock(requestOptions),
         getPaperUpdateSchedulerStatus(requestOptions),
-        getTradingViewRuntimeStatus(requestOptions),
+        fetchAndSetTvRuntimeStatusAction(requestOptions),
       ]);
       if (!isCancelled()) {
-        setDashboardEquity(equity);
-        setSummary(paperSummary);
-        setScoreSummary(scoreData);
-        setSwingSummary(swingData);
-        setMomentumSummary(momentumData);
-        setPaperUpdateProgress(progress);
-        setPaperUpdateRuns(arr(runs, ["runs"]));
-        setPaperUpdateLock(lock);
-        setPaperUpdateScheduler(scheduler);
-        setTvRuntimeStatus(tradingViewStatus);
+        const [equity, paperSummary, scoreData, swingData, momentumData, progress, runs, lock, scheduler, tradingViewStatus] = results;
+        if (equity.status === "fulfilled") setDashboardEquity(equity.value);
+        if (paperSummary.status === "fulfilled") setSummary(paperSummary.value);
+        if (scoreData.status === "fulfilled") setScoreSummary(scoreData.value);
+        if (swingData.status === "fulfilled") setSwingSummary(swingData.value);
+        if (momentumData.status === "fulfilled") setMomentumSummary(momentumData.value);
+        if (progress.status === "fulfilled") setPaperUpdateProgress(progress.value);
+        if (runs.status === "fulfilled") setPaperUpdateRuns(arr(runs.value, ["runs"]));
+        if (lock.status === "fulfilled") setPaperUpdateLock(lock.value);
+        if (scheduler.status === "fulfilled") setPaperUpdateScheduler(scheduler.value);
+
+        const errors = settledErrors([
+          { endpoint: "/api/dashboard/paper-equity", result: equity },
+          { endpoint: "/api/paper/summary", result: paperSummary },
+          { endpoint: "/api/score/summary", result: scoreData },
+          { endpoint: "/api/swing/summary", result: swingData },
+          { endpoint: "/api/momentum/summary", result: momentumData },
+          { endpoint: "/api/paper/update-progress", result: progress },
+          { endpoint: "/api/paper/update-runs", result: runs },
+          { endpoint: "/api/paper/update-lock", result: lock },
+          { endpoint: "/api/paper/update-scheduler/status", result: scheduler },
+          { endpoint: "/api/tv/runtime-status", result: tradingViewStatus },
+        ]);
+        setDashboardErrors(errors);
       }
-      return { equity, paperSummary, scoreData, swingData, momentumData, progress, runs, lock, scheduler, tradingViewStatus };
+      return {
+        equity: settledValue(results[0]),
+        paperSummary: settledValue(results[1]),
+        scoreData: settledValue(results[2]),
+        swingData: settledValue(results[3]),
+        momentumData: settledValue(results[4]),
+        progress: settledValue(results[5]),
+        runs: settledValue(results[6]),
+        lock: settledValue(results[7]),
+        scheduler: settledValue(results[8]),
+        tradingViewStatus: settledValue(results[9]),
+      };
     } catch (err) {
       if (!isCancelled() && !isRequestCancellation(err)) console.error("dashboard snapshot refresh failed", err);
       return null;
@@ -2162,38 +2473,41 @@ export default function App() {
   }, [loading]);
 
   useEffect(() => {
-    if (loading !== "swing batch tv confirm" && loading !== "momentum batch tv confirm") return undefined;
+    const isTradingPage = activePage === "Swing Trading" || activePage === "Momentum Trading";
+    if (!isTradingPage) {
+      return undefined;
+    }
     let cancelled = false;
-    const pollRuntime = async () => {
-      if (tvRuntimeCycleRef.current) return;
-      const controller = new AbortController();
-      tvRuntimeCycleRef.current = true;
-      tvRuntimeAbortRef.current = controller;
+    const poll = async () => {
+      if (cancelled) return;
+      if (tvActionInProgressRef.current) {
+        if (!cancelled) {
+          tvPollTimeoutRef.current = window.setTimeout(poll, BATCH_TV_RUNTIME_REFRESH_MS);
+        }
+        return;
+      }
       try {
-        const status = await getTradingViewRuntimeStatus({ signal: controller.signal });
-        if (!cancelled) setTvRuntimeStatus(status);
+        await fetchAndSetTvRuntimeStatusPoll();
       } catch (err) {
-        if (!cancelled && !isRequestCancellation(err)) console.error("TradingView runtime status poll failed", err);
+        if (!cancelled && !isRequestCancellation(err)) {
+          console.error("TV runtime polling failed", err);
+        }
       } finally {
-        if (tvRuntimeAbortRef.current === controller) {
-          tvRuntimeAbortRef.current = null;
-          tvRuntimeCycleRef.current = false;
+        if (!cancelled) {
+          tvPollTimeoutRef.current = window.setTimeout(poll, BATCH_TV_RUNTIME_REFRESH_MS);
         }
       }
     };
-    pollRuntime();
-    const intervalId = window.setInterval(pollRuntime, BATCH_TV_RUNTIME_REFRESH_MS);
+    poll();
     return () => {
       cancelled = true;
-      const activeController = tvRuntimeAbortRef.current;
-      activeController?.abort();
-      if (activeController) {
-        tvRuntimeAbortRef.current = null;
-        tvRuntimeCycleRef.current = false;
+      if (tvPollTimeoutRef.current) {
+        window.clearTimeout(tvPollTimeoutRef.current);
+        tvPollTimeoutRef.current = null;
       }
-      window.clearInterval(intervalId);
+      tvPollAbortRef.current?.abort();
     };
-  }, [loading]);
+  }, [activePage]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2215,25 +2529,19 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (activePage !== "Settings") return undefined;
+    if (activePage !== "Settings" && activePage !== "Swing Trading" && activePage !== "Momentum Trading") return undefined;
     let cancelled = false;
     const controller = new AbortController();
-    refreshGlobalHealth({ includeSettings: true, includeRuntime: true, isCancelled: () => cancelled });
-    Promise.all([
-      getTradingViewAttachableTabs({ signal: controller.signal }),
-      getTradingViewRuntimeStatus({ signal: controller.signal }),
-    ])
-      .then(([tabs, status]) => {
-        if (cancelled) return;
-        setTvAttachableTabs(tabs);
-        setTvRuntimeStatus(status);
-      })
+    refreshGlobalHealth({ includeSettings: true, includeRuntime: false, isCancelled: () => cancelled });
+    fetchAndSetTvRuntimeStatusAction({ signal: controller.signal })
       .catch((err) => {
-        if (!cancelled && !isRequestCancellation(err)) console.error("TradingView tab refresh failed", err);
+        if (!cancelled && !isRequestCancellation(err)) console.error("TradingView runtime status refresh failed", err);
       });
     return () => {
       cancelled = true;
       controller.abort();
+      tvTabsAbortRef.current?.abort();
+      tvActionAbortRef.current?.abort();
     };
   }, [activePage]);
 
@@ -2242,8 +2550,16 @@ export default function App() {
     globalStatusAbortRef.current?.abort();
     paperLiveAbortRef.current?.abort();
     paperSafetyAbortRef.current?.abort();
-    tvRuntimeAbortRef.current?.abort();
+    tvActionAbortRef.current?.abort();
+    tvPollAbortRef.current?.abort();
+    tvTabsAbortRef.current?.abort();
     stockDetailAbortRef.current?.abort();
+    swingCandidatesAbortRef.current?.abort();
+    momentumCandidatesAbortRef.current?.abort();
+    if (tvPollTimeoutRef.current) {
+      window.clearTimeout(tvPollTimeoutRef.current);
+      tvPollTimeoutRef.current = null;
+    }
   }, []);
 
   useEffect(() => {
@@ -2271,28 +2587,36 @@ export default function App() {
     let cancelled = false;
     const controller = new AbortController();
     const requestOptions = { signal: controller.signal };
-    Promise.all([
-      getAiFeatureDatasetSummary({}, requestOptions),
+    const filterStrategy = aiDatasetFilters.strategyType || "";
+    const filterTf = aiDatasetFilters.timeframe ? normalizeTimeframe(aiDatasetFilters.timeframe) : "";
+    const cleanTf = (filterTf && SUPPORTED_TIMEFRAMES.has(filterTf)) ? filterTf : "";
+    const queryParams = { strategyType: filterStrategy, timeframe: cleanTf };
+    Promise.allSettled([
+      getAiFeatureDatasetSummary(queryParams, requestOptions),
       getAiFeatureSnapshots(50, requestOptions),
       getAiOutcomePreview(50, requestOptions),
       getAiDataCollectionStatus(requestOptions),
     ])
-      .then(([summaryData, snapshotsData, outcomePreviewData, collectionStatusData]) => {
+      .then((results) => {
         if (!cancelled) {
-          setAiDatasetSummary(summaryData);
-          setAiFeatureSnapshots(arr(snapshotsData, ["rows"]));
-          setAiOutcomePreview(outcomePreviewData);
-          setAiDataCollectionStatus(collectionStatusData);
+          const [summaryData, snapshotsData, outcomePreviewData, collectionStatusData] = results;
+          if (summaryData.status === "fulfilled") setAiDatasetSummary(summaryData.value);
+          if (snapshotsData.status === "fulfilled") setAiFeatureSnapshots(arr(snapshotsData.value, ["rows"]));
+          if (outcomePreviewData.status === "fulfilled") setAiOutcomePreview(outcomePreviewData.value);
+          if (collectionStatusData.status === "fulfilled") setAiDataCollectionStatus(collectionStatusData.value);
+          setAiDatasetErrors(settledErrors([
+            { endpoint: "/api/ai/features/summary", result: summaryData },
+            { endpoint: "/api/ai/features/snapshots", result: snapshotsData },
+            { endpoint: "/api/ai/features/outcome-preview", result: outcomePreviewData },
+            { endpoint: "/api/ai/features/collection-status", result: collectionStatusData },
+          ]));
         }
       })
-      .catch((err) => {
-        if (!cancelled && !isRequestCancellation(err)) console.error("AI dataset tracking load failed", err);
-      });
     return () => {
       cancelled = true;
       controller.abort();
     };
-  }, [activePage]);
+  }, [activePage, aiDatasetFilters]);
 
   useEffect(() => {
     if (activePage !== "Paper Trades") return undefined;
@@ -2377,43 +2701,98 @@ export default function App() {
   const handlers = {
     loadSummary: () => act("summary", async () => { const data = await getPaperSummary(); setSummary(data); return data; }),
     aiDatasetSummary: () => act("AI dataset summary", async () => {
-      const [summaryData, snapshotsData, outcomePreviewData, collectionStatusData] = await Promise.all([
-        getAiFeatureDatasetSummary(aiDatasetFilters),
+      const filterStrategy = aiDatasetFilters.strategyType || "";
+      const filterTf = aiDatasetFilters.timeframe ? normalizeTimeframe(aiDatasetFilters.timeframe) : "";
+      const cleanTf = (filterTf && SUPPORTED_TIMEFRAMES.has(filterTf)) ? filterTf : "";
+      const queryParams = { strategyType: filterStrategy, timeframe: cleanTf };
+      const results = await Promise.allSettled([
+        getAiFeatureDatasetSummary(queryParams),
         getAiFeatureSnapshots(50),
         getAiOutcomePreview(50),
         getAiDataCollectionStatus(),
       ]);
+      const [summaryResult, snapshotsResult, outcomePreviewResult, collectionStatusResult] = results;
+      const summaryData = settledValue(summaryResult, aiDatasetSummary);
+      const snapshotsData = settledValue(snapshotsResult, { rows: aiFeatureSnapshots });
+      const outcomePreviewData = settledValue(outcomePreviewResult, aiOutcomePreview);
+      const collectionStatusData = settledValue(collectionStatusResult, aiDataCollectionStatus);
       setAiDatasetSummary(summaryData);
       setAiFeatureSnapshots(arr(snapshotsData, ["rows"]));
       setAiOutcomePreview(outcomePreviewData);
       setAiDataCollectionStatus(collectionStatusData);
-      return { summary: summaryData, snapshots: snapshotsData, outcome_preview: outcomePreviewData, collection_status: collectionStatusData };
+      const errors = settledErrors([
+        { endpoint: "/api/ai/features/summary", result: summaryResult },
+        { endpoint: "/api/ai/features/snapshots", result: snapshotsResult },
+        { endpoint: "/api/ai/features/outcome-preview", result: outcomePreviewResult },
+        { endpoint: "/api/ai/features/collection-status", result: collectionStatusResult },
+      ]);
+      setAiDatasetErrors(errors);
+      return { summary: summaryData, snapshots: snapshotsData, outcome_preview: outcomePreviewData, collection_status: collectionStatusData, partial_errors: errors };
     }),
     dryRun: () => act("pipeline dry run", () => runPaperPipeline({ limit: 1, timeframe: "1D", dryRun: true, strategy: "swing" })),
     saveRun: () => act("pipeline save", () => runPaperPipeline({ limit: 1, timeframe: "1D", dryRun: false, strategy: "swing" })),
+    tvRefreshStatus: () => act("refresh tv status", async () => {
+      tvActionInProgressRef.current = true;
+      if (tvPollTimeoutRef.current) {
+        window.clearTimeout(tvPollTimeoutRef.current);
+        tvPollTimeoutRef.current = null;
+      }
+      tvPollAbortRef.current?.abort();
+      try {
+        const status = await fetchAndSetTvRuntimeStatusAction({ manual: true });
+        return status;
+      } finally {
+        tvActionInProgressRef.current = false;
+      }
+    }),
     tvRefreshTabs: () => act("tv tabs", async () => {
-      const tabs = await getTradingViewAttachableTabs();
-      setTvAttachableTabs(tabs);
-      const status = await getTradingViewRuntimeStatus();
-      setTvRuntimeStatus(status);
-      return { attachable_tabs: tabs, runtime: status };
+      tvActionInProgressRef.current = true;
+      if (tvPollTimeoutRef.current) {
+        window.clearTimeout(tvPollTimeoutRef.current);
+        tvPollTimeoutRef.current = null;
+      }
+      tvPollAbortRef.current?.abort();
+      try {
+        const tabs = await fetchAndSetTvAttachableTabs({ manual: true });
+        const status = await fetchAndSetTvRuntimeStatusAction({ manual: true });
+        return { attachable_tabs: tabs, runtime: status };
+      } finally {
+        tvActionInProgressRef.current = false;
+      }
     }),
     tvAttachTab: (targetId) => act("tv attach tab", async () => {
       if (!targetId) throw new Error("Missing TradingView target id.");
-      const attached = await attachTradingViewTab(targetId);
-      const [tabs, status] = await Promise.all([getTradingViewAttachableTabs(), getTradingViewRuntimeStatus()]);
-      setTvAttachableTabs(tabs);
-      setTvRuntimeStatus(status);
-      return { attached, attachable_tabs: tabs, runtime: status };
+      tvActionInProgressRef.current = true;
+      if (tvPollTimeoutRef.current) {
+        window.clearTimeout(tvPollTimeoutRef.current);
+        tvPollTimeoutRef.current = null;
+      }
+      tvPollAbortRef.current?.abort();
+      try {
+        const attached = await attachTradingViewTab(targetId);
+        const tabs = await fetchAndSetTvAttachableTabs({ manual: true });
+        const status = await fetchAndSetTvRuntimeStatusAction({ manual: true });
+        return { attached, attachable_tabs: tabs, runtime: status };
+      } finally {
+        tvActionInProgressRef.current = false;
+      }
     }),
     tvDetachTab: () => act("tv detach tab", async () => {
-      const detached = await detachTradingViewTab();
-      const [tabs, status] = await Promise.all([getTradingViewAttachableTabs(), getTradingViewRuntimeStatus()]);
-      setTvAttachableTabs(tabs);
-      setTvRuntimeStatus(status);
-      return { detached, attachable_tabs: tabs, runtime: status };
+      tvActionInProgressRef.current = true;
+      if (tvPollTimeoutRef.current) {
+        window.clearTimeout(tvPollTimeoutRef.current);
+        tvPollTimeoutRef.current = null;
+      }
+      tvPollAbortRef.current?.abort();
+      try {
+        const detached = await detachTradingViewTab();
+        const tabs = await fetchAndSetTvAttachableTabs({ manual: true });
+        const status = await fetchAndSetTvRuntimeStatusAction({ manual: true });
+        return { detached, attachable_tabs: tabs, runtime: status };
+      } finally {
+        tvActionInProgressRef.current = false;
+      }
     }),
-    scan: () => act("scan", async () => { const data = await runScan(); if (data?.scan_run_id) setLatestScanRunId(data.scan_run_id); setScanRows(await getPaperSafeScanRows(data?.scan_run_id)); return data; }),
     scoreMarketData: () => act("score market data", async () => {
       const data = await runScoring();
       const frontendScoredAt = new Date().toLocaleString();
@@ -2443,71 +2822,132 @@ export default function App() {
       return { score_run: data, score_summary: scoreData, swing_summary: swingData, momentum_summary: momentumData };
     }),
     swingSummary: () => act("swing summary", async () => { const data = await getSwingSummary(); setSwingSummary(data); setSwingTvLimit(positiveCount(data?.swing_candidates_count)); setSwingCandidatesStale(Boolean(data?.is_score_stale)); return data; }),
-    swing: () => act("swing candidates", async () => { const summaryData = await getSwingSummary(); const limit = positiveCount(summaryData?.swing_candidates_count); const data = await getSwingCandidates("BROAD_MARKET_750", limit); setSwingRows(arr(data, ["candidates", "rows"])); setSwingSummary(summaryData); setSwingTvLimit(limit); setSwingCandidatesStale(Boolean(summaryData?.is_score_stale)); return data; }),
+    swing: () => act("swing candidates", async () => {
+      swingCandidatesAbortRef.current?.abort();
+      const controller = new AbortController();
+      swingCandidatesAbortRef.current = controller;
+      setSwingRows([]);
+      try {
+        const options = { signal: controller.signal };
+        const summaryData = await getSwingSummary("BROAD_MARKET_750", options);
+        const limit = positiveCount(summaryData?.swing_candidates_count);
+        const data = await getSwingCandidates("BROAD_MARKET_750", limit, options);
+        setSwingRows(arr(data, ["candidates", "rows"]));
+        setSwingSummary(summaryData);
+        setSwingTvLimit(limit);
+        setSwingCandidatesStale(Boolean(summaryData?.is_score_stale));
+        return data;
+      } catch (err) {
+        setSwingRows([]);
+        throw err;
+      }
+    }),
     swingTvConfirm: () => act("swing batch tv confirm", async () => {
-      const summaryData = await getSwingSummary();
-      const summaryCount = countValue(summaryData?.swing_candidates_count);
-      let candidateRows = Array.isArray(swingRows) ? swingRows : [];
-      const totalTarget = summaryCount || candidateRows.length;
-      if (totalTarget > 0 && candidateRows.length < totalTarget) {
-        const candidateData = await getSwingCandidates("BROAD_MARKET_750", totalTarget);
-        candidateRows = arr(candidateData, ["candidates", "rows"]);
-        setSwingRows(candidateRows);
+      tvActionInProgressRef.current = true;
+      if (tvPollTimeoutRef.current) {
+        window.clearTimeout(tvPollTimeoutRef.current);
+        tvPollTimeoutRef.current = null;
       }
-      const totalRequested = Math.min(totalTarget || candidateRows.length, candidateRows.length || totalTarget);
-      if (totalRequested <= 0) throw new Error("No Swing candidates available for TV Confirm.");
-      const batchSize = SWING_TV_BATCH_SIZE;
-      const totalBatches = Math.ceil(totalRequested / batchSize);
-      const startedAt = Date.now();
-      let processedSoFar = 0;
-      const completed = [];
-      swingBatchStopRef.current = false;
-      setSwingBatchStopRequested(false);
-      setSwingBatchStopMessage("");
-      setSwingBatchError(null);
-      setSwingBatchResults([]);
-      setLatestSwingTvRows([]);
-      setSwingTvRowsLoaded(true);
-      setSwingTvResult(null);
-      setSwingSummary(summaryData);
-      for (let offset = 0; offset < totalRequested; offset += batchSize) {
-        const batchNumber = Math.floor(offset / batchSize) + 1;
-        const currentLimit = Math.min(batchSize, totalRequested - offset);
-        const rangeEnd = offset + currentLimit;
-        const symbols = candidateSymbols(candidateRows, offset, currentLimit);
-        setSwingBatchProgress({
-          process_type: "Swing TV Confirm",
-          current_batch_number: batchNumber,
-          total_batches: totalBatches,
-          batch_size: batchSize,
-          total_requested: totalRequested,
-          processed_so_far: processedSoFar,
-          current_batch_range: `${offset + 1}-${rangeEnd}`,
-          current_batch_symbols: symbols,
-          started_at: startedAt,
-          elapsed_time: Math.floor((Date.now() - startedAt) / 1000),
-        });
+      tvPollAbortRef.current?.abort();
+      try {
+        const status = await fetchAndSetTvRuntimeStatusAction({ manual: true, forceAbort: true });
+        if (!status || status.preflight_ready !== true) {
+          throw new Error(status?.preflight_message || "TradingView is not ready for batch confirm.");
+        }
+        if (deriveTradingViewBusy(status)) {
+          throw new Error("TradingView is busy with another operation.");
+        }
+
+        const summaryData = await getSwingSummary();
+        const summaryCount = countValue(summaryData?.swing_candidates_count);
+        let candidateRows = Array.isArray(swingRows) ? swingRows : [];
+        const totalTarget = summaryCount || candidateRows.length;
+        if (totalTarget > 0 && candidateRows.length < totalTarget) {
+          const candidateData = await getSwingCandidates("BROAD_MARKET_750", totalTarget);
+          candidateRows = arr(candidateData, ["candidates", "rows"]);
+          setSwingRows(candidateRows);
+        }
+        const totalRequested = Math.min(totalTarget || candidateRows.length, candidateRows.length || totalTarget);
+        if (totalRequested <= 0) throw new Error("No Swing candidates available for TV Confirm.");
+        const batchSize = SWING_TV_BATCH_SIZE;
+        const totalBatches = Math.ceil(totalRequested / batchSize);
+        const startedAt = Date.now();
+        let processedSoFar = 0;
+        const completed = [];
+        swingBatchStopRef.current = false;
+        setSwingBatchStopRequested(false);
+        setSwingBatchStopMessage("");
+        setSwingBatchError(null);
+        setSwingBatchResults([]);
+        setLatestSwingTvRows([]);
+        setSwingTvRowsLoaded(true);
+        setSwingTvResult(null);
+        setSwingSummary(summaryData);
+        for (let offset = 0; offset < totalRequested; offset += batchSize) {
+          const batchNumber = Math.floor(offset / batchSize) + 1;
+          const currentLimit = Math.min(batchSize, totalRequested - offset);
+          const rangeEnd = offset + currentLimit;
+          const symbols = candidateSymbols(candidateRows, offset, currentLimit);
+          setSwingBatchProgress({
+            process_type: "Swing TV Confirm",
+            current_batch_number: batchNumber,
+            total_batches: totalBatches,
+            batch_size: batchSize,
+            total_requested: totalRequested,
+            processed_so_far: processedSoFar,
+            current_batch_range: `${offset + 1}-${rangeEnd}`,
+            current_batch_symbols: symbols,
+            started_at: startedAt,
+            elapsed_time: Math.floor((Date.now() - startedAt) / 1000),
+          });
+          try {
+            let batch = null;
+            for (let retryAttempt = 0; retryAttempt <= TV_BUSY_MAX_RETRIES; retryAttempt++) {
+              try {
+                batch = await swingTvConfirm({ limit: currentLimit, offset, batchNumber, batchSize, timeframes: SWING_MTF_TIMEFRAMES, save: true });
+                break;
+              } catch (retryErr) {
+                if (isTvManagerBusy(retryErr) && retryAttempt < TV_BUSY_MAX_RETRIES) {
+                  console.warn(`Swing batch ${batchNumber}: TV_MANAGER_BUSY, retry ${retryAttempt + 1}/${TV_BUSY_MAX_RETRIES} after ${TV_BUSY_BASE_DELAY_MS * (retryAttempt + 1)}ms`);
+                  await delay(TV_BUSY_BASE_DELAY_MS * (retryAttempt + 1));
+                  continue;
+                }
+                throw retryErr;
+              }
+            }
+            const rows = tvRows(batch);
+            processedSoFar += Number(batch?.processed || 0);
+            completed.push(batch);
+            setSwingBatchResults([...completed]);
+            setLatestSwingTvRows((current) => [...current, ...rows]);
+            setSwingTvRowsLoaded(true);
+            setSwingBatchProgress((current) => current ? { ...current, processed_so_far: processedSoFar, elapsed_time: Math.floor((Date.now() - startedAt) / 1000) } : current);
+          } catch (err) {
+            if (isRequestCancellation(err)) throw err;
+            try {
+              await fetchAndSetTvRuntimeStatusAction({ manual: true });
+            } catch (statusErr) {
+              console.error("Failed to refresh status after batch failure", statusErr);
+            }
+            setSwingBatchError({ batch_number: batchNumber, message: formatActionError(err, `swing batch ${batchNumber}`) });
+            setSwingBatchProgress(null);
+            throw err;
+          }
+          if (swingBatchStopRef.current) {
+            setSwingBatchStopMessage(`Stopped after Batch ${batchNumber}.`);
+            break;
+          }
+        }
+        setSwingBatchProgress(null);
         try {
-          const batch = await swingTvConfirm({ limit: currentLimit, offset, batchNumber, batchSize, timeframes: SWING_MTF_TIMEFRAMES, save: true });
-          const rows = tvRows(batch);
-          processedSoFar += Number(batch?.processed || 0);
-          completed.push(batch);
-          setSwingBatchResults([...completed]);
-          setLatestSwingTvRows((current) => [...current, ...rows]);
-          setSwingTvRowsLoaded(true);
-          setSwingBatchProgress((current) => current ? { ...current, processed_so_far: processedSoFar, elapsed_time: Math.floor((Date.now() - startedAt) / 1000) } : current);
-        } catch (err) {
-          setSwingBatchError({ batch_number: batchNumber, message: formatActionError(err, `swing batch ${batchNumber}`) });
-          setSwingBatchProgress(null);
-          throw err;
+          await fetchAndSetTvRuntimeStatusAction({ manual: true });
+        } catch (statusErr) {
+          console.error("Failed to refresh status after batch completion", statusErr);
         }
-        if (swingBatchStopRef.current) {
-          setSwingBatchStopMessage(`Stopped after Batch ${batchNumber}.`);
-          break;
-        }
+        return { total_requested: totalRequested, batch_size: batchSize, batches_completed: completed.length, results: completed };
+      } finally {
+        tvActionInProgressRef.current = false;
       }
-      setSwingBatchProgress(null);
-      return { total_requested: totalRequested, batch_size: batchSize, batches_completed: completed.length, results: completed };
     }),
     swingSavedTv: () => act("saved swing tv results", async () => {
       const data = await getSwingTvConfirmed({ limit: 50 });
@@ -2517,10 +2957,28 @@ export default function App() {
       return data;
     }),
     swingStopBatch: () => { swingBatchStopRef.current = true; setSwingBatchStopRequested(true); },
-    swingSignals: () => act("swing signals", () => buildSwingSignals(false)),
-    swingPlans: () => act("swing plans", () => buildPaperPlans("SWING_TV_CONFIRMED", false)),
     momentumSummary: () => act("momentum summary", async () => { const data = await getMomentumSummary(); const limit = positiveCount(data?.momentum_candidates_count || 10); setMomentumSummary(data); setMomentumTvLimit(limit); setMomentumBatchTotal(limit); setMomentumCandidatesStale(Boolean(data?.is_score_stale)); return data; }),
-    momentum: () => act("momentum candidates", async () => { const summaryData = await getMomentumSummary(); const limit = positiveCount(summaryData?.momentum_candidates_count); const data = await getMomentumCandidates("BROAD_MARKET_750", limit); setMomentumRows(arr(data, ["candidates", "rows"])); setMomentumSummary(summaryData); setMomentumTvLimit(limit); setMomentumBatchTotal(limit); setMomentumCandidatesStale(Boolean(summaryData?.is_score_stale)); return data; }),
+    momentum: () => act("momentum candidates", async () => {
+      momentumCandidatesAbortRef.current?.abort();
+      const controller = new AbortController();
+      momentumCandidatesAbortRef.current = controller;
+      setMomentumRows([]);
+      try {
+        const options = { signal: controller.signal };
+        const summaryData = await getMomentumSummary("BROAD_MARKET_750", options);
+        const limit = positiveCount(summaryData?.momentum_candidates_count);
+        const data = await getMomentumCandidates("BROAD_MARKET_750", limit, options);
+        setMomentumRows(arr(data, ["candidates", "rows"]));
+        setMomentumSummary(summaryData);
+        setMomentumTvLimit(limit);
+        setMomentumBatchTotal(limit);
+        setMomentumCandidatesStale(Boolean(summaryData?.is_score_stale));
+        return data;
+      } catch (err) {
+        setMomentumRows([]);
+        throw err;
+      }
+    }),
     momentumConfirm: () => act("momentum tv confirm", async () => {
       setMomentumTvResult(null);
       const summaryData = await getMomentumSummary();
@@ -2541,72 +2999,112 @@ export default function App() {
       return normalized;
     }),
     momentumBatchConfirm: () => act("momentum batch tv confirm", async () => {
-      const summaryData = await getMomentumSummary();
-      const summaryCount = countValue(summaryData?.momentum_candidates_count);
-      let candidateRows = Array.isArray(momentumRows) ? momentumRows : [];
-      const totalTarget = summaryCount || candidateRows.length;
-      if (totalTarget > 0 && candidateRows.length < totalTarget) {
-        const candidateData = await getMomentumCandidates("BROAD_MARKET_750", totalTarget);
-        candidateRows = arr(candidateData, ["candidates", "rows"]);
-        setMomentumRows(candidateRows);
+      tvActionInProgressRef.current = true;
+      if (tvPollTimeoutRef.current) {
+        window.clearTimeout(tvPollTimeoutRef.current);
+        tvPollTimeoutRef.current = null;
       }
-      const totalRequested = Math.min(totalTarget || candidateRows.length, candidateRows.length || totalTarget);
-      if (totalRequested <= 0) throw new Error("No Momentum candidates available for TV Confirm.");
-      const batchSize = MOMENTUM_TV_BATCH_SIZE;
-      const totalBatches = Math.ceil(totalRequested / batchSize);
-      const startedAt = Date.now();
-      let processedSoFar = 0;
-      const completed = [];
-      momentumBatchStopRef.current = false;
-      setMomentumBatchStopRequested(false);
-      setMomentumBatchStopMessage("");
-      setMomentumBatchError(null);
-      setMomentumBatchResults([]);
-      setLatestMomentumTvRows([]);
-      setMomentumTvRowsLoaded(true);
-      setMomentumSummary(summaryData);
-      for (let offset = 0; offset < totalRequested; offset += batchSize) {
-        const batchNumber = Math.floor(offset / batchSize) + 1;
-        const currentLimit = Math.min(batchSize, totalRequested - offset);
-        const rangeEnd = offset + currentLimit;
-        const symbols = candidateSymbols(candidateRows, offset, currentLimit);
-        setMomentumBatchProgress({
-          process_type: "Momentum TV Confirm",
-          current_batch_number: batchNumber,
-          total_batches: totalBatches,
-          batch_size: batchSize,
-          total_requested: totalRequested,
-          processed_so_far: processedSoFar,
-          current_batch_range: `${offset + 1}-${rangeEnd}`,
-          current_batch_symbols: symbols,
-          started_at: startedAt,
-          elapsed_time: Math.floor((Date.now() - startedAt) / 1000),
-        });
+      tvPollAbortRef.current?.abort();
+      try {
+        const status = await fetchAndSetTvRuntimeStatusAction({ manual: true, forceAbort: true });
+        if (!status || status.preflight_ready !== true) {
+          throw new Error(status?.preflight_message || "TradingView is not ready for batch confirm.");
+        }
+        if (deriveTradingViewBusy(status)) {
+          throw new Error("TradingView is busy with another operation.");
+        }
+
+        const summaryData = await getMomentumSummary();
+        const summaryCount = countValue(summaryData?.momentum_candidates_count);
+        let candidateRows = Array.isArray(momentumRows) ? momentumRows : [];
+        const totalTarget = summaryCount || candidateRows.length;
+        if (totalTarget > 0 && candidateRows.length < totalTarget) {
+          const candidateData = await getMomentumCandidates("BROAD_MARKET_750", totalTarget);
+          candidateRows = arr(candidateData, ["candidates", "rows"]);
+          setMomentumRows(candidateRows);
+        }
+        const totalRequested = Math.min(totalTarget || candidateRows.length, candidateRows.length || totalTarget);
+        if (totalRequested <= 0) throw new Error("No Momentum candidates available for TV Confirm.");
+        const batchSize = MOMENTUM_TV_BATCH_SIZE;
+        const totalBatches = Math.ceil(totalRequested / batchSize);
+        const startedAt = Date.now();
+        let processedSoFar = 0;
+        const completed = [];
+        momentumBatchStopRef.current = false;
+        setMomentumBatchStopRequested(false);
+        setMomentumBatchStopMessage("");
+        setMomentumBatchError(null);
+        setMomentumBatchResults([]);
+        setLatestMomentumTvRows([]);
+        setMomentumTvRowsLoaded(true);
+        setMomentumSummary(summaryData);
+        for (let offset = 0; offset < totalRequested; offset += batchSize) {
+          const batchNumber = Math.floor(offset / batchSize) + 1;
+          const currentLimit = Math.min(batchSize, totalRequested - offset);
+          const rangeEnd = offset + currentLimit;
+          const symbols = candidateSymbols(candidateRows, offset, currentLimit);
+          setMomentumBatchProgress({
+            process_type: "Momentum TV Confirm",
+            current_batch_number: batchNumber,
+            total_batches: totalBatches,
+            batch_size: batchSize,
+            total_requested: totalRequested,
+            processed_so_far: processedSoFar,
+            current_batch_range: `${offset + 1}-${rangeEnd}`,
+            current_batch_symbols: symbols,
+            started_at: startedAt,
+            elapsed_time: Math.floor((Date.now() - startedAt) / 1000),
+          });
+          try {
+            let batch = null;
+            for (let retryAttempt = 0; retryAttempt <= TV_BUSY_MAX_RETRIES; retryAttempt++) {
+              try {
+                batch = await momentumTvConfirm({ limit: currentLimit, offset, batchNumber, batchSize, timeframes: MOMENTUM_MTF_TIMEFRAMES, save: true, forceUseStaleScores: false });
+                break;
+              } catch (retryErr) {
+                if (isTvManagerBusy(retryErr) && retryAttempt < TV_BUSY_MAX_RETRIES) {
+                  console.warn(`Momentum batch ${batchNumber}: TV_MANAGER_BUSY, retry ${retryAttempt + 1}/${TV_BUSY_MAX_RETRIES} after ${TV_BUSY_BASE_DELAY_MS * (retryAttempt + 1)}ms`);
+                  await delay(TV_BUSY_BASE_DELAY_MS * (retryAttempt + 1));
+                  continue;
+                }
+                throw retryErr;
+              }
+            }
+            const rows = tvRows(batch);
+            processedSoFar += Number(batch?.processed || 0);
+            completed.push(batch);
+            setMomentumBatchResults([...completed]);
+            setLatestMomentumTvRows((current) => [...current, ...rows]);
+            setMomentumTvRowsLoaded(true);
+            setMomentumBatchProgress((current) => current ? { ...current, processed_so_far: processedSoFar, elapsed_time: Math.floor((Date.now() - startedAt) / 1000) } : current);
+          } catch (err) {
+            if (isRequestCancellation(err)) throw err;
+            try {
+              await fetchAndSetTvRuntimeStatusAction({ manual: true });
+            } catch (statusErr) {
+              console.error("Failed to refresh status after batch failure", statusErr);
+            }
+            setMomentumBatchError({ batch_number: batchNumber, message: formatActionError(err, `momentum batch ${batchNumber}`) });
+            setMomentumBatchProgress(null);
+            throw err;
+          }
+          if (momentumBatchStopRef.current) {
+            setMomentumBatchStopMessage(`Stopped after Batch ${batchNumber}.`);
+            break;
+          }
+        }
+        setMomentumBatchProgress(null);
         try {
-          const batch = await momentumTvConfirm({ limit: currentLimit, offset, batchNumber, batchSize, timeframes: MOMENTUM_MTF_TIMEFRAMES, save: true, forceUseStaleScores: false });
-          const rows = tvRows(batch);
-          processedSoFar += Number(batch?.processed || 0);
-          completed.push(batch);
-          setMomentumBatchResults([...completed]);
-          setLatestMomentumTvRows((current) => [...current, ...rows]);
-          setMomentumTvRowsLoaded(true);
-          setMomentumBatchProgress((current) => current ? { ...current, processed_so_far: processedSoFar, elapsed_time: Math.floor((Date.now() - startedAt) / 1000) } : current);
-        } catch (err) {
-          setMomentumBatchError({ batch_number: batchNumber, message: formatActionError(err, `momentum batch ${batchNumber}`) });
-          setMomentumBatchProgress(null);
-          throw err;
+          await fetchAndSetTvRuntimeStatusAction({ manual: true });
+        } catch (statusErr) {
+          console.error("Failed to refresh status after batch completion", statusErr);
         }
-        if (momentumBatchStopRef.current) {
-          setMomentumBatchStopMessage(`Stopped after Batch ${batchNumber}.`);
-          break;
-        }
+        return { total_requested: totalRequested, batch_size: batchSize, batches_completed: completed.length, results: completed };
+      } finally {
+        tvActionInProgressRef.current = false;
       }
-      setMomentumBatchProgress(null);
-      return { total_requested: totalRequested, batch_size: batchSize, batches_completed: completed.length, results: completed };
     }),
     momentumStopBatch: () => { momentumBatchStopRef.current = true; setMomentumBatchStopRequested(true); },
-    momentumSignals: () => act("momentum signals", () => buildMomentumSignals(false)),
-    momentumPlans: () => act("momentum plans", () => buildPaperPlans("MOMENTUM_TV_CONFIRMED", false)),
     stockMarketData: () => act("stock market data", async () => {
       const searched = normalizeSearchSymbol(search);
       const data = await getMarketDataSymbol({ exchange: searched.exchange, symbol: searched.symbol });
@@ -2627,33 +3125,82 @@ export default function App() {
     }),
     stockSwingTvConfirm: () => act("stock swing tv confirm", async () => {
       const searched = normalizeSearchSymbol(search);
+      if (!searched.symbol) throw new Error("Invalid or empty Swing symbol.");
+      if (!validateTimeframes(stockSwingTimeframes)) {
+        throw new Error("Unsupported timeframe(s) in Swing TV Timeframes. Supported: 1m, 3m, 5m, 15m, 30m, 45m, 1h, 2h, 3h, 4h, 1D, 1W, 1M");
+      }
       const data = await swingTvConfirm({ limit: 1, timeframes: stockSwingTimeframes, save: false, singleSymbol: true, symbol: searched.symbol, tradingviewSymbol: searched.tradingview_symbol, exchange: searched.exchange });
       setStockSwingTvResult(data);
       return data;
     }),
     stockMomentumTvConfirm: () => act("stock momentum tv confirm", async () => {
       const searched = normalizeSearchSymbol(search);
+      if (!searched.symbol) throw new Error("Invalid or empty Momentum symbol.");
+      if (!validateTimeframes(stockMomentumTimeframes)) {
+        throw new Error("Unsupported timeframe(s) in Momentum TV Timeframes. Supported: 1m, 3m, 5m, 15m, 30m, 45m, 1h, 2h, 3h, 4h, 1D, 1W, 1M");
+      }
       const data = await momentumTvConfirm({ limit: 1, timeframes: stockMomentumTimeframes, save: false, forceUseStaleScores: false, singleSymbol: true, symbol: searched.symbol, tradingviewSymbol: searched.tradingview_symbol, exchange: searched.exchange });
       setStockMomentumTvResult(data);
       return data;
     }),
-    tvTest: () => act("tv candles", async () => { const data = await testTvSymbol(tv.symbol, tv.timeframe); setTvResult(data); return data; }),
+    tvTest: () => act("tv candles", async () => {
+      const searched = normalizeSearchSymbol(tv.symbol);
+      if (!searched.symbol) throw new Error("Invalid or empty TradingView symbol.");
+      const cleanTf = normalizeTimeframe(tv.timeframe);
+      if (!SUPPORTED_TIMEFRAMES.has(cleanTf)) {
+        throw new Error("Unsupported TradingView timeframe. Supported: 1m, 3m, 5m, 15m, 30m, 45m, 1h, 2h, 3h, 4h, 1D, 1W, 1M");
+      }
+      const data = await testTvSymbol(searched.tradingview_symbol || tv.symbol, cleanTf);
+      setTvResult(data);
+      return data;
+    }),
     dryRun750: () => act("dry run 750 scan", async () => { const data = await loadAllMarketData(true); setMarketLoadResult(data); const progress = await getMarketLoadProgress(); setMarketProgress(progress); return { load_all: data, progress }; }),
     scanAll750: () => act("scan all 750 stocks", async () => { const data = await loadAllMarketData(false); setMarketLoadResult(data); const progress = await getMarketLoadProgress(); setMarketProgress(progress); setSwingCandidatesStale(true); setMomentumCandidatesStale(true); setMarketDataNeedsScore(true); setNotice(SCAN_SCORE_WARNING); return { load_all: data, progress }; }),
   };
 
+  const filteredAiFeatureSnapshots = useMemo(() => {
+    const rows = Array.isArray(aiFeatureSnapshots) ? aiFeatureSnapshots : [];
+    return rows.filter((row) => {
+      if (aiDatasetFilters.strategyType && String(row.strategy_type || "").toLowerCase() !== String(aiDatasetFilters.strategyType).toLowerCase()) return false;
+      if (aiDatasetFilters.timeframe) {
+        const filterTf = normalizeTimeframe(aiDatasetFilters.timeframe);
+        if (filterTf && String(row.timeframe || "").toUpperCase() !== filterTf.toUpperCase()) return false;
+      }
+      return true;
+    });
+  }, [aiFeatureSnapshots, aiDatasetFilters]);
+
+  const filteredAiOutcomePreview = useMemo(() => {
+    if (!aiOutcomePreview) return null;
+    const filterTf = aiDatasetFilters.timeframe ? normalizeTimeframe(aiDatasetFilters.timeframe) : "";
+    const filterRow = (row) => {
+      if (aiDatasetFilters.strategyType && String(row.strategy_type || "").toLowerCase() !== String(aiDatasetFilters.strategyType).toLowerCase()) return false;
+      if (filterTf && String(row.timeframe || "").toUpperCase() !== filterTf.toUpperCase()) return false;
+      return true;
+    };
+    const eligible = Array.isArray(aiOutcomePreview.eligible_snapshots) ? aiOutcomePreview.eligible_snapshots : [];
+    const skipped = Array.isArray(aiOutcomePreview.skipped_snapshots) ? aiOutcomePreview.skipped_snapshots : [];
+    const filteredEligible = eligible.filter(filterRow);
+    const filteredSkipped = skipped.filter(filterRow);
+    return {
+      ...aiOutcomePreview,
+      eligible_attach_count: filteredEligible.length,
+      eligible_snapshots: filteredEligible,
+      skipped_snapshots: filteredSkipped,
+    };
+  }, [aiOutcomePreview, aiDatasetFilters]);
+
   const page = useMemo(() => {
-    if (activePage === "Swing Trading") return <SwingTrading swingRows={swingRows} swingSummary={swingSummary} latestSwingTvRows={latestSwingTvRows} swingTvRowsLoaded={swingTvRowsLoaded} swingBatchResults={swingBatchResults} swingBatchProgress={swingBatchProgress} swingBatchError={swingBatchError} swingBatchStopRequested={swingBatchStopRequested} swingBatchStopMessage={swingBatchStopMessage} swingBatchRunning={loading === "swing batch tv confirm"} candidatesStale={swingCandidatesStale} onSummary={handlers.swingSummary} onLoad={handlers.swing} onBatchConfirm={handlers.swingTvConfirm} onStopBatch={handlers.swingStopBatch} onLoadSaved={handlers.swingSavedTv} onSignals={handlers.swingSignals} onPlans={handlers.swingPlans} onOpenStock={openStockDetail} loading={!!loading} />;
-    if (activePage === "Momentum Trading") return <MomentumTrading momentumRows={momentumRows} momentumSummary={momentumSummary} latestMomentumTvRows={latestMomentumTvRows} momentumTvRowsLoaded={momentumTvRowsLoaded} momentumBatchResults={momentumBatchResults} momentumBatchProgress={momentumBatchProgress} momentumBatchError={momentumBatchError} momentumBatchStopRequested={momentumBatchStopRequested} momentumBatchStopMessage={momentumBatchStopMessage} momentumBatchRunning={loading === "momentum batch tv confirm"} candidatesStale={momentumCandidatesStale} onSummary={handlers.momentumSummary} onLoad={handlers.momentum} onBatchConfirm={handlers.momentumBatchConfirm} onStopBatch={handlers.momentumStopBatch} onLoadSaved={handlers.momentumSavedTv} onSignals={handlers.momentumSignals} onPlans={handlers.momentumPlans} onOpenStock={openStockDetail} loading={!!loading} />;
+    if (activePage === "Swing Trading") return <SwingTrading swingRows={swingRows} swingSummary={swingSummary} latestSwingTvRows={latestSwingTvRows} swingTvRowsLoaded={swingTvRowsLoaded} swingBatchResults={swingBatchResults} swingBatchProgress={swingBatchProgress} swingBatchError={swingBatchError} swingBatchStopRequested={swingBatchStopRequested} swingBatchStopMessage={swingBatchStopMessage} swingBatchRunning={loading === "swing batch tv confirm"} candidatesStale={swingCandidatesStale} onSummary={handlers.swingSummary} onLoad={handlers.swing} onBatchConfirm={handlers.swingTvConfirm} onStopBatch={handlers.swingStopBatch} onLoadSaved={handlers.swingSavedTv} onOpenStock={openStockDetail} loading={!!loading} tvRuntimeStatus={tvRuntimeStatus} tvRuntimeLastUpdatedAt={tvRuntimeLastUpdatedAt} onRefreshTvStatus={handlers.tvRefreshStatus} />;
+    if (activePage === "Momentum Trading") return <MomentumTrading momentumRows={momentumRows} momentumSummary={momentumSummary} latestMomentumTvRows={latestMomentumTvRows} momentumTvRowsLoaded={momentumTvRowsLoaded} momentumBatchResults={momentumBatchResults} momentumBatchProgress={momentumBatchProgress} momentumBatchError={momentumBatchError} momentumBatchStopRequested={momentumBatchStopRequested} momentumBatchStopMessage={momentumBatchStopMessage} momentumBatchRunning={loading === "momentum batch tv confirm"} candidatesStale={momentumCandidatesStale} onSummary={handlers.momentumSummary} onLoad={handlers.momentum} onBatchConfirm={handlers.momentumBatchConfirm} onStopBatch={handlers.momentumStopBatch} onLoadSaved={handlers.momentumSavedTv} onOpenStock={openStockDetail} loading={!!loading} tvRuntimeStatus={tvRuntimeStatus} tvRuntimeLastUpdatedAt={tvRuntimeLastUpdatedAt} onRefreshTvStatus={handlers.tvRefreshStatus} />;
     if (activePage === "Market Data") return <MarketDataPage tv={tv} setTv={setTv} tvResult={tvResult} onTest={handlers.tvTest} onDryRun750={handlers.dryRun750} onScanAll750={handlers.scanAll750} onScoreMarketData={handlers.scoreMarketData} marketLoadResult={marketLoadResult} marketProgress={marketProgress} scoreRunResult={scoreRunResult} scoreSummary={scoreSummary} marketDataNeedsScore={marketDataNeedsScore} loading={!!loading} loadingText={loading} lastResponse={lastResponse} />;
     if (activePage === "Stock Detail") return <StockDetailPage search={search} stockMarketData={stockMarketData} stockSwingPrecheck={stockSwingPrecheck} stockMomentumPrecheck={stockMomentumPrecheck} stockSwingTvResult={stockSwingTvResult} stockMomentumTvResult={stockMomentumTvResult} stockSavedSwingResult={stockSavedSwingResult} stockSavedMomentumResult={stockSavedMomentumResult} latestSwingTvRows={latestSwingTvRows} latestMomentumTvRows={latestMomentumTvRows} stockSwingTimeframes={stockSwingTimeframes} setStockSwingTimeframes={setStockSwingTimeframes} stockMomentumTimeframes={stockMomentumTimeframes} setStockMomentumTimeframes={setStockMomentumTimeframes} onLoadStockMarket={handlers.stockMarketData} onSwingPrecheck={handlers.stockSwingPrecheck} onMomentumPrecheck={handlers.stockMomentumPrecheck} onStockSwingTvConfirm={handlers.stockSwingTvConfirm} onStockMomentumTvConfirm={handlers.stockMomentumTvConfirm} loading={!!loading} />;
     if (activePage === "Paper Trades") return <PaperTrades openTrades={paperOpenTrades} history={paperHistory} summary={summary} liveStatus={paperLiveStatus} />;
     if (activePage === "Settings") return <Settings settings={settings} health={health} runtimeInfo={systemRuntimeInfo} tvRuntimeStatus={tvRuntimeStatus} tvAttachableTabs={tvAttachableTabs} onRefreshTvTabs={handlers.tvRefreshTabs} onAttachTvTab={handlers.tvAttachTab} onDetachTvTab={handlers.tvDetachTab} loading={!!loading} />;
-    return <Dashboard summary={summary} scoreSummary={scoreSummary} swingSummary={swingSummary} momentumSummary={momentumSummary} dashboardEquity={dashboardEquity} health={health} tvRuntimeStatus={tvRuntimeStatus} aiDatasetSummary={aiDatasetSummary} aiFeatureSnapshots={aiFeatureSnapshots} aiOutcomePreview={aiOutcomePreview} aiDataCollectionStatus={aiDataCollectionStatus} aiDatasetFilters={aiDatasetFilters} paperUpdateProgress={paperUpdateProgress} paperUpdateRuns={paperUpdateRuns} paperUpdateLock={paperUpdateLock} paperUpdateScheduler={paperUpdateScheduler} onSummary={handlers.loadSummary} onDryRun={handlers.dryRun} onSaveRun={handlers.saveRun} onAiDatasetRefresh={handlers.aiDatasetSummary} onAiDatasetFiltersChange={setAiDatasetFilters} aiDatasetLoading={loading === "AI dataset summary"} loading={!!loading} />;
-  }, [activePage, settings, health, systemRuntimeInfo, summary, scoreSummary, swingSummary, momentumSummary, dashboardEquity, tvRuntimeStatus, tvAttachableTabs, aiDatasetSummary, aiFeatureSnapshots, aiOutcomePreview, aiDataCollectionStatus, aiDatasetFilters, paperUpdateProgress, paperUpdateRuns, paperUpdateLock, paperUpdateScheduler, swingRows, latestSwingTvRows, swingTvRowsLoaded, swingBatchResults, swingBatchProgress, swingBatchError, swingBatchStopRequested, swingBatchStopMessage, swingCandidatesStale, momentumRows, momentumCandidatesStale, latestMomentumTvRows, momentumTvRowsLoaded, momentumBatchResults, momentumBatchProgress, momentumBatchError, momentumBatchStopRequested, momentumBatchStopMessage, stockMarketData, stockSwingPrecheck, stockMomentumPrecheck, stockSwingTvResult, stockMomentumTvResult, stockSavedSwingResult, stockSavedMomentumResult, stockSwingTimeframes, stockMomentumTimeframes, search, tv, tvResult, marketLoadResult, marketProgress, scoreRunResult, marketDataNeedsScore, paperOpenTrades, paperHistory, paperLiveStatus, loading, lastResponse]);
+    return <Dashboard summary={summary} scoreSummary={scoreSummary} swingSummary={swingSummary} momentumSummary={momentumSummary} dashboardEquity={dashboardEquity} health={health} tvRuntimeStatus={tvRuntimeStatus} aiDatasetSummary={aiDatasetSummary} aiFeatureSnapshots={filteredAiFeatureSnapshots} aiOutcomePreview={filteredAiOutcomePreview} aiDataCollectionStatus={aiDataCollectionStatus} aiDatasetFilters={aiDatasetFilters} aiDatasetErrors={aiDatasetErrors} dashboardErrors={dashboardErrors} paperUpdateProgress={paperUpdateProgress} paperUpdateRuns={paperUpdateRuns} paperUpdateLock={paperUpdateLock} paperUpdateScheduler={paperUpdateScheduler} onSummary={handlers.loadSummary} onDryRun={handlers.dryRun} onSaveRun={handlers.saveRun} onAiDatasetRefresh={handlers.aiDatasetSummary} onAiDatasetFiltersChange={setAiDatasetFilters} aiDatasetLoading={loading === "AI dataset summary"} loading={!!loading} />;
+  }, [activePage, settings, health, systemRuntimeInfo, summary, scoreSummary, swingSummary, momentumSummary, dashboardEquity, tvRuntimeStatus, tvRuntimeLastUpdatedAt, tvAttachableTabs, aiDatasetSummary, filteredAiFeatureSnapshots, filteredAiOutcomePreview, aiDataCollectionStatus, aiDatasetFilters, aiDatasetErrors, dashboardErrors, paperUpdateProgress, paperUpdateRuns, paperUpdateLock, paperUpdateScheduler, swingRows, latestSwingTvRows, swingTvRowsLoaded, swingBatchResults, swingBatchProgress, swingBatchError, swingBatchStopRequested, swingBatchStopMessage, swingCandidatesStale, momentumRows, momentumCandidatesStale, latestMomentumTvRows, momentumTvRowsLoaded, momentumBatchResults, momentumBatchProgress, momentumBatchError, momentumBatchStopRequested, momentumBatchStopMessage, stockMarketData, stockSwingPrecheck, stockMomentumPrecheck, stockSwingTvResult, stockMomentumTvResult, stockSavedSwingResult, stockSavedMomentumResult, stockSwingTimeframes, stockMomentumTimeframes, search, tv, tvResult, marketLoadResult, marketProgress, scoreRunResult, marketDataNeedsScore, paperOpenTrades, paperHistory, paperLiveStatus, loading, lastResponse]);
 
-  const tradingViewBatchBusy = loading === "swing batch tv confirm" || loading === "momentum batch tv confirm";
-  const tvBadge = tradingViewBatchBusy ? { tone: "yellow", label: "TradingView Busy" } : tradingViewBadge(tvRuntimeStatus);
+  const tvBadge = tradingViewBadge(tvRuntimeStatus);
 
   return <div className="appShell">
     <aside className="sidebar"><div className="brand"><div className="brandMark">TA</div><div><h1>Trading Agent</h1><p>Paper Terminal</p></div></div><div className="navSeparator">Workspace</div><nav>{NAV_WITH_STOCK_DETAIL.map((item) => <button className={activePage === item.label ? "navItem active" : "navItem"} key={item.label} onClick={() => setActivePage(item.label)}><span>{item.icon}</span>{item.label}</button>)}</nav><div className="sidebarFooter"><Badge tone="yellow">PAPER ONLY</Badge><p>No live trading. No broker orders.</p></div></aside>

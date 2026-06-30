@@ -1,7 +1,12 @@
+# start-trading-agent.ps1
+# Safe startup script for the Trading Agent backend and frontend.
+
 param(
     [int]$BackendPort = 8011,
     [int]$FrontendPort = 5173,
-    [int]$MongoPort = 27017
+    [int]$MongoPort = 27017,
+    [switch]$Restart,
+    [switch]$ForceKillUnrelatedPortOwner
 )
 
 $ErrorActionPreference = "Stop"
@@ -11,126 +16,49 @@ $BackendRoot = Join-Path $ProjectRoot "backend"
 $FrontendRoot = Join-Path $ProjectRoot "frontend"
 $PythonExe = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 $LogRoot = Join-Path $ProjectRoot "logs"
-$StartedProcesses = @()
 
+Import-Module -Name (Join-Path $ProjectRoot "scripts\TradingAgent.Processes.psm1") -Force
+
+# Helper function to get full path normalization
 function Normalize-PathValue([string]$PathValue) {
     return ([System.IO.Path]::GetFullPath($PathValue)).TrimEnd("\")
 }
 
-function Get-PortProcessIds([int]$Port) {
-    $pattern = "^\s*TCP\s+\S+:$Port\s+\S+\s+LISTENING\s+(\d+)\s*$"
-    @(& netstat -ano -p tcp |
-        ForEach-Object {
-            if ($_ -match $pattern) { [int]$Matches[1] }
-        } |
-        Where-Object { $_ -and $_ -ne $PID } |
-        Select-Object -Unique)
-}
-
-function Stop-PortProcesses([int]$Port) {
-    $processIds = Get-PortProcessIds $Port
-    if (-not $processIds -or $processIds.Count -eq 0) {
-        Write-Host "Port $Port is clear."
-        return
-    }
-
-    foreach ($processId in $processIds) {
-        $commandLine = (Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction SilentlyContinue).CommandLine
-        Write-Host "Stopping PID $processId on port $Port"
-        if ($commandLine) { Write-Host "  $commandLine" }
-        Stop-Process -Id $processId -Force -ErrorAction Stop
-    }
-
-    $deadline = (Get-Date).AddSeconds(10)
-    while ((Get-Date) -lt $deadline) {
-        if ((Get-PortProcessIds $Port).Count -eq 0) { return }
-        Start-Sleep -Milliseconds 250
-    }
-    throw "Port $Port did not clear after stopping existing processes."
-}
-
-function Test-PortListening([int]$Port) {
-    $client = [System.Net.Sockets.TcpClient]::new()
-    try {
-        $connect = $client.BeginConnect("127.0.0.1", $Port, $null, $null)
-        if (-not $connect.AsyncWaitHandle.WaitOne(1000, $false)) { return $false }
-        $client.EndConnect($connect)
-        return $true
-    } catch {
-        return $false
-    } finally {
-        $client.Close()
+# 1. Duplicate-start check
+$status = Get-TradingAgentStatus
+if ($status -eq "RUNNING" -and -not $Restart) {
+    # Check if this running instance really belongs to this project
+    $runtimeRoot = Get-BackendRuntimeRoot -BackendPort $BackendPort
+    if ($runtimeRoot -and (Normalize-PathValue $runtimeRoot) -eq (Normalize-PathValue $ProjectRoot)) {
+        Write-Host "Trading Agent is already running"
+        exit 0
     }
 }
 
-function Get-ListeningProcessId([int]$Port) {
-    $processId = Get-PortProcessIds $Port | Select-Object -First 1
-    if (-not $processId) { throw "No listener found on port $Port." }
-    return [int]$processId
+# 2. Stop stale or existing same-project processes first
+Write-Host "Cleaning up existing project instances..."
+$stopParams = @{
+    BackendPort = $BackendPort
+    FrontendPort = $FrontendPort
 }
-
-function Get-ProcessCommandLine([int]$ProcessId) {
-    return (Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction SilentlyContinue).CommandLine
+if ($ForceKillUnrelatedPortOwner) {
+    $stopParams.ForceKillUnrelatedPortOwner = $true
 }
+& (Join-Path $ProjectRoot "stop-trading-agent.ps1") @stopParams
 
-function Wait-ProcessCommandLine([int]$ProcessId, [string]$Name) {
-    for ($attempt = 0; $attempt -lt 20; $attempt++) {
-        $commandLine = Get-ProcessCommandLine $ProcessId
-        if ($commandLine) { return $commandLine }
-        Start-Sleep -Milliseconds 250
+# 3. Verify ports 8011 and 5173 are free
+if (-not (Wait-PortFree $BackendPort 5) -or -not (Wait-PortFree $FrontendPort 5)) {
+    $bOwners = Get-PortOwners $BackendPort
+    $fOwners = Get-PortOwners $FrontendPort
+    Write-Host "Startup safety check failed: required ports are occupied by another process!" -ForegroundColor Red
+    foreach ($owner in ($bOwners + $fOwners)) {
+        Write-Host "  Occupied by: PID=$($owner.Pid), Name=$($owner.Name), Executable=$($owner.ExecutablePath), Command=$($owner.CommandLine)"
     }
-    throw "$Name process $ProcessId did not expose a command line."
+    Write-Host "Aborting. Exit Code: PORT_OCCUPIED_BY_UNRELATED_PROCESS" -ForegroundColor Red
+    exit 1
 }
 
-function Assert-CommandLineContains([int]$ProcessId, [string]$Name, [string[]]$Needles) {
-    $commandLine = Wait-ProcessCommandLine $ProcessId $Name
-    foreach ($needle in $Needles) {
-        if ($commandLine.IndexOf($needle, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
-            throw "$Name process $ProcessId did not start from this project. Missing '$needle' in command line: $commandLine"
-        }
-    }
-    return $commandLine
-}
-
-function ConvertTo-ProcessArgumentString([string[]]$Arguments) {
-    $escaped = foreach ($argument in $Arguments) {
-        if ($argument -notmatch '[\s"]') {
-            $argument
-        } else {
-            '"' + $argument.Replace('"', '\"') + '"'
-        }
-    }
-    return ($escaped -join " ")
-}
-
-function Start-HiddenProcess([string]$FilePath, [string[]]$Arguments, [string]$WorkingDirectory) {
-    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $FilePath
-    $startInfo.Arguments = ConvertTo-ProcessArgumentString $Arguments
-    $startInfo.WorkingDirectory = $WorkingDirectory
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    return [System.Diagnostics.Process]::Start($startInfo)
-}
-
-function Format-CommandLine([string]$FilePath, [string[]]$Arguments) {
-    return '"' + $FilePath + '" ' + (ConvertTo-ProcessArgumentString $Arguments)
-}
-
-function Wait-HttpJson([string]$Uri, [int]$TimeoutSeconds = 45) {
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    $lastError = $null
-    while ((Get-Date) -lt $deadline) {
-        try {
-            return Invoke-RestMethod -Uri $Uri -Method Get -TimeoutSec 2
-        } catch {
-            $lastError = $_
-            Start-Sleep -Seconds 1
-        }
-    }
-    throw "Timed out waiting for $Uri. Last error: $lastError"
-}
-
+# MongoDB startup function (preserved)
 function Start-MongoDbIfNeeded {
     if (Test-PortListening $MongoPort) {
         Write-Host "MongoDB already listening on port $MongoPort."
@@ -177,8 +105,15 @@ function Start-MongoDbIfNeeded {
     $mongoLog = Join-Path $LogRoot "mongodb.log"
     $mongoArgs = @("--dbpath", $mongoData, "--bind_ip", "127.0.0.1", "--port", [string]$MongoPort, "--logpath", $mongoLog, "--logappend")
     Write-Host "Starting mongod.exe with project-local dbpath."
-    $mongoProcess = Start-HiddenProcess $mongodPath $mongoArgs $ProjectRoot
-    $script:StartedProcesses += $mongoProcess
+
+    # Hidden process launch
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $mongodPath
+    $startInfo.Arguments = ($mongoArgs -join " ")
+    $startInfo.WorkingDirectory = $ProjectRoot
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    [System.Diagnostics.Process]::Start($startInfo) | Out-Null
 
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
         if (Test-PortListening $MongoPort) { return }
@@ -187,6 +122,22 @@ function Start-MongoDbIfNeeded {
     throw "MongoDB did not start on port $MongoPort."
 }
 
+# Hidden process startup helper
+function Start-HiddenProcess([string]$FilePath, [string[]]$Arguments, [string]$WorkingDirectory) {
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $FilePath
+    # Escape quotes if args have spaces
+    $escaped = foreach ($arg in $Arguments) {
+        if ($arg -notmatch '[\s"]') { $arg } else { '"' + $arg.Replace('"', '\"') + '"' }
+    }
+    $startInfo.Arguments = ($escaped -join " ")
+    $startInfo.WorkingDirectory = $WorkingDirectory
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    return [System.Diagnostics.Process]::Start($startInfo)
+}
+
+# Main startup flow
 try {
     if (-not (Test-Path -LiteralPath $BackendRoot)) { throw "Backend folder not found: $BackendRoot" }
     if (-not (Test-Path -LiteralPath $FrontendRoot)) { throw "Frontend folder not found: $FrontendRoot" }
@@ -195,51 +146,146 @@ try {
     New-Item -ItemType Directory -Force -Path $LogRoot | Out-Null
 
     Write-Host "Project root: $ProjectRoot"
-    Stop-PortProcesses $BackendPort
-    Stop-PortProcesses $FrontendPort
     Start-MongoDbIfNeeded
 
+    # Generate diagnostics token and configure env
+    $diagToken = [System.Guid]::NewGuid().ToString("N")
+    $env:TRADING_AGENT_DIAGNOSTICS_ENABLED = "true"
+    $env:TRADING_AGENT_DIAGNOSTICS_TOKEN = $diagToken
+
+    # 4. Start backend
     $backendArgs = @("-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", [string]$BackendPort, "--app-dir", $BackendRoot)
-    $backendCommandLine = Format-CommandLine $PythonExe $backendArgs
+    Write-Host "Launching Backend process..."
     $backendProcess = Start-HiddenProcess $PythonExe $backendArgs $BackendRoot
-    $StartedProcesses += $backendProcess
+    $backendPid = $backendProcess.Id
 
+    # 5. Start frontend
     $frontendArgs = @("/c", $npm, "--prefix", $FrontendRoot, "run", "dev", "--", "--host", "127.0.0.1", "--port", [string]$FrontendPort, "--strictPort")
-    $frontendCommandLine = Format-CommandLine $env:ComSpec $frontendArgs
+    Write-Host "Launching Frontend process..."
     $frontendProcess = Start-HiddenProcess $env:ComSpec $frontendArgs $FrontendRoot
-    $StartedProcesses += $frontendProcess
+    $frontendPid = $frontendProcess.Id
 
-    $health = Wait-HttpJson "http://127.0.0.1:$BackendPort/health" 60
-    if ($health.status -ne "ok") { throw "Backend /health returned unexpected status: $($health | ConvertTo-Json -Compress)" }
-
-    $runtime = Wait-HttpJson "http://127.0.0.1:$BackendPort/api/system/runtime-info" 15
-    $backendListeningPid = Get-ListeningProcessId $BackendPort
-    $reportedRoot = Normalize-PathValue $runtime.project_root
-    if ($reportedRoot -ne (Normalize-PathValue $ProjectRoot)) {
-        throw "Backend runtime project_root mismatch. Expected '$ProjectRoot', got '$($runtime.project_root)'."
+    # 6. Wait and Validate Backend Health
+    Write-Host "Waiting for Backend health check..."
+    $backendHealthy = $false
+    $deadline = (Get-Date).AddSeconds(45)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-BackendHealth -Port $BackendPort) {
+            $backendHealthy = $true
+            break
+        }
+        if ($backendProcess.HasExited) {
+            throw "Backend process exited prematurely during startup."
+        }
+        Start-Sleep -Seconds 1
     }
-    if ([int]$runtime.backend_pid -ne $backendListeningPid) {
-        throw "Backend runtime PID mismatch. Listener PID $backendListeningPid, runtime reports $($runtime.backend_pid)."
+
+    if (-not $backendHealthy) {
+        throw "Timed out waiting for Backend /health to return OK."
     }
 
-    Wait-HttpJson "http://127.0.0.1:$FrontendPort" 45 | Out-Null
-    $frontendListeningPid = Get-ListeningProcessId $FrontendPort
+    # 7. Verify /api/system/runtime-info project_root
+    $runtimeRoot = Get-BackendRuntimeRoot -BackendPort $BackendPort
+    if (-not $runtimeRoot) {
+        throw "Failed to retrieve system runtime root from backend."
+    }
+    if ((Normalize-PathValue $runtimeRoot) -ne (Normalize-PathValue $ProjectRoot)) {
+        # Check case-insensitive match
+        if ($runtimeRoot.ToLower().TrimEnd("\") -ne $ProjectRoot.ToLower().TrimEnd("\")) {
+            throw "Backend runtime project_root mismatch. Expected '$ProjectRoot', got '$runtimeRoot'."
+        }
+    }
+
+    # 8. Wait and Validate Frontend Health
+    Write-Host "Waiting for Frontend to respond..."
+    $frontendHealthy = $false
+    $deadline = (Get-Date).AddSeconds(45)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-FrontendHealth -Port $FrontendPort) {
+            $frontendHealthy = $true
+            break
+        }
+        if ($frontendProcess.HasExited) {
+            throw "Frontend process exited prematurely during startup."
+        }
+        Start-Sleep -Seconds 1
+    }
+
+    if (-not $frontendHealthy) {
+        throw "Timed out waiting for Frontend HTTP 200 check."
+    }
+
+    # 9. Verify launched listener PIDs actually belong to this project
+    $bOwners = @(Get-PortOwners $BackendPort)
+    $fOwners = @(Get-PortOwners $FrontendPort)
+    $allNew = @($bOwners) + @($fOwners)
+    foreach ($newOwner in $allNew) {
+        if (-not (Test-ProjectOwnedProcess $newOwner)) {
+            throw "Post-startup validation failed: port listener PID $($newOwner.Pid) does not belong to this project."
+        }
+    }
+
+    # 10. Record process identity in the runtime ownership registry
+    $backendInfo = Get-ProcessByPid $backendPid
+    $frontendInfo = Get-ProcessByPid $frontendPid
+
+    # Resolve child processes (descendants of backend and frontend)
+    $bDescendants = Get-ProcessTree $backendPid
+    $fDescendants = Get-ProcessTree $frontendPid
+    $childProcesses = @()
+    foreach ($child in (@($bDescendants) + @($fDescendants))) {
+        $childProcesses += @{
+            pid            = $child.Pid
+            name           = $child.Name
+            creation_ticks = $child.CreationTicks
+            command_line   = $child.CommandLine
+        }
+    }
+
+    $runtimeData = @{
+        project_root = $ProjectRoot
+        diagnostics_token = $diagToken
+        backend      = @{
+            pid            = $backendPid
+            creation_ticks = $backendInfo.CreationTicks
+            command_line   = $backendInfo.CommandLine
+            port           = $BackendPort
+        }
+        frontend     = @{
+            pid            = $frontendPid
+            creation_ticks = $frontendInfo.CreationTicks
+            command_line   = $frontendInfo.CommandLine
+            port           = $FrontendPort
+        }
+        child_processes = $childProcesses
+        started_at      = (Get-Date).ToString("o")
+    }
+    Write-RuntimeOwnership -Data $runtimeData
 
     Write-Host ""
-    Write-Host "Trading Agent started."
-    Write-Host "Backend PID: $backendListeningPid"
-    Write-Host "Backend command line: $backendCommandLine"
-    Write-Host "Frontend PID: $frontendListeningPid"
-    Write-Host "Frontend command line: $frontendCommandLine"
+    Write-Host "Trading Agent started successfully." -ForegroundColor Green
+    Write-Host "Backend PID:  $backendPid"
+    Write-Host "Frontend PID: $frontendPid"
     Write-Host "Backend:  http://127.0.0.1:$BackendPort"
     Write-Host "Frontend: http://127.0.0.1:$FrontendPort"
+
 } catch {
-    Write-Host "Startup failed: $($_.Exception.Message)"
-    foreach ($process in $StartedProcesses) {
+    Write-Host "Startup failed: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Stopping any newly launched processes..." -ForegroundColor Yellow
+
+    # Stop newly launched PIDs if validation fails halfway
+    if ($null -ne $backendProcess -and -not $backendProcess.HasExited) {
         try {
-            if ($process -and -not $process.HasExited) {
-                Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-            }
+            $ticks = (Get-CimInstance Win32_Process -Filter "ProcessId = $($backendProcess.Id)" -ErrorAction SilentlyContinue).CreationDate.Ticks
+            $bProc = [PSCustomObject]@{ Pid = $backendProcess.Id; Name = "python"; CreationTicks = $ticks; CommandLine = "" }
+            Stop-ProjectProcessTree -RootProcess $bProc -Unconditional
+        } catch {}
+    }
+    if ($null -ne $frontendProcess -and -not $frontendProcess.HasExited) {
+        try {
+            $ticks = (Get-CimInstance Win32_Process -Filter "ProcessId = $($frontendProcess.Id)" -ErrorAction SilentlyContinue).CreationDate.Ticks
+            $fProc = [PSCustomObject]@{ Pid = $frontendProcess.Id; Name = "cmd"; CreationTicks = $ticks; CommandLine = "" }
+            Stop-ProjectProcessTree -RootProcess $fProc -Unconditional
         } catch {}
     }
     exit 1

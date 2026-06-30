@@ -1,7 +1,10 @@
 import asyncio
 import json
+import os
 import sys
 import time
+import tempfile
+import threading
 from pathlib import Path
 from urllib.error import HTTPError
 
@@ -10,14 +13,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import tv_client as tv_client_module
 from routes import tv as tv_routes
-from services.tradingview_manager import TradingViewExecutionManager
+from services.tradingview_manager import TradingViewExecutionManager, TradingViewPreflightError
 from tv_client import MAX_MANAGED_TABS, TradingViewClient, TradingViewTabNavigationError, TradingViewTabNotAttachedError, is_app_managed_tab
 from tv_confirmation import enforce_tv_confirmation_safety
 
 
+ORIGINAL_TV_PREFERENCE_FILE = tv_routes.tradingview_manager.preference_file
+TEST_TV_PREFERENCE_FILE = Path(tempfile.gettempdir()) / f"trading-agent-test-tv-attachment-{os.getpid()}.json"
+
+
 def setup_function(_function) -> None:
     tv_client_module.MANAGED_TAB_IDS.clear()
+    tv_routes.tradingview_manager.preference_file = str(TEST_TV_PREFERENCE_FILE)
     tv_routes.tradingview_manager.detach_target()
+
+
+def teardown_function(_function) -> None:
+    tv_routes.tradingview_manager.detach_target()
+    tv_routes.tradingview_manager.preference_file = ORIGINAL_TV_PREFERENCE_FILE
 
 
 def test_simultaneous_tradingview_requests_run_serially() -> None:
@@ -51,29 +64,73 @@ def test_simultaneous_tradingview_requests_run_serially() -> None:
     asyncio.run(run())
 
 
-def test_tradingview_timeout_releases_manager_for_next_request() -> None:
+def test_tradingview_timeout_quarantines_manager_until_worker_finishes(tmp_path) -> None:
     async def run() -> None:
-        manager = TradingViewExecutionManager()
+        manager = TradingViewExecutionManager(preference_path=tmp_path / "tv-pref.json")
+        manager._cached_preflight = {
+            "preflight_ready": True,
+            "preflight_code": "OK",
+            "preflight_message": "fake ready",
+            "cdp_reachable": True,
+            "valid_chart_target_count": 1,
+            "manual_attachment_required": False,
+            "attached_target_ready": True,
+            "last_attachment_error": None,
+        }
+        started = threading.Event()
+        release = threading.Event()
+        second_called = threading.Event()
+
+        def slow_worker() -> dict:
+            started.set()
+            release.wait(2)
+            return {"ok": True, "diagnostics": {"managed_tab_id": "late-tab", "managed_tab_count": 1, "devtools_ws_connected": True}}
 
         try:
-            await manager.run_sync("slow", time.sleep, 0.2, timeout_seconds=0.01)
+            await manager.run_sync("slow", slow_worker, timeout_seconds=0.01)
         except TimeoutError:
             pass
         else:
             raise AssertionError("timeout was expected")
 
+        assert started.is_set()
+        status = manager.operation_status_snapshot()
+        assert status["worker_running"] is True
+        assert status["recovering_from_timeout"] is True
+        assert status["quarantined_operation"] == "slow"
+        assert status["manager_available"] is False
+
+        try:
+            await manager.run_sync(
+                "fast",
+                lambda: second_called.set(),
+                timeout_seconds=1,
+            )
+        except TradingViewPreflightError as exc:
+            assert exc.code == "TV_MANAGER_RECOVERING"
+        else:
+            raise AssertionError("quarantined manager should reject a second worker")
+        assert not second_called.is_set()
+
+        release.set()
+        for _ in range(100):
+            if manager.operation_status_snapshot()["manager_available"]:
+                break
+            await asyncio.sleep(0.01)
+
         result = await manager.run_sync(
-            "fast",
-            lambda: {"ok": True, "diagnostics": {"managed_tab_id": "tab-fast", "managed_tab_count": 1, "devtools_ws_connected": True}},
+            "after_recovery",
+            lambda: {"ok": True, "diagnostics": {"managed_tab_id": "tab-after", "managed_tab_count": 1, "devtools_ws_connected": True}},
             timeout_seconds=1,
         )
-        status = manager.runtime_status()
 
         assert result["ok"] is True
+        status = manager.operation_status_snapshot()
         assert status["worker_running"] is False
         assert status["active_operation"] is None
-        assert status["timeout_count"] == 1
-        assert status["current_tab_id"] == "tab-fast"
+        assert status["recovering_from_timeout"] is False
+        assert manager._timeout_count == 1
+        assert manager._current_tab_id == "tab-after"
 
     asyncio.run(run())
 
@@ -105,6 +162,69 @@ def test_failed_tradingview_request_does_not_poison_next_request() -> None:
         assert status["current_tab_id"] == "tab-reconnected"
 
     asyncio.run(run())
+
+
+def test_cancelled_http_coroutine_keeps_worker_quarantined_until_completion(tmp_path) -> None:
+    async def run() -> None:
+        manager = TradingViewExecutionManager(preference_path=tmp_path / "tv-pref.json")
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_worker() -> dict:
+            started.set()
+            release.wait(2)
+            return {"ok": True}
+
+        task = asyncio.create_task(manager.run_sync("cancelled", blocking_worker, timeout_seconds=10))
+        for _ in range(100):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("task cancellation was expected")
+
+        status = manager.operation_status_snapshot()
+        assert status["worker_running"] is True
+        assert status["recovering_from_timeout"] is True
+        assert status["quarantined_operation"] == "cancelled"
+        assert status["manager_available"] is False
+
+        release.set()
+        for _ in range(100):
+            if manager.operation_status_snapshot()["manager_available"]:
+                break
+            await asyncio.sleep(0.01)
+
+        assert manager.operation_status_snapshot()["manager_available"] is True
+
+    asyncio.run(run())
+
+
+def test_stale_quarantined_completion_cannot_clear_newer_generation() -> None:
+    manager = TradingViewExecutionManager()
+    manager._active_operation = "newer"
+    manager._active_generation = 2
+    manager._worker_running_generation = 2
+    manager._quarantined_generation = 2
+    manager._quarantined_operation = "newer"
+    manager._recovery_started_at = "2026-01-01T00:00:00"
+
+    class DoneFuture:
+        def exception(self):
+            return None
+
+    manager._quarantined_worker_done(1, "older", DoneFuture())
+
+    status = manager.operation_status_snapshot()
+    assert status["recovering_from_timeout"] is True
+    assert status["quarantined_generation"] == 2
+    assert status["quarantined_operation"] == "newer"
+    assert status["manager_available"] is False
 
 
 def test_tab_navigation_failure_releases_manager_for_next_request() -> None:
@@ -347,8 +467,16 @@ def test_open_symbol_allows_attached_user_chart_target(monkeypatch) -> None:
     assert any(message.get("method") == "Page.navigate" for message in state["sent"])
 
 
-def test_manager_stores_and_detaches_attached_target_details() -> None:
-    manager = TradingViewExecutionManager()
+def test_manager_stores_and_detaches_attached_target_details(monkeypatch, tmp_path) -> None:
+    state = {"sent": []}
+
+    def fake_ws_connect(url: str, open_timeout: int = 5):
+        return FakeNavigationWebSocket(state)
+
+    monkeypatch.setattr(tv_client_module, "ws_connect", fake_ws_connect)
+    monkeypatch.setattr(tv_client_module, "TradingViewClient", FakeAttachableTargetClient)
+
+    manager = TradingViewExecutionManager(preference_path=tmp_path / "tv-pref.json")
 
     attached = manager.attach_target({"target_id": "chart-1", "title": "TradingView", "url": "https://in.tradingview.com/chart/ThW59K6v/", "websocket_debugger_url": "ws://chart-1", "ready": True})
     status = manager.runtime_status()
@@ -389,15 +517,16 @@ def test_invalid_attach_target_is_rejected(monkeypatch) -> None:
     assert client.validate_attachable_target("blank") is None
 
 
-def test_attach_tab_endpoint_helper_stores_validated_target(monkeypatch) -> None:
+def test_attach_tab_endpoint_helper_stores_validated_target(monkeypatch, tmp_path) -> None:
     state = {"sent": []}
 
     def fake_ws_connect(url: str, open_timeout: int = 5):
         return FakeNavigationWebSocket(state)
 
     monkeypatch.setattr(tv_client_module, "ws_connect", fake_ws_connect)
-    monkeypatch.setattr(tv_routes, "TradingViewClient", FakeAttachableTargetClient)
-    tv_routes.tradingview_manager.detach_target()
+    monkeypatch.setattr(tv_client_module, "TradingViewClient", FakeAttachableTargetClient)
+    manager = TradingViewExecutionManager(preference_path=tmp_path / "tv-pref.json")
+    monkeypatch.setattr(tv_routes, "tradingview_manager", manager)
     try:
         result = tv_routes._attach_tab_sync("chart-1")
         status = tv_routes.tradingview_manager.runtime_status()
@@ -409,30 +538,36 @@ def test_attach_tab_endpoint_helper_stores_validated_target(monkeypatch) -> None
     assert status["attached_target_id"] == "chart-1"
 
 
-def test_list_attachable_tabs_auto_attaches_single_valid_target(monkeypatch) -> None:
+def test_list_attachable_tabs_does_not_auto_attach_single_valid_target(monkeypatch, tmp_path) -> None:
     state = {"sent": []}
 
     def fake_ws_connect(url: str, open_timeout: int = 5):
         return FakeNavigationWebSocket(state)
 
     monkeypatch.setattr(tv_client_module, "ws_connect", fake_ws_connect)
-    monkeypatch.setattr(tv_routes, "TradingViewClient", FakeAttachableTargetClient)
+    monkeypatch.setattr(tv_client_module, "TradingViewClient", FakeAttachableTargetClient)
+    manager = TradingViewExecutionManager(preference_path=tmp_path / "tv-pref.json")
+    monkeypatch.setattr(tv_routes, "tradingview_manager", manager)
 
     result = tv_routes._list_attachable_tabs_sync()
 
     assert result["count"] == 1
-    assert result["auto_attached"] is True
-    assert result["attached_target_id"] == "chart-1"
+    assert result["auto_attached"] is False
+    assert result["attached_target_id"] is None
+    assert result["manual_attachment_required"] is True
+    assert manager.attached_target_snapshot() is None
 
 
-def test_attach_tab_endpoint_helper_rejects_invalid_target(monkeypatch) -> None:
+def test_attach_tab_endpoint_helper_rejects_invalid_target(monkeypatch, tmp_path) -> None:
     state = {"sent": []}
 
     def fake_ws_connect(url: str, open_timeout: int = 5):
         return FakeNavigationWebSocket(state)
 
     monkeypatch.setattr(tv_client_module, "ws_connect", fake_ws_connect)
-    monkeypatch.setattr(tv_routes, "TradingViewClient", FakeAttachableTargetClient)
+    monkeypatch.setattr(tv_client_module, "TradingViewClient", FakeAttachableTargetClient)
+    manager = TradingViewExecutionManager(preference_path=tmp_path / "tv-pref.json")
+    monkeypatch.setattr(tv_routes, "tradingview_manager", manager)
 
     try:
         tv_routes._attach_tab_sync("blank")

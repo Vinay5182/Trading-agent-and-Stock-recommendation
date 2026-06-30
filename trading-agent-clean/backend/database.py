@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 
-from config import settings
+from config import settings, validate_settings
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -12,6 +12,7 @@ mongo_client: AsyncIOMotorClient | None = None
 
 async def connect_to_mongo() -> None:
     global mongo_client
+    validate_settings(settings)
     mongo_client = AsyncIOMotorClient(settings.MONGO_URI)
 
 
@@ -30,16 +31,32 @@ def get_database() -> AsyncIOMotorDatabase:
 
 @asynccontextmanager
 async def lifespan(app):
+    validation = validate_settings(settings)
     await connect_to_mongo()
     from services.mongo_indexes import ensure_active_indexes
     from services.paper_automation import initialize_scheduler_status, shutdown_paper_automation, start_paper_automation_once
 
-    await ensure_active_indexes(get_database())
-    await initialize_scheduler_status(get_database())
-    automation_task = start_paper_automation_once()
-    logger.info("Registered paper automation background task name=%s", automation_task.get_name())
+    automation_started = False
     try:
+        index_summary = await ensure_active_indexes(get_database())
+        logger.info(
+            "Critical Mongo indexes verified expected=%s verified=%s created=%s",
+            index_summary.get("critical_expected"),
+            len(index_summary.get("critical_verified", [])),
+            len(index_summary.get("critical_created", [])),
+        )
+        if validation["automation_disabled"]:
+            logger.info("Smoke read-only startup mode active; paper automation disabled")
+            yield
+            return
+        await initialize_scheduler_status(get_database())
+        from services.tradingview_manager import tradingview_manager
+        await tradingview_manager.validate_preference_on_restart()
+        automation_task = start_paper_automation_once()
+        automation_started = True
+        logger.info("Registered paper automation background task name=%s", automation_task.get_name())
         yield
     finally:
-        await shutdown_paper_automation()
+        if automation_started:
+            await shutdown_paper_automation()
         await close_mongo_connection()

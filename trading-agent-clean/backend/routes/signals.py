@@ -1,9 +1,12 @@
 from datetime import datetime
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Header, Query
+from fastapi.responses import JSONResponse
 
 from database import get_database
-from services.tradingview_manager import tradingview_manager
+from security.operator_intent import OPERATOR_INTENT_HEADER, require_operator_intent_value
+from services.mongo_indexes import get_collection_index_specs
+from services.tradingview_manager import tradingview_manager, TradingViewPreflightError
 from tv_confirmation import PAPER_PLAN_FIELDS, confirm_momentum_symbol_timeframe, confirm_symbol_timeframe
 
 
@@ -16,7 +19,28 @@ async def build_tv_confirmed_signals(
     timeframe: str = Query(default="1D"),
     scan_run_id: str | None = Query(default=None),
     save: bool = Query(default=False),
-) -> dict:
+    operator_intent: str | None = Header(default=None, alias=OPERATOR_INTENT_HEADER),
+):
+    if save:
+        require_operator_intent_value(operator_intent)
+    # Advisory-only preflight: reject immediately only for hard failures
+    if not tradingview_manager.attached_target_id and not tradingview_manager._connected:
+        cached = tradingview_manager._cached_preflight
+        if cached and not cached.get("preflight_ready") and cached.get("preflight_code") not in ("TV_MANAGER_BUSY", "OK"):
+            details = {
+                "code": cached.get("preflight_code"),
+                "message": cached.get("preflight_message"),
+                "cdp_reachable": cached.get("cdp_reachable"),
+                "valid_target_count": cached.get("valid_chart_target_count"),
+                "attached_target_id": None,
+                "attached_title": cached.get("attached_title"),
+                "attached_url": cached.get("attached_url"),
+                "chart_ready": False,
+                "manual_attachment_required": cached.get("manual_attachment_required"),
+                "retryable": False,
+            }
+            return JSONResponse(status_code=400, content=details)
+
     db = get_database()
     active_scan_run_id = scan_run_id
     if active_scan_run_id is None:
@@ -47,13 +71,17 @@ async def build_tv_confirmed_signals(
     processed = 0
     async for row in cursor:
         processed += 1
-        confirmation = await tradingview_manager.run_sync(
-            "signals.confirm_symbol_timeframe",
-            confirm_symbol_timeframe,
-            row["tradingview_symbol"],
-            timeframe,
-            retries=1,
-        )
+        try:
+            confirmation = await tradingview_manager.run_sync(
+                "signals.confirm_symbol_timeframe",
+                confirm_symbol_timeframe,
+                row["tradingview_symbol"],
+                timeframe,
+                retries=1,
+                require_preflight=True,
+            )
+        except TradingViewPreflightError as exc:
+            return JSONResponse(status_code=400, content=exc.details)
         if not confirmation["tv_confirmed"] or not confirmation.get("paper_plan_valid"):
             continue
         now = datetime.utcnow().isoformat()
@@ -88,10 +116,7 @@ async def build_tv_confirmed_signals(
     upserted_count = 0
     modified_count = 0
     if save and signals:
-        await db.paper_signals.create_index(
-            [("symbol", 1), ("timeframe", 1), ("signal_type", 1), ("paper_only", 1), ("source", 1)],
-            unique=True,
-        )
+        get_collection_index_specs("paper_signals")
         for signal in signals:
             identity = {
                 "symbol": signal["symbol"],
@@ -121,6 +146,7 @@ async def build_tv_confirmed_signals(
         "upserted_count": upserted_count,
         "modified_count": modified_count,
         "storage": "paper_signals" if save else "response_only",
+        "write_intent": "persist" if save else "preview",
     }
 
 
@@ -140,7 +166,28 @@ async def build_momentum_tv_confirmed_signals(
     timeframe: str = Query(default="1D"),
     scan_run_id: str | None = Query(default=None),
     save: bool = Query(default=False),
-) -> dict:
+    operator_intent: str | None = Header(default=None, alias=OPERATOR_INTENT_HEADER),
+):
+    if save:
+        require_operator_intent_value(operator_intent)
+    # Advisory-only preflight: reject immediately only for hard failures
+    if not tradingview_manager.attached_target_id and not tradingview_manager._connected:
+        cached = tradingview_manager._cached_preflight
+        if cached and not cached.get("preflight_ready") and cached.get("preflight_code") not in ("TV_MANAGER_BUSY", "OK"):
+            details = {
+                "code": cached.get("preflight_code"),
+                "message": cached.get("preflight_message"),
+                "cdp_reachable": cached.get("cdp_reachable"),
+                "valid_target_count": cached.get("valid_chart_target_count"),
+                "attached_target_id": None,
+                "attached_title": cached.get("attached_title"),
+                "attached_url": cached.get("attached_url"),
+                "chart_ready": False,
+                "manual_attachment_required": cached.get("manual_attachment_required"),
+                "retryable": False,
+            }
+            return JSONResponse(status_code=400, content=details)
+
     db = get_database()
     active_scan_run_id = scan_run_id
     if active_scan_run_id is None:
@@ -162,13 +209,17 @@ async def build_momentum_tv_confirmed_signals(
     signals = []
     async for row in cursor:
         processed += 1
-        confirmation = await tradingview_manager.run_sync(
-            "signals.confirm_momentum_symbol_timeframe",
-            confirm_momentum_symbol_timeframe,
-            row["tradingview_symbol"],
-            timeframe,
-            retries=1,
-        )
+        try:
+            confirmation = await tradingview_manager.run_sync(
+                "signals.confirm_momentum_symbol_timeframe",
+                confirm_momentum_symbol_timeframe,
+                row["tradingview_symbol"],
+                timeframe,
+                retries=1,
+                require_preflight=True,
+            )
+        except TradingViewPreflightError as exc:
+            return JSONResponse(status_code=400, content=exc.details)
         if not (
             confirmation.get("momentum_confirmed") is True
             and confirmation.get("reason") == "MOMENTUM_CONFIRMED"
@@ -211,10 +262,7 @@ async def build_momentum_tv_confirmed_signals(
     upserted_count = 0
     modified_count = 0
     if save and signals:
-        await db.paper_signals.create_index(
-            [("symbol", 1), ("timeframe", 1), ("signal_type", 1), ("paper_only", 1), ("source", 1)],
-            unique=True,
-        )
+        get_collection_index_specs("paper_signals")
         for signal in signals:
             identity = {
                 "symbol": signal["symbol"],
@@ -243,4 +291,6 @@ async def build_momentum_tv_confirmed_signals(
         "upserted_count": upserted_count,
         "modified_count": modified_count,
         "signals": signals,
+        "storage": "paper_signals" if save else "response_only",
+        "write_intent": "persist" if save else "preview",
     }

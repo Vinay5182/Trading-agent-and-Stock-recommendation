@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from routes import momentum, paper, swing
+from security.operator_intent import OPERATOR_INTENT_HEADER, OPERATOR_INTENT_VALUE
 
 
 def setup_function(_function) -> None:
@@ -151,6 +152,8 @@ def test_swing_save_false_exception_does_not_record_system_error(monkeypatch) ->
         return [sample_candidate("SWINGERR")]
 
     async def fake_run_sync(*_args, **_kwargs):
+        if _args and _args[0] == "tv.validate_preflight":
+            return None
         raise TimeoutError("manager timeout")
 
     async def fake_record_system_error(*_args, **kwargs):
@@ -193,6 +196,8 @@ def test_momentum_save_false_exception_does_not_record_system_error(monkeypatch)
         return [sample_candidate("MOMERR")]
 
     async def fake_run_sync(*_args, **_kwargs):
+        if _args and _args[0] == "tv.validate_preflight":
+            return None
         raise TimeoutError("manager timeout")
 
     async def fake_record_system_error(*_args, **kwargs):
@@ -230,6 +235,8 @@ def test_swing_confirmation_passes_attached_target_to_worker(monkeypatch) -> Non
         return [sample_candidate("SWINGATTACH")]
 
     async def fake_run_sync(*args, **_kwargs):
+        if args and args[0] == "tv.validate_preflight":
+            return None
         captured["args"] = args
         return {
             "tv_status": "TECHNICAL_FAILED",
@@ -269,6 +276,8 @@ def test_momentum_confirmation_passes_attached_target_to_worker(monkeypatch) -> 
         return [sample_candidate("MOMATTACH")]
 
     async def fake_run_sync(*args, **_kwargs):
+        if args and args[0] == "tv.validate_preflight":
+            return None
         captured["args"] = args
         return {
             "tv_status": "TECHNICAL_FAILED",
@@ -340,7 +349,7 @@ def test_sync_trade_ready_endpoint_returns_json_cors_on_service_error(monkeypatc
     with TestClient(test_app) as client:
         response = client.post(
             "/api/paper/sync-trade-ready",
-            headers={"Origin": "http://127.0.0.1:5173"},
+            headers={"Origin": "http://127.0.0.1:5173", OPERATOR_INTENT_HEADER: OPERATOR_INTENT_VALUE},
         )
 
     assert response.status_code == 500

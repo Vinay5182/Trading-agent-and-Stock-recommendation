@@ -1,9 +1,11 @@
 import asyncio
 from datetime import datetime, time, timezone
+import hashlib
+import json
 from time import perf_counter
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query
 from pymongo import UpdateOne
 
 from data_provider import (
@@ -16,9 +18,7 @@ from data_provider import (
     SOURCE_YFINANCE_ONLY,
     build_market_data_document,
     fetch_market_data_for_symbol,
-    fetch_nse_quote,
     fetch_yfinance_batch_for_missing,
-    fetch_yfinance_quote_for_missing_fields,
     ensure_market_data_indexes,
     is_valid_market_symbol,
     merge_field_fallback,
@@ -26,17 +26,34 @@ from data_provider import (
     required_missing_fields,
     scoring_missing_fields,
     upsert_market_data,
+    sanitize_provider_error,
 )
 from database import get_database
 from nse_client import fetch_broad_market_nse_quotes, fetch_nse_index_quotes
 from nse_universe import get_supported_indexes, get_universe_result
 from routes.staleness import is_score_stale
+from security.operator_intent import OPERATOR_INTENT_HEADER, require_operator_intent_value
+from services.pipeline_run_lock import (
+    PipelineLockLost,
+    PipelineRunBusy,
+    get_pipeline_run_status,
+    parse_strict_bool,
+    pipeline_error_response,
+    run_with_pipeline_lock,
+)
 
 
 router = APIRouter()
 IST = ZoneInfo("Asia/Kolkata")
 VALID_SOURCE_MODES = {"auto", "nse_first", "cache"}
 HISTORY_FIELDS = ["relative_volume", "thirty_day_change_percent"]
+
+
+def dry_run_query(value: str | bool | None) -> bool:
+    try:
+        return parse_strict_bool(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 def utc_now_iso() -> str:
@@ -368,12 +385,10 @@ def build_load_all_row(
     return merged
 
 
-async def ensure_market_load_state_indexes(db) -> None:
-    await db.market_load_state.create_index(
-        [("index_name", 1), ("session_date", 1), ("session", 1), ("source_mode", 1)],
-        unique=True,
-    )
-    await db.market_load_state.create_index("updated_at")
+async def ensure_market_load_state_indexes(db) -> dict:
+    from services.mongo_indexes import get_collection_index_specs
+
+    return {"startup_owned": [spec.as_dict() for spec in get_collection_index_specs("market_load_state")]}
 
 
 async def get_after_market_state(db, clean_index: str, market_session: dict):
@@ -461,6 +476,7 @@ async def cache_response(clean_index: str, market_session: dict, message: str, s
         "dry_run": False,
         "used_cache": True,
         "mongo_writes": False,
+        "provider_calls": False,
         "source_mode": source_mode,
         "message": message,
         "market_session": market_session,
@@ -468,30 +484,7 @@ async def cache_response(clean_index: str, market_session: dict, message: str, s
     }
 
 
-@router.get("/indexes")
-async def get_market_indexes() -> dict:
-    result = get_supported_indexes()
-    return {"count": len(result["indexes"]), **result}
-
-
-@router.get("/session-status")
-async def market_session_status() -> dict:
-    return get_market_session_status()
-
-
-@router.get("/load-state")
-async def get_market_load_state(index_name: str = Query(default="BROAD_MARKET_750")) -> dict:
-    clean_index = index_name.strip().upper()
-    db = get_database()
-    await ensure_market_load_state_indexes(db)
-    cursor = db.market_load_state.find({"index_name": clean_index}, {"_id": 0}).sort("updated_at", -1).limit(10)
-    rows = [row async for row in cursor]
-    return {"index_name": clean_index, "count": len(rows), "rows": rows}
-
-
-@router.post("/cleanup-invalid-symbols")
-async def cleanup_invalid_symbols(dry_run: bool = Query(default=True)) -> dict:
-    db = get_database()
+async def find_invalid_market_symbols(db) -> tuple[list[dict], list[str]]:
     query = {
         "$or": [
             {"symbol": {"$regex": "^(DUMMY|PLACEHOLDER|FAKE_SYMBOL|TEST_SYMBOL)", "$options": "i"}},
@@ -508,23 +501,196 @@ async def cleanup_invalid_symbols(dry_run: bool = Query(default=True)) -> dict:
         for doc in invalid_docs
         if doc.get("canonical_symbol") or doc.get("symbol")
     })
-    if dry_run:
-        return {"dry_run": True, "matched_count": len(invalid_docs), "symbols": symbols}
+    return invalid_docs, symbols
+
+
+async def _cleanup_invalid_symbols_real(db, lease=None) -> dict:
+    if lease is not None:
+        await lease.update_status(stage="cleanup_scan", processed_count=0)
+    invalid_docs, symbols = await find_invalid_market_symbols(db)
+    if lease is not None:
+        await lease.renew()
+        await lease.update_status(stage="cleanup_delete", processed_count=0, total_count=len(invalid_docs))
     if not invalid_docs:
-        return {"dry_run": False, "deleted_count": 0, "symbols": []}
+        return {
+            "dry_run": False,
+            "mongo_writes": True,
+            "provider_calls": False,
+            "processed": 0,
+            "deleted_count": 0,
+            "symbols": [],
+        }
     result = await db.market_data.delete_many({"_id": {"$in": [doc["_id"] for doc in invalid_docs]}})
-    return {"dry_run": False, "deleted_count": result.deleted_count, "symbols": symbols}
+    return {
+        "dry_run": False,
+        "mongo_writes": True,
+        "provider_calls": False,
+        "processed": len(invalid_docs),
+        "deleted_count": result.deleted_count,
+        "symbols": symbols,
+    }
+
+
+@router.get("/indexes")
+async def get_market_indexes() -> dict:
+    result = get_supported_indexes()
+    return {"count": len(result["indexes"]), **result}
+
+
+@router.get("/session-status")
+async def market_session_status() -> dict:
+    return get_market_session_status()
+
+
+@router.get("/pipeline-status")
+async def market_pipeline_status() -> dict:
+    return await get_pipeline_run_status(get_database())
+
+
+@router.get("/load-state")
+async def get_market_load_state(index_name: str = Query(default="BROAD_MARKET_750")) -> dict:
+    clean_index = index_name.strip().upper()
+    db = get_database()
+    await ensure_market_load_state_indexes(db)
+    cursor = db.market_load_state.find({"index_name": clean_index}, {"_id": 0}).sort("updated_at", -1).limit(10)
+    rows = [row async for row in cursor]
+    return {"index_name": clean_index, "count": len(rows), "rows": rows}
+
+
+@router.post("/cleanup-invalid-symbols")
+async def cleanup_invalid_symbols(
+    dry_run: str | bool = Query(default="true"),
+    approved_plan_hash: str | None = Query(default=None),
+    operator_intent: str | None = Header(default=None, alias=OPERATOR_INTENT_HEADER),
+) -> dict:
+    dry_run_flag = dry_run_query(dry_run)
+    if not dry_run_flag:
+        require_operator_intent_value(operator_intent)
+    db = get_database()
+
+    # Calculate expected plan hash based on current invalid symbols
+    invalid_docs, symbols = await find_invalid_market_symbols(db)
+    material = {"symbols": sorted(symbols)}
+    serialized = json.dumps(material, sort_keys=True, separators=(",", ":"), default=str)
+    expected_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    if dry_run_flag:
+        return {
+            "dry_run": True,
+            "mongo_writes": False,
+            "provider_calls": False,
+            "matched_count": len(invalid_docs),
+            "symbols": symbols,
+            "plan_hash": expected_hash,
+        }
+
+    if not approved_plan_hash or approved_plan_hash != expected_hash:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Plan approval required. Explicitly confirm proposed cleanup action by passing approved_plan_hash='{expected_hash}'."
+        )
+
+    try:
+        return await run_with_pipeline_lock(
+            db,
+            operation="market_cleanup_invalid_symbols",
+            requested_scope={},
+            work=lambda lease: _cleanup_invalid_symbols_real(db, lease),
+        )
+    except (PipelineRunBusy, PipelineLockLost) as exc:
+        return pipeline_error_response(exc)
+    except Exception as exc:
+        return pipeline_error_response(exc)
+
+
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from collections import defaultdict
+from typing import Any
+import time as time_lib
+import re
+
+TEST_SYMBOL_LIMIT_WINDOW = 60
+TEST_SYMBOL_LIMIT_MAX = 10
+test_symbol_history = defaultdict(list)
 
 
 @router.get("/test-symbol")
-async def test_market_symbol(symbol: str = Query(default="RELIANCE"), index_name: str = Query(default="NIFTY_50")) -> dict:
+async def test_market_symbol(
+    request: Request = None,
+    symbol: str = Query(default="RELIANCE"),
+    index_name: str = Query(default="NIFTY_50"),
+    exchange: str = Query(default="NSE"),
+) -> Any:
+    # Resolve potential direct python call defaults
+    if hasattr(exchange, "default"):
+        exchange = exchange.default
+    if hasattr(symbol, "default"):
+        symbol = symbol.default
+    if hasattr(index_name, "default"):
+        index_name = index_name.default
+
+    if not isinstance(exchange, str) or exchange.strip().upper() != "NSE":
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "Invalid exchange. Only NSE exchange is supported."}
+        )
+
+    if not symbol or not re.match(r"^[a-zA-Z0-9_\-&]+$", symbol):
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "Invalid symbol format. Symbols must be alphanumeric (optionally including hyphens, underscores, or ampersands)."}
+        )
+
+    if request is not None:
+        client_ip = request.client.host if request.client else "unknown"
+        now = time_lib.time()
+        test_symbol_history[client_ip] = [
+            t for t in test_symbol_history[client_ip]
+            if now - t < TEST_SYMBOL_LIMIT_WINDOW
+        ]
+        if len(test_symbol_history[client_ip]) >= TEST_SYMBOL_LIMIT_MAX:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Too many requests. Rate limit exceeded for /test-symbol."}
+            )
+        test_symbol_history[client_ip].append(now)
+
     clean_symbol = normalize_symbol("NSE", symbol)
-    batch = fetch_nse_index_quotes(index_name)
-    batch_quote = batch.quote_map.get(clean_symbol)
-    nse_result = batch_quote or fetch_nse_quote(clean_symbol)
+
+    try:
+        async def do_fetch():
+            batch = fetch_nse_index_quotes(index_name)
+            batch_quote = batch.quote_map.get(clean_symbol)
+            merged_result = await fetch_market_data_for_symbol(
+                clean_symbol, index_name=index_name, nse_quote=batch_quote
+            )
+            return batch, batch_quote, merged_result
+
+        batch, batch_quote, merged_result = await asyncio.wait_for(do_fetch(), timeout=15.0)
+
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            status_code=504,
+            content={"detail": "Gateway Timeout: Request to provider timed out after 15 seconds."}
+        )
+    except Exception as exc:
+        sanitized = sanitize_provider_error(str(exc))
+        return JSONResponse(
+            status_code=502,
+            content={"detail": f"Bad Gateway: Provider fetch failed. {sanitized}"}
+        )
+
+    nse_result = batch_quote or {
+        "nse_ok": merged_result.get("nse_ok"),
+        "nse_error": merged_result.get("nse_error"),
+    }
     missing_after_nse = required_missing_fields(nse_result) + scoring_missing_fields(nse_result)
-    yfinance_result = fetch_yfinance_quote_for_missing_fields(clean_symbol, missing_after_nse)
-    merged_result = await fetch_market_data_for_symbol(clean_symbol, index_name=index_name, nse_quote=batch_quote)
+    yfinance_result = {
+        "yfinance_symbol": merged_result.get("yfinance_symbol", f"{clean_symbol}.NS"),
+        "yfinance_ok": merged_result.get("yfinance_ok", False),
+        "yfinance_error": merged_result.get("yfinance_error"),
+    }
     errors = [
         error for error in [nse_result.get("nse_error"), yfinance_result.get("yfinance_error")]
         if error
@@ -562,45 +728,23 @@ async def get_market_universe(index_name: str = Query(default="NIFTY_50")) -> di
     return get_universe_result(clean_index)
 
 
-@router.post("/load-index")
-async def load_market_index(
-    index_name: str = Query(default="NIFTY_50"),
-    limit: int = Query(default=10, ge=1),
-    offset: int = Query(default=0, ge=0),
-    dry_run: bool = Query(default=True),
-    force_refresh: bool = Query(default=False),
-    source_mode: str = Query(default="auto"),
+async def _load_market_index_real(
+    db,
+    *,
+    clean_index: str,
+    mode: str,
+    market_session: dict,
+    universe: dict,
+    planned_symbols: list[dict],
+    effective_limit: int,
+    requested_limit: int,
+    offset: int,
+    next_offset: int,
+    has_more: bool,
+    limit_warning: str | None,
+    force_refresh: bool,
+    lease=None,
 ) -> dict:
-    clean_index = index_name.strip().upper()
-    mode = clean_source_mode(source_mode)
-    market_session = get_market_session_status()
-    effective_limit = min(limit, 50)
-    limit_warning = "limit clamped to 50" if limit > 50 else None
-    universe = get_universe_result(clean_index)
-    planned_symbols = universe["symbols"][offset:offset + effective_limit]
-    next_offset = offset + len(planned_symbols)
-    has_more = next_offset < universe["count"]
-    if dry_run:
-        return {
-            "index_name": clean_index,
-            "limit": effective_limit,
-            "requested_limit": limit,
-            "offset": offset,
-            "next_offset": next_offset,
-            "has_more": has_more,
-            "limit_warning": limit_warning,
-            "dry_run": True,
-            "mongo_writes": False,
-            "force_refresh": force_refresh,
-            "source_mode": mode,
-            "market_session": market_session,
-            "source": universe["source"],
-            "error": universe["error"],
-            "universe_count": universe["count"],
-            "planned_count": len(planned_symbols),
-            "planned_symbols": planned_symbols,
-        }
-    db = get_database()
     if mode == "cache":
         return await cache_response(clean_index, market_session, "Using Mongo cache by request.", mode)
     if mode == "auto" and market_session["session"] == "WEEKEND" and not force_refresh:
@@ -616,6 +760,8 @@ async def load_market_index(
             )
             response["load_state"] = state
             return response
+    if lease is not None:
+        await lease.update_status(stage="fetching_nse_batch", processed_count=0, total_count=len(planned_symbols))
     nse_batch = fetch_nse_index_quotes(clean_index)
     rows = []
     processed = 0
@@ -630,6 +776,8 @@ async def load_market_index(
         "invalid_skipped_count": 0,
     }
     for planned in planned_symbols:
+        if lease is not None:
+            await lease.renew()
         processed += 1
         if not is_valid_market_symbol(planned.get("canonical_symbol") or planned.get("symbol")):
             source_counts["invalid_skipped_count"] += 1
@@ -664,6 +812,8 @@ async def load_market_index(
                 "nse_error": str(exc),
                 "field_sources": {},
             }
+        if lease is not None:
+            await lease.renew()
         result = await upsert_market_data(db, row)
         upserted_count += 1 if result.upserted_id is not None else 0
         modified_count += result.modified_count
@@ -678,16 +828,19 @@ async def load_market_index(
         if row.get("is_complete"):
             complete_count += 1
         rows.append(row_summary(row))
+        if lease is not None:
+            await lease.update_status(stage="loading_index", processed_count=processed, total_count=len(planned_symbols))
     response = {
         "index_name": clean_index,
         "limit": effective_limit,
-        "requested_limit": limit,
+        "requested_limit": requested_limit,
         "offset": offset,
         "next_offset": next_offset,
         "has_more": has_more,
         "limit_warning": limit_warning,
         "dry_run": False,
         "mongo_writes": True,
+        "provider_calls": True,
         "used_cache": False,
         "force_refresh": force_refresh,
         "source_mode": mode,
@@ -720,49 +873,97 @@ async def load_market_index(
     return response
 
 
-@router.post("/scan-all")
-@router.post("/load-all")
-async def load_all_market_data(
-    index_name: str = Query(default="BROAD_MARKET_750"),
-    dry_run: bool = Query(default=False),
+@router.post("/load-index")
+async def load_market_index(
+    index_name: str = Query(default="NIFTY_50"),
+    limit: int = Query(default=10, ge=1),
+    offset: int = Query(default=0, ge=0),
+    dry_run: str | bool = Query(default="true"),
     force_refresh: bool = Query(default=False),
     source_mode: str = Query(default="auto"),
-    refresh_history: bool = Query(default=False),
-    force_history_refresh: bool = Query(default=False),
+    operator_intent: str | None = Header(default=None, alias=OPERATOR_INTENT_HEADER),
 ) -> dict:
-    total_timer = perf_counter()
+    dry_run_flag = dry_run_query(dry_run)
+    if not dry_run_flag:
+        require_operator_intent_value(operator_intent)
     clean_index = index_name.strip().upper()
     mode = clean_source_mode(source_mode)
     market_session = get_market_session_status()
-    today_ist = market_session["date"]
+    effective_limit = min(limit, 50)
+    limit_warning = "limit clamped to 50" if limit > 50 else None
     universe = get_universe_result(clean_index)
-    planned_symbols = universe["symbols"]
-    started_at = utc_now_iso()
-    if dry_run:
-        finished_at = utc_now_iso()
+    planned_symbols = universe["symbols"][offset:offset + effective_limit]
+    next_offset = offset + len(planned_symbols)
+    has_more = next_offset < universe["count"]
+    if dry_run_flag:
         return {
             "index_name": clean_index,
-            "universe_count": universe["count"],
-            "planned_count": len(planned_symbols),
-            "processed": 0,
+            "limit": effective_limit,
+            "requested_limit": limit,
+            "offset": offset,
+            "next_offset": next_offset,
+            "has_more": has_more,
+            "limit_warning": limit_warning,
             "dry_run": True,
             "mongo_writes": False,
-            "used_cache": False,
+            "provider_calls": False,
             "force_refresh": force_refresh,
-            "refresh_history": refresh_history,
-            "force_history_refresh": force_history_refresh,
             "source_mode": mode,
             "market_session": market_session,
             "source": universe["source"],
             "error": universe["error"],
-            "started_at": started_at,
-            "finished_at": finished_at,
-            "duration_seconds": 0,
-            "planned_symbols_sample": planned_symbols[:20],
+            "universe_count": universe["count"],
+            "planned_count": len(planned_symbols),
+            "planned_symbols": planned_symbols,
         }
-
     db = get_database()
+    try:
+        return await run_with_pipeline_lock(
+            db,
+            operation="market_load_index",
+            requested_scope={"index_name": clean_index, "limit": effective_limit, "offset": offset},
+            work=lambda lease: _load_market_index_real(
+                db,
+                clean_index=clean_index,
+                mode=mode,
+                market_session=market_session,
+                universe=universe,
+                planned_symbols=planned_symbols,
+                effective_limit=effective_limit,
+                requested_limit=limit,
+                offset=offset,
+                next_offset=next_offset,
+                has_more=has_more,
+                limit_warning=limit_warning,
+                force_refresh=force_refresh,
+                lease=lease,
+            ),
+        )
+    except (PipelineRunBusy, PipelineLockLost) as exc:
+        return pipeline_error_response(exc)
+    except Exception as exc:
+        return pipeline_error_response(exc)
+
+
+async def _load_all_market_data_real(
+    db,
+    *,
+    clean_index: str,
+    mode: str,
+    market_session: dict,
+    universe: dict,
+    planned_symbols: list[dict],
+    started_at: str,
+    total_timer,
+    force_refresh: bool,
+    refresh_history: bool,
+    force_history_refresh: bool,
+    today_ist: str,
+    lease=None,
+) -> dict:
     await ensure_market_data_indexes(db)
+    if lease is not None:
+        await lease.update_status(stage="fetching_nse_batch", processed_count=0, total_count=len(planned_symbols))
     nse_timer = perf_counter()
     nse_batch = fetch_load_all_nse_batch(clean_index)
     nse_batch_seconds = seconds_since(nse_timer)
@@ -771,6 +972,9 @@ async def load_all_market_data(
         if is_valid_market_symbol(planned.get("canonical_symbol") or planned.get("symbol"))
     ]
     valid_symbols = [planned["canonical_symbol"] for planned in valid_plans]
+    if lease is not None:
+        await lease.renew()
+        await lease.update_status(stage="loading_cached_rows", processed_count=0, total_count=len(valid_plans))
     cached_rows = await get_cached_market_rows(db, valid_symbols)
     missing_by_symbol = {}
     missing_symbols = []
@@ -798,6 +1002,9 @@ async def load_all_market_data(
     yfinance_timer = perf_counter()
     yfinance_rows = {}
     if missing_symbols:
+        if lease is not None:
+            await lease.renew()
+            await lease.update_status(stage="fetching_yfinance_batch", processed_count=0, total_count=len(missing_symbols))
         yfinance_rows = await asyncio.to_thread(
             fetch_yfinance_batch_for_missing,
             missing_symbols,
@@ -819,8 +1026,6 @@ async def load_all_market_data(
         "invalid_skipped_count": 0,
     }
     processed = 0
-    upserted_count = 0
-    modified_count = 0
     errors_sample = []
     rows_to_write = []
     merge_timer = perf_counter()
@@ -838,6 +1043,9 @@ async def load_all_market_data(
         if row.get("source_used") == SOURCE_FETCH_FAILED and len(errors_sample) < 20:
             errors_sample.append(row_summary(row))
     merge_seconds = seconds_since(merge_timer)
+    if lease is not None:
+        await lease.renew()
+        await lease.update_status(stage="writing_market_rows", processed_count=processed, total_count=len(planned_symbols), counts=counts)
     mongo_timer = perf_counter()
     upserted_count, modified_count = await bulk_upsert_market_rows(db, rows_to_write)
     mongo_upsert_seconds = seconds_since(mongo_timer)
@@ -850,6 +1058,7 @@ async def load_all_market_data(
         "processed": processed,
         "dry_run": False,
         "mongo_writes": True,
+        "provider_calls": True,
         "mongo_write_mode": "bulk_write",
         "used_cache": False,
         "force_refresh": force_refresh,
@@ -881,6 +1090,79 @@ async def load_all_market_data(
     await save_last_load_speed_state(db, clean_index, response)
     await save_after_market_state(db, clean_index, market_session, response)
     return response
+
+
+@router.post("/scan-all")
+@router.post("/load-all")
+async def load_all_market_data(
+    index_name: str = Query(default="BROAD_MARKET_750"),
+    dry_run: str | bool = Query(default="true"),
+    force_refresh: bool = Query(default=False),
+    source_mode: str = Query(default="auto"),
+    refresh_history: bool = Query(default=False),
+    force_history_refresh: bool = Query(default=False),
+    operator_intent: str | None = Header(default=None, alias=OPERATOR_INTENT_HEADER),
+) -> dict:
+    dry_run_flag = dry_run_query(dry_run)
+    if not dry_run_flag:
+        require_operator_intent_value(operator_intent)
+    total_timer = perf_counter()
+    clean_index = index_name.strip().upper()
+    mode = clean_source_mode(source_mode)
+    market_session = get_market_session_status()
+    today_ist = market_session["date"]
+    universe = get_universe_result(clean_index)
+    planned_symbols = universe["symbols"]
+    started_at = utc_now_iso()
+    if dry_run_flag:
+        finished_at = utc_now_iso()
+        return {
+            "index_name": clean_index,
+            "universe_count": universe["count"],
+            "planned_count": len(planned_symbols),
+            "processed": 0,
+            "dry_run": True,
+            "mongo_writes": False,
+            "provider_calls": False,
+            "used_cache": False,
+            "force_refresh": force_refresh,
+            "refresh_history": refresh_history,
+            "force_history_refresh": force_history_refresh,
+            "source_mode": mode,
+            "market_session": market_session,
+            "source": universe["source"],
+            "error": universe["error"],
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "duration_seconds": 0,
+            "planned_symbols_sample": planned_symbols[:20],
+        }
+    db = get_database()
+    try:
+        return await run_with_pipeline_lock(
+            db,
+            operation="market_load_all",
+            requested_scope={"index_name": clean_index},
+            work=lambda lease: _load_all_market_data_real(
+                db,
+                clean_index=clean_index,
+                mode=mode,
+                market_session=market_session,
+                universe=universe,
+                planned_symbols=planned_symbols,
+                started_at=started_at,
+                total_timer=total_timer,
+                force_refresh=force_refresh,
+                refresh_history=refresh_history,
+                force_history_refresh=force_history_refresh,
+                today_ist=today_ist,
+                lease=lease,
+            ),
+        )
+    except (PipelineRunBusy, PipelineLockLost) as exc:
+        return pipeline_error_response(exc)
+    except Exception as exc:
+        return pipeline_error_response(exc)
 
 
 @router.get("/load-speed-status")
@@ -974,40 +1256,162 @@ async def load_all_market_batches(
     index_name: str = Query(default="BROAD_MARKET_750"),
     batch_size: int = Query(default=50, ge=1),
     max_batches: int = Query(default=3, ge=1),
-    dry_run: bool = Query(default=False),
+    dry_run: str | bool = Query(default="true"),
+    approved_plan_hash: str | None = Query(default=None),
+    operator_intent: str | None = Header(default=None, alias=OPERATOR_INTENT_HEADER),
 ) -> dict:
+    dry_run_flag = dry_run_query(dry_run)
+    if not dry_run_flag:
+        require_operator_intent_value(operator_intent)
     effective_batch_size = min(batch_size, 50)
     effective_max_batches = min(max_batches, 5)
     clean_index = index_name.strip().upper()
+
+    # Calculate deterministic plan hash based on symbols to be processed
     progress = await get_market_load_progress(clean_index)
     offset = progress["market_data_count"]
-    batches = []
+    universe = get_universe_result(clean_index)
+    planned_symbols_total = []
+    temp_offset = offset
     for _ in range(effective_max_batches):
-        batch = await load_market_index(clean_index, effective_batch_size, offset, dry_run)
-        batches.append(
-            {
-                "offset": batch["offset"],
-                "processed": batch.get("processed", batch.get("planned_count", 0)),
-                "next_offset": batch["next_offset"],
-                "has_more": batch["has_more"],
-                "upserted_count": batch.get("upserted_count", 0),
-                "modified_count": batch.get("modified_count", 0),
-                "fetch_failed": batch.get("fetch_failed", 0),
-                "complete_count": batch.get("complete_count", 0),
-            }
-        )
-        offset = batch["next_offset"]
-        if not batch["has_more"]:
+        planned_batch = universe["symbols"][temp_offset:temp_offset + effective_batch_size]
+        planned_symbols_total.extend(planned_batch)
+        temp_offset += len(planned_batch)
+        if temp_offset >= universe["count"]:
             break
-    return {
+
+    planned_canonical_symbols = [
+        (doc.get("canonical_symbol") or doc.get("symbol") or "").strip().upper()
+        for doc in planned_symbols_total
+        if doc.get("canonical_symbol") or doc.get("symbol")
+    ]
+    material = {
         "index_name": clean_index,
-        "batch_size": effective_batch_size,
         "max_batches": effective_max_batches,
-        "dry_run": dry_run,
-        "batches": batches,
-        "last_offset": offset,
-        "has_more": bool(batches and batches[-1]["has_more"]),
+        "batch_size": effective_batch_size,
+        "symbols": sorted(planned_canonical_symbols),
     }
+    serialized = json.dumps(material, sort_keys=True, separators=(",", ":"), default=str)
+    expected_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    if dry_run_flag:
+        progress = await get_market_load_progress(clean_index)
+        offset = progress["market_data_count"]
+        universe = get_universe_result(clean_index)
+        batches = []
+        for _ in range(effective_max_batches):
+            planned_symbols = universe["symbols"][offset:offset + effective_batch_size]
+            next_offset = offset + len(planned_symbols)
+            has_more = next_offset < universe["count"]
+            batches.append(
+                {
+                    "offset": offset,
+                    "processed": len(planned_symbols),
+                    "planned_count": len(planned_symbols),
+                    "next_offset": next_offset,
+                    "has_more": has_more,
+                    "upserted_count": 0,
+                    "modified_count": 0,
+                    "fetch_failed": 0,
+                    "complete_count": 0,
+                }
+            )
+            offset = next_offset
+            if not has_more:
+                break
+        return {
+            "index_name": clean_index,
+            "batch_size": effective_batch_size,
+            "max_batches": effective_max_batches,
+            "dry_run": True,
+            "mongo_writes": False,
+            "provider_calls": False,
+            "batches": batches,
+            "last_offset": offset,
+            "has_more": bool(batches and batches[-1]["has_more"]),
+            "plan_hash": expected_hash,
+        }
+
+    if not approved_plan_hash or approved_plan_hash != expected_hash:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Plan approval required. Explicitly confirm proposed batch load action by passing approved_plan_hash='{expected_hash}'."
+        )
+
+    async def work(lease):
+        progress = await get_market_load_progress(clean_index)
+        offset = progress["market_data_count"]
+        batches = []
+        for batch_number in range(effective_max_batches):
+            await lease.renew()
+            await lease.update_status(stage="loading_batch", processed_count=batch_number, total_count=effective_max_batches)
+            mode = clean_source_mode("auto")
+            market_session = get_market_session_status()
+            universe = get_universe_result(clean_index)
+            planned_symbols = universe["symbols"][offset:offset + effective_batch_size]
+            next_offset = offset + len(planned_symbols)
+            has_more = next_offset < universe["count"]
+            batch = await _load_market_index_real(
+                db,
+                clean_index=clean_index,
+                mode=mode,
+                market_session=market_session,
+                universe=universe,
+                planned_symbols=planned_symbols,
+                effective_limit=effective_batch_size,
+                requested_limit=batch_size,
+                offset=offset,
+                next_offset=next_offset,
+                has_more=has_more,
+                limit_warning="limit clamped to 50" if batch_size > 50 else None,
+                force_refresh=False,
+                lease=lease,
+            )
+            batches.append(
+                {
+                    "offset": batch.get("offset", offset),
+                    "processed": batch.get("processed", batch.get("planned_count", 0)),
+                    "next_offset": batch.get("next_offset", next_offset),
+                    "has_more": batch.get("has_more", has_more),
+                    "upserted_count": batch.get("upserted_count", 0),
+                    "modified_count": batch.get("modified_count", 0),
+                    "fetch_failed": batch.get("fetch_failed", 0),
+                    "complete_count": batch.get("complete_count", 0),
+                    "used_cache": batch.get("used_cache", False),
+                }
+            )
+            offset = batch.get("next_offset", next_offset)
+            if not batch.get("has_more", has_more):
+                break
+        return {
+            "index_name": clean_index,
+            "batch_size": effective_batch_size,
+            "max_batches": effective_max_batches,
+            "dry_run": False,
+            "mongo_writes": True,
+            "provider_calls": any(not batch.get("used_cache", False) for batch in batches),
+            "batches": batches,
+            "last_offset": offset,
+            "has_more": bool(batches and batches[-1]["has_more"]),
+            "processed": sum(batch.get("processed", 0) for batch in batches),
+        }
+
+    db = get_database()
+    try:
+        return await run_with_pipeline_lock(
+            db,
+            operation="market_load_all_batches",
+            requested_scope={
+                "index_name": clean_index,
+                "batch_size": effective_batch_size,
+                "max_batches": effective_max_batches,
+            },
+            work=work,
+        )
+    except (PipelineRunBusy, PipelineLockLost) as exc:
+        return pipeline_error_response(exc)
+    except Exception as exc:
+        return pipeline_error_response(exc)
 
 
 @router.get("/data")

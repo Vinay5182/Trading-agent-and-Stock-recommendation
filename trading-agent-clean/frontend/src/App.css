@@ -1171,3 +1171,103 @@ body {
   .paperCompactTable th,
   .paperCompactTable td { padding: 8px; }
 }
+
+.actionableWarning {
+  border: 1px solid rgba(220, 38, 38, 0.45);
+  border-radius: 8px;
+  background: rgba(220, 38, 38, 0.08);
+  color: #fca5a5;
+  padding: 16px;
+  margin-bottom: 20px;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+}
+.actionableWarning h3 {
+  margin: 0 0 8px;
+  color: #f87171;
+  font-size: 16px;
+  font-weight: 700;
+}
+.actionableWarning .warningMsg {
+  margin: 0 0 12px;
+  font-weight: bold;
+  font-size: 14px;
+}
+.tvDiagnosticInfo {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  background: rgba(0, 0, 0, 0.35);
+  padding: 12px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+.tvDiagnosticInfo div {
+  overflow-wrap: anywhere;
+}
+.actionableWarning .instruction {
+  margin: 0;
+  font-weight: 800;
+  color: #fca5a5;
+  font-size: 13px;
+}
+.tvDiagnosticInfo .errorText {
+  grid-column: 1 / -1;
+  color: #f87171;
+  font-family: monospace;
+  background: rgba(0, 0, 0, 0.2);
+  padding: 8px;
+  border-radius: 4px;
+  margin-top: 4px;
+}
+.tvDiagnosticReady {
+  border: 1px solid rgba(16, 185, 129, 0.45);
+  border-radius: 8px;
+  background: rgba(16, 185, 129, 0.08);
+  color: #a7f3d0;
+  padding: 16px;
+  margin-bottom: 20px;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+}
+.tvDiagnosticReady h3 {
+  margin: 0 0 8px;
+  color: #34d399;
+  font-size: 16px;
+  font-weight: 700;
+}
+.tvDiagnosticReady .tvReadyMsg {
+  margin: 0 0 12px;
+  font-weight: bold;
+  font-size: 14px;
+}
+.tvDiagnosticReadyInfo {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+  font-size: 13px;
+  background: rgba(0, 0, 0, 0.35);
+  padding: 12px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+.tvDiagnosticPending {
+  border: 1px solid rgba(251, 191, 36, 0.45);
+  border-radius: 8px;
+  background: rgba(251, 191, 36, 0.08);
+  color: #fde68a;
+  padding: 16px;
+  margin-bottom: 20px;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+}
+.tvDiagnosticPending h3 {
+  margin: 0 0 8px;
+  color: #fbbf24;
+  font-size: 16px;
+  font-weight: 700;
+}
+.tvDiagnosticPending .pendingMsg {
+  margin: 0 0 12px;
+  font-weight: bold;
+  font-size: 14px;
+}

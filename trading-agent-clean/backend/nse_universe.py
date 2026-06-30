@@ -3,7 +3,14 @@ import io
 import urllib.request
 from functools import lru_cache
 
-from data_provider import build_tradingview_symbol, is_valid_market_symbol, normalize_symbol
+from data_provider import (
+    PROVIDER_TIMEOUT_SECONDS,
+    build_tradingview_symbol,
+    is_valid_market_symbol,
+    normalize_symbol,
+    provider_error_text,
+    run_provider_call,
+)
 
 
 NSE_CSV = "NSE_CSV"
@@ -301,15 +308,18 @@ def fetch_nse_csv_symbols(index_name: str) -> tuple[list[str], str | None, int, 
                 },
             )
             try:
-                with urllib.request.urlopen(request, timeout=6) as response:
-                    text = response.read().decode("utf-8-sig", errors="ignore")
+                def read_csv():
+                    with urllib.request.urlopen(request, timeout=PROVIDER_TIMEOUT_SECONDS) as response:
+                        return response.read().decode("utf-8-sig", errors="ignore")
+
+                text = run_provider_call("NSE", "CSV_UNIVERSE", read_csv)
                 reader = csv.DictReader(io.StringIO(text))
                 raw_symbols = [row.get("Symbol") or row.get("symbol") or "" for row in reader]
                 symbols, invalid = clean_unique_symbols(raw_symbols)
                 if symbols:
                     return symbols, None, len(raw_symbols), invalid
             except Exception as exc:
-                errors.append(f"{url}: {exc}")
+                errors.append(f"{url}: {provider_error_text('NSE', 'CSV_UNIVERSE', exc)}")
     return [], "; ".join(errors) if errors else "no_csv_slug", 0, []
 
 

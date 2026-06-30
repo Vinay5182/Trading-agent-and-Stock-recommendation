@@ -8,6 +8,16 @@ from fastapi.testclient import TestClient
 
 from main import app
 from routes import paper
+from security.operator_intent import OPERATOR_INTENT_HEADER, OPERATOR_INTENT_VALUE
+
+
+OPERATOR_HEADERS = {OPERATOR_INTENT_HEADER: OPERATOR_INTENT_VALUE}
+
+
+def trusted_client() -> TestClient:
+    client = TestClient(app)
+    client.headers.update(OPERATOR_HEADERS)
+    return client
 
 
 def make_trade(
@@ -290,7 +300,7 @@ def test_real_mode_requires_approval_before_evaluation(monkeypatch) -> None:
         ],
     )
     monkeypatch.setattr(paper, "TradingViewClient", FakeTradingViewEntryClient)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.post("/api/paper/update-trades?dry_run=false&max_trades=6&max_writes=1")
 
@@ -310,7 +320,7 @@ def test_real_mode_requires_approval_before_evaluation(monkeypatch) -> None:
 def test_update_plans_real_mode_requires_approval(monkeypatch) -> None:
     collection = patch_paper_database(monkeypatch, [make_trade("WAIT1", "NOT_TRIGGERED", entry_triggered=False)])
     monkeypatch.setattr(paper, "TradingViewClient", FakeTradingViewEntryClient)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.post("/api/paper/update-plans?dry_run=false&max_trades=6&max_writes=1")
 

@@ -3,11 +3,18 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 import {
+  OPERATOR_INTENT_HEADER,
+  OPERATOR_INTENT_VALUE,
+  validateApiBase,
+  attachTradingViewTab,
+  detachTradingViewTab,
   getAiDataCollectionStatus,
   getAiFeatureDatasetSummary,
   getAiFeatureSnapshots,
   getAiOutcomePreview,
   getDashboardPaperEquity,
+  getHealth,
+  getMarketPipelineStatus,
   getPaperHistory,
   getPaperOpenTrades,
   getPaperSummary,
@@ -15,7 +22,14 @@ import {
   getSystemRuntimeInfo,
   getTradingViewRuntimeStatus,
   isRequestCancellation,
-  runScan,
+  loadAllMarketData,
+  momentumTvConfirm,
+  runPaperPipeline,
+  runScoring,
+  swingTvConfirm,
+  deriveTradingViewBusy,
+  tradingViewBadge,
+  isBatchReady,
 } from "./api.js";
 import { aiDataCollectionChecklist, aiOutcomeSkippedRows, aiSnapshotDisplayRows } from "./aiDataset.js";
 
@@ -76,19 +90,103 @@ test("scan helpers match active backend routes", async (t) => {
     return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true }) };
   };
 
-  await runScan();
   await getScanRows("scan-1");
   await getTradingViewRuntimeStatus();
 
-  assert.equal(calls[0].url, "http://127.0.0.1:8011/api/scan");
-  assert.equal(calls[0].options.method, "POST");
-  assert.deepEqual(JSON.parse(calls[0].options.body), {
-    selected_index: "DEFAULT_UNIVERSE",
-    limit: 50,
-    force_refresh: false,
+  assert.equal(calls[0].url, "http://127.0.0.1:8011/api/scan/rows?scan_run_id=scan-1");
+  assert.equal(calls[1].url, "http://127.0.0.1:8011/api/tv/runtime-status");
+});
+
+test("operator intent header is scoped to trusted mutating helpers", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  t.after(() => {
+    globalThis.fetch = originalFetch;
   });
-  assert.equal(calls[1].url, "http://127.0.0.1:8011/api/scan/rows?scan_run_id=scan-1");
-  assert.equal(calls[2].url, "http://127.0.0.1:8011/api/tv/runtime-status");
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url, options });
+    return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true }) };
+  };
+
+  await getHealth();
+  await getTradingViewRuntimeStatus();
+  await runScoring();
+  await loadAllMarketData(true);
+  await loadAllMarketData(false);
+  await runPaperPipeline({ dryRun: true });
+  await runPaperPipeline({ dryRun: false });
+  await swingTvConfirm({ save: false });
+  await swingTvConfirm({ save: true });
+  await momentumTvConfirm({ save: false });
+  await momentumTvConfirm({ save: true });
+  await attachTradingViewTab("chart-1");
+  await detachTradingViewTab();
+
+  const operatorHeader = (index) => calls[index].options.headers[OPERATOR_INTENT_HEADER];
+  assert.equal(operatorHeader(0), undefined);
+  assert.equal(operatorHeader(1), undefined);
+  assert.equal(operatorHeader(2), OPERATOR_INTENT_VALUE);
+  assert.equal(operatorHeader(3), undefined);
+  assert.equal(operatorHeader(4), OPERATOR_INTENT_VALUE);
+  assert.equal(operatorHeader(5), undefined);
+  assert.equal(operatorHeader(6), OPERATOR_INTENT_VALUE);
+  assert.equal(operatorHeader(7), undefined);
+  assert.equal(operatorHeader(8), OPERATOR_INTENT_VALUE);
+  assert.equal(operatorHeader(9), undefined);
+  assert.equal(operatorHeader(10), OPERATOR_INTENT_VALUE);
+  assert.equal(operatorHeader(11), OPERATOR_INTENT_VALUE);
+  assert.equal(operatorHeader(12), OPERATOR_INTENT_VALUE);
+  assert.equal(calls[2].url, "http://127.0.0.1:8011/api/score/run?index_name=BROAD_MARKET_750&dry_run=false");
+  assert.equal(calls[3].url, "http://127.0.0.1:8011/api/market/load-all?index_name=BROAD_MARKET_750&dry_run=true");
+  assert.equal(calls[4].url, "http://127.0.0.1:8011/api/market/load-all?index_name=BROAD_MARKET_750&dry_run=false");
+});
+
+test("market pipeline preview and status helpers stay read-only", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url, options });
+    return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true }) };
+  };
+
+  await loadAllMarketData();
+  await runScoring("BROAD_MARKET_750", true);
+  await getMarketPipelineStatus();
+
+  assert.equal(calls[0].url, "http://127.0.0.1:8011/api/market/load-all?index_name=BROAD_MARKET_750&dry_run=true");
+  assert.equal(calls[0].options.headers[OPERATOR_INTENT_HEADER], undefined);
+  assert.equal(calls[1].url, "http://127.0.0.1:8011/api/score/run?index_name=BROAD_MARKET_750&dry_run=true");
+  assert.equal(calls[1].options.headers[OPERATOR_INTENT_HEADER], undefined);
+  assert.equal(calls[2].url, "http://127.0.0.1:8011/api/market/pipeline-status");
+  assert.equal(calls[2].options.headers[OPERATOR_INTENT_HEADER], undefined);
+});
+
+test("operator intent wrapper preserves caller headers and fetch controls", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const controller = new AbortController();
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = async (url, options = {}) => {
+    assert.equal(url, "http://127.0.0.1:8011/api/tv/attach-tab?target_id=chart-1");
+    assert.equal(options.method, "POST");
+    assert.equal(options.timeoutMs, undefined);
+    assert.equal(options.operatorIntent, undefined);
+    assert.equal(options.headers[OPERATOR_INTENT_HEADER], OPERATOR_INTENT_VALUE);
+    assert.equal(options.headers["X-Caller-Trace"], "abc123");
+    assert.ok(options.signal instanceof AbortSignal);
+    assert.notEqual(options.signal, controller.signal);
+    return { ok: true, status: 200, text: async () => JSON.stringify({ attached: true }) };
+  };
+
+  await attachTradingViewTab("chart-1", {
+    timeoutMs: 5000,
+    signal: controller.signal,
+    headers: { "X-Caller-Trace": "abc123" },
+  });
 });
 
 test("request cancellation is typed and not a display error", async (t) => {
@@ -223,8 +321,8 @@ test("polling requests have overlap guards and abort cleanup", () => {
   assert.ok(source.includes("paperSafetyCycleRef.current"));
   assert.ok(source.includes("paperLiveAbortRef.current?.abort()"));
   assert.ok(source.includes("paperSafetyAbortRef.current?.abort()"));
-  assert.ok(source.includes("tvRuntimeCycleRef.current"));
-  assert.ok(source.includes("tvRuntimeAbortRef.current?.abort()"));
+  assert.ok(source.includes("tvPollAbortRef.current?.abort()"));
+  assert.ok(source.includes("tvActionAbortRef.current?.abort()"));
   assert.ok(source.includes("DASHBOARD_REFRESH_MS"));
   assert.ok(source.includes("BATCH_TV_RUNTIME_REFRESH_MS"));
   assert.ok(source.includes("GLOBAL_HEALTH_REFRESH_MS"));
@@ -238,18 +336,18 @@ test("dashboard renders virtual balance portfolio without manual refresh control
 
   assert.ok(source.includes("getDashboardPaperEquity"));
   assert.ok(source.includes("refreshDashboardSnapshot"));
-  assert.ok(dashboardSource.includes("Starting Balance"));
-  assert.ok(dashboardSource.includes("Current Virtual Balance"));
-  assert.ok(dashboardSource.includes("Open Margin Used"));
-  assert.ok(dashboardSource.includes("Available Margin"));
-  assert.ok(dashboardSource.includes("Maximum Buying Power"));
-  assert.ok(dashboardSource.includes("Effective Exposure"));
-  assert.ok(dashboardSource.includes("Broker Funded Amount"));
-  assert.ok(dashboardSource.includes("Buying Power Usage %"));
-  assert.ok(dashboardSource.includes("Realized P&L"));
+  assert.ok(dashboardSource.includes("Starting Virtual Capital"));
+  assert.ok(dashboardSource.includes("Settled Balance"));
+  assert.ok(dashboardSource.includes("Reserved Margin"));
+  assert.ok(dashboardSource.includes("Available Cash"));
   assert.ok(dashboardSource.includes("Unrealized P&L"));
-  assert.ok(dashboardSource.includes("Total P&L"));
-  assert.ok(dashboardSource.includes("Virtual Return %"));
+  assert.ok(dashboardSource.includes("Total Equity"));
+  assert.ok(dashboardSource.includes("Total Realized P&L"));
+  assert.ok(dashboardSource.includes("Effective Open Exposure"));
+  assert.ok(dashboardSource.includes("Broker Funded Exposure"));
+  assert.ok(dashboardSource.includes("Active/Partial Trade Count"));
+  assert.ok(dashboardSource.includes("Total Margin Released"));
+  assert.ok(dashboardSource.includes("Capital Returned From Latest Exits"));
   assert.ok(dashboardSource.includes("Drawdown"));
   assert.ok(dashboardSource.includes("Profit Factor"));
   assert.ok(dashboardSource.includes("Average RR"));
@@ -289,7 +387,7 @@ test("settings renders backend runtime identity", () => {
 
   assert.ok(source.includes("getSystemRuntimeInfo"));
   assert.ok(source.includes("systemRuntimeInfo"));
-  assert.ok(source.includes('if (activePage !== "Settings") return undefined;'));
+  assert.ok(source.includes('activePage !== "Settings"'));
   assert.ok(settingsSource.includes("Running Project Identity"));
   assert.ok(settingsSource.includes("project_root"));
   assert.ok(settingsSource.includes("backend_pid"));
@@ -553,4 +651,524 @@ test("AI dataset dashboard remains read-only without training or prediction acti
   assert.ok(summarySource.includes("This is a dry-run preview only. It does not attach labels or modify MongoDB."));
   assert.equal(/<ActionButton[^>]*>\s*(Train|Predict|Prediction|Recommend)/i.test(summarySource), false);
   assert.equal(/<ActionButton[^>]*>\s*(Attach|Write|Save|Collect)/i.test(summarySource), false);
+});
+
+test("TradingView busy status derivation and badge display rules", () => {
+  const idleStatus = { worker_running: false, queue_length: 0, active_operation: null, connected: true };
+  assert.equal(deriveTradingViewBusy(idleStatus), false);
+  assert.deepEqual(tradingViewBadge(idleStatus), { tone: "green", label: "TradingView Connected" });
+
+  const disconnectedIdleStatus = { worker_running: false, queue_length: 0, active_operation: null, connected: false };
+  assert.equal(deriveTradingViewBusy(disconnectedIdleStatus), false);
+  assert.deepEqual(tradingViewBadge(disconnectedIdleStatus), { tone: "gray", label: "TradingView Idle" });
+
+  const missingActiveOpStatus = { worker_running: false, queue_length: 0, connected: true };
+  assert.equal(deriveTradingViewBusy(missingActiveOpStatus), false);
+
+  const workerRunningStatus = { worker_running: true, queue_length: 0, active_operation: null, connected: true };
+  assert.equal(deriveTradingViewBusy(workerRunningStatus), true);
+  assert.deepEqual(tradingViewBadge(workerRunningStatus), { tone: "yellow", label: "TradingView Busy" });
+
+  const queueLengthStatus = { worker_running: false, queue_length: 2, active_operation: null, connected: true };
+  assert.equal(deriveTradingViewBusy(queueLengthStatus), true);
+
+  const activeOpStatus = { worker_running: false, queue_length: 0, active_operation: "confirm_swing", connected: true };
+  assert.equal(deriveTradingViewBusy(activeOpStatus), true);
+
+  const recoveringStatus = { worker_running: true, recovering_from_timeout: true, manager_available: false, last_error: "timed out", connected: false };
+  assert.equal(deriveTradingViewBusy(recoveringStatus), true);
+  assert.deepEqual(tradingViewBadge(recoveringStatus), { tone: "yellow", label: "TradingView Recovering" });
+
+  const errorStatus = { last_error: "connection lost", connected: true };
+  assert.deepEqual(tradingViewBadge(errorStatus), { tone: "red", label: "TradingView Error" });
+});
+
+test("TradingView batch readiness and freshness logic", () => {
+  const freshTime = Date.now() - 1000;
+  const readyStatus = { preflight_ready: true };
+  assert.equal(isBatchReady(readyStatus, freshTime), true);
+
+  const notReadyStatus = { preflight_ready: false };
+  assert.equal(isBatchReady(notReadyStatus, freshTime), false);
+
+  const staleTime = Date.now() - 11000;
+  assert.equal(isBatchReady(readyStatus, staleTime), false);
+  assert.equal(isBatchReady(readyStatus, null), false);
+});
+
+test("TradingView single-tab pending: frontend displays neutral pending state", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  // 1. singleTabPending logic exists and checks the right conditions
+  assert.ok(appSource.includes("const singleTabPending ="));
+  assert.ok(appSource.includes("status.cdp_reachable &&"));
+  assert.ok(appSource.includes("(status.valid_chart_target_count === 1) &&"));
+  assert.ok(appSource.includes("!status.attached_target_id &&"));
+  assert.ok(appSource.includes("!status.manual_attachment_required;"));
+
+  // 2. Pending state renders a distinct neutral panel, not the red warning
+  assert.ok(appSource.includes('className="tvDiagnosticPending"'));
+  assert.ok(appSource.includes("TradingView Chart Available"));
+  assert.ok(appSource.includes("One TradingView chart is available and will attach automatically when a TradingView operation runs."));
+  assert.ok(appSource.includes("Will attach on next operation"));
+
+  // 3. The CSS classes for pending state exist
+  const cssSource = readFileSync(new URL("./App.css", import.meta.url), "utf8");
+  assert.ok(cssSource.includes(".tvDiagnosticPending"));
+  assert.ok(cssSource.includes(".tvDiagnosticPending h3"));
+  assert.ok(cssSource.includes(".tvDiagnosticPending .pendingMsg"));
+});
+
+test("TradingView multi-tab: selection warning shown only for multiple valid tabs", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  // actionableWarning is the fallback that shows "Tab Selection / Attachment Required"
+  assert.ok(appSource.includes('className="actionableWarning"'));
+  assert.ok(appSource.includes("TradingView Tab Selection / Attachment Required"));
+
+  // manual_attachment_required drives whether the instruction says "select in Settings"
+  assert.ok(appSource.includes("status.manual_attachment_required"));
+  assert.ok(appSource.includes("Please go to the Settings tab, select an active TradingView chart, and click Attach."));
+});
+
+test("TradingView diagnostic component order: ready > pending > warning", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  // The component must check in this order:
+  // 1. preflight_ready === true => green (tvDiagnosticReady)
+  // 2. singleTabPending => yellow (tvDiagnosticPending)
+  // 3. fallthrough => red (actionableWarning)
+  const readyIdx = appSource.indexOf('className="tvDiagnosticReady"');
+  const pendingIdx = appSource.indexOf('className="tvDiagnosticPending"');
+  const warningIdx = appSource.indexOf('className="actionableWarning"');
+
+  assert.ok(readyIdx !== -1, "tvDiagnosticReady must exist");
+  assert.ok(pendingIdx !== -1, "tvDiagnosticPending must exist");
+  assert.ok(warningIdx !== -1, "actionableWarning must exist");
+  assert.ok(readyIdx < pendingIdx, "ready check must come before pending check");
+  assert.ok(pendingIdx < warningIdx, "pending check must come before warning fallthrough");
+});
+
+test("TradingView state synchronization, polling, and pre-batch check rules in App source code", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  assert.ok(appSource.includes("tvPollRequestRef.current"));
+  assert.ok(appSource.includes("tvActionRequestRef.current"));
+  assert.ok(appSource.includes("requestId === tvPollRequestRef.current"));
+  assert.ok(appSource.includes("requestId === tvActionRequestRef.current"));
+
+  assert.ok(appSource.includes("const cancelled = isRequestCancellation(err) || signal.aborted;"));
+
+  assert.ok(appSource.includes("tvPollTimeoutRef.current = window.setTimeout(poll, BATCH_TV_RUNTIME_REFRESH_MS);"));
+  assert.ok(appSource.includes("poll();"));
+  assert.ok(appSource.includes("window.clearTimeout(tvPollTimeoutRef.current);"));
+
+  assert.ok(appSource.includes("fetchAndSetTvRuntimeStatusAction({ manual: true, forceAbort: true })"));
+
+  assert.ok(appSource.includes("fetchAndSetTvAttachableTabs"));
+  const tabsStart = appSource.indexOf("const fetchAndSetTvAttachableTabs =");
+  const tabsEnd = appSource.indexOf("const act =", tabsStart);
+  const tabsSource = appSource.slice(tabsStart, tabsEnd);
+  assert.ok(tabsSource.includes("setTvAttachableTabs(tabs)"));
+
+  assert.ok(appSource.includes("const isTradingPage = activePage === \"Swing Trading\" || activePage === \"Momentum Trading\";"));
+
+  assert.ok(appSource.includes("tvTabsAbortRef.current?.abort()"));
+  assert.ok(appSource.includes("tvActionAbortRef.current?.abort()"));
+  assert.ok(appSource.includes("window.clearTimeout(tvPollTimeoutRef.current)"));
+
+  assert.ok(appSource.includes("disabled={loading || !isBatchReady(tvRuntimeStatus, tvRuntimeLastUpdatedAt) || deriveTradingViewBusy(tvRuntimeStatus)}"));
+
+  assert.ok(appSource.includes("className=\"tvDiagnosticReady\""));
+  assert.ok(appSource.includes("TradingView Ready / Connected"));
+
+  assert.ok(appSource.includes("tvRefreshStatus: () => act(\"refresh tv status\""));
+});
+
+test("page entry reads TV runtime status without discovering attachable tabs", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+  const effectStart = appSource.indexOf('if (activePage !== "Settings" && activePage !== "Swing Trading" && activePage !== "Momentum Trading") return undefined;');
+  const effectEnd = appSource.indexOf("}, [activePage]);", effectStart);
+  const effectSource = appSource.slice(effectStart, effectEnd);
+
+  assert.ok(effectSource.includes("fetchAndSetTvRuntimeStatusAction"));
+  assert.equal(effectSource.includes("fetchAndSetTvAttachableTabs"), false);
+
+  const refreshStatusStart = appSource.indexOf('tvRefreshStatus: () => act("refresh tv status"');
+  const refreshStatusEnd = appSource.indexOf('tvRefreshTabs: () => act("tv tabs"', refreshStatusStart);
+  const refreshStatusSource = appSource.slice(refreshStatusStart, refreshStatusEnd);
+  assert.ok(refreshStatusSource.includes("fetchAndSetTvRuntimeStatusAction"));
+  assert.equal(refreshStatusSource.includes("fetchAndSetTvAttachableTabs"), false);
+});
+
+test("explicit Refresh TV Tabs remains the only attachable-tab discovery path", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+  const refreshTabsStart = appSource.indexOf('tvRefreshTabs: () => act("tv tabs"');
+  const attachStart = appSource.indexOf('tvAttachTab:', refreshTabsStart);
+  const refreshTabsSource = appSource.slice(refreshTabsStart, attachStart);
+
+  assert.ok(refreshTabsSource.includes("fetchAndSetTvAttachableTabs({ manual: true })"));
+  assert.ok(refreshTabsSource.includes("fetchAndSetTvRuntimeStatusAction({ manual: true })"));
+});
+
+test("AI dataset dashboard load handles partial endpoint failure without console error", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  assert.ok(appSource.includes("const settledValue ="));
+  assert.ok(appSource.includes("const settledErrors ="));
+  assert.ok(appSource.includes("Promise.allSettled"));
+  assert.ok(appSource.includes('endpoint: "/api/ai/features/collection-status"'));
+  assert.equal(appSource.includes("AI dataset tracking load failed"), false);
+  assert.ok(appSource.includes("Some dataset panels could not refresh"));
+});
+
+test("Wave 3: Candidate Navigation and Polling Stability App rules", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  // 1. Swing candidate opens Stock Detail once with normalized identity
+  assert.ok(appSource.includes("function rowSearchSymbol(row)"));
+  assert.ok(appSource.includes("const exchange = String(row?.exchange || \"NSE\").trim().toUpperCase();"));
+  assert.ok(appSource.includes("return `${exchange}:${symbol}`;"));
+  assert.ok(appSource.includes("const openStockDetail = (row) => {"));
+  assert.ok(appSource.includes("const nextSearch = rowSearchSymbol(row);"));
+
+  // 2. Invalid candidates do not request APIs
+  assert.ok(appSource.includes("if (!raw || raw === \"-\" || raw === \"UNDEFINED\" || raw === \"NULL\")"));
+  assert.ok(appSource.includes("if (activePage !== \"Stock Detail\" || !searched.symbol)"));
+
+  // 3. One Dashboard endpoint failure does not discard other successful results
+  assert.ok(appSource.includes("const refreshDashboardSnapshot = async"));
+  assert.ok(appSource.includes("await Promise.allSettled(["));
+  assert.ok(appSource.includes("if (equity.status === \"fulfilled\") setDashboardEquity(equity.value);"));
+  assert.ok(appSource.includes("if (paperSummary.status === \"fulfilled\") setSummary(paperSummary.value);"));
+  assert.ok(appSource.includes("Some dashboard panels could not refresh"));
+
+  // 4. Abort/unmount causes no stale state update
+  assert.ok(appSource.includes("controller.abort();"));
+  assert.ok(appSource.includes("dashboardRefreshAbortRef.current?.abort();"));
+  assert.ok(appSource.includes("tvActionAbortRef.current?.abort();"));
+  assert.ok(appSource.includes("tvPollAbortRef.current?.abort();"));
+  assert.ok(appSource.includes("tvTabsAbortRef.current?.abort();"));
+  assert.ok(appSource.includes("stockDetailAbortRef.current?.abort();"));
+});
+
+test("TradingView batch confirm behavior and channel separation", async (t) => {
+  let loadingState = "";
+  let errorState = "";
+  let noticeState = "";
+  let tvRuntimeStatus = null;
+  let tvRuntimeLastUpdatedAt = null;
+  let tvRuntimeRefreshError = null;
+  let tvRuntimeLoading = false;
+
+  const tvActionInProgressRef = { current: false };
+  const tvPollRequestRef = { current: 0 };
+  const tvPollAbortRef = { current: null };
+  const tvActionRequestRef = { current: 0 };
+  const tvActionAbortRef = { current: null };
+  const tvPollTimeoutRef = { current: null };
+
+  const fetchCalls = [];
+  let shouldPreflightBeReady = true;
+
+  const mockGetTradingViewRuntimeStatus = async (options = {}) => {
+    fetchCalls.push({ type: "runtime-status", options });
+    if (options.signal?.aborted) {
+      const err = new Error("Request cancelled.");
+      err.name = "AbortError";
+      throw err;
+    }
+    return {
+      preflight_ready: shouldPreflightBeReady,
+      preflight_message: "Not ready",
+      worker_running: false,
+      queue_length: 0,
+      active_operation: null,
+      connected: true,
+    };
+  };
+
+  const mockSwingTvConfirm = async (options = {}) => {
+    fetchCalls.push({ type: "swing-tv-confirm", options });
+    return { processed: 1 };
+  };
+
+  const mockMomentumTvConfirm = async (options = {}) => {
+    fetchCalls.push({ type: "momentum-tv-confirm", options });
+    return { processed: 1 };
+  };
+
+  const fetchAndSetTvRuntimeStatusPoll = async (options = {}) => {
+    if (tvActionInProgressRef.current) return null;
+    const requestId = tvPollRequestRef.current + 1;
+    tvPollRequestRef.current = requestId;
+    const controller = new AbortController();
+    if (!options.signal) {
+      tvPollAbortRef.current = controller;
+    }
+    const signal = options.signal || controller.signal;
+    try {
+      const status = await mockGetTradingViewRuntimeStatus({ ...options, signal });
+      if (requestId === tvPollRequestRef.current && !tvActionInProgressRef.current) {
+        tvRuntimeStatus = status;
+        tvRuntimeLastUpdatedAt = Date.now();
+        tvRuntimeRefreshError = null;
+      }
+      return status;
+    } catch (err) {
+      const cancelled = err.name === "AbortError" || signal.aborted;
+      if (requestId === tvPollRequestRef.current && !tvActionInProgressRef.current) {
+        if (!cancelled) {
+          tvRuntimeRefreshError = err.message || String(err);
+        }
+      }
+      throw err;
+    } finally {
+      if (tvPollAbortRef.current === controller) {
+        tvPollAbortRef.current = null;
+      }
+    }
+  };
+
+  const fetchAndSetTvRuntimeStatusAction = async (options = {}) => {
+    const requestId = tvActionRequestRef.current + 1;
+    tvActionRequestRef.current = requestId;
+    if (options.manual === true || options.forceAbort === true) {
+      tvActionAbortRef.current?.abort();
+    }
+    const controller = new AbortController();
+    if (!options.signal) {
+      tvActionAbortRef.current = controller;
+    }
+    const signal = options.signal || controller.signal;
+    tvRuntimeLoading = true;
+    try {
+      const status = await mockGetTradingViewRuntimeStatus({ ...options, signal });
+      if (requestId === tvActionRequestRef.current) {
+        tvRuntimeStatus = status;
+        tvRuntimeLastUpdatedAt = Date.now();
+        tvRuntimeRefreshError = null;
+        tvRuntimeLoading = false;
+      }
+      return status;
+    } catch (err) {
+      const cancelled = err.name === "AbortError" || signal.aborted;
+      if (requestId === tvActionRequestRef.current) {
+        tvRuntimeLoading = false;
+        if (!cancelled) {
+          tvRuntimeRefreshError = err.message || String(err);
+        }
+      }
+      throw err;
+    } finally {
+      if (tvActionAbortRef.current === controller) {
+        tvActionAbortRef.current = null;
+      }
+    }
+  };
+
+  const act = async (name, fn) => {
+    loadingState = name;
+    errorState = "";
+    noticeState = "";
+    try {
+      const data = await fn();
+      return data;
+    } catch (err) {
+      if (err.name === "AbortError") return null;
+      errorState = err.message || String(err);
+      throw err;
+    } finally {
+      loadingState = "";
+    }
+  };
+
+  let pollCancelled = false;
+  const pollLoop = async () => {
+    if (pollCancelled) return;
+    if (tvActionInProgressRef.current) {
+      tvPollTimeoutRef.current = setTimeout(pollLoop, 10);
+      return;
+    }
+    try {
+      await fetchAndSetTvRuntimeStatusPoll();
+    } catch (err) {
+      // Check that cancelled poll does not set tvRuntimeRefreshError
+      if (err.name === "AbortError") {
+        assert.equal(tvRuntimeRefreshError, null);
+      }
+    } finally {
+      if (!pollCancelled) {
+        tvPollTimeoutRef.current = setTimeout(pollLoop, 10);
+      }
+    }
+  };
+
+  // Start background poll
+  pollLoop();
+
+  // Wait for a poll to run
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  assert.ok(fetchCalls.length > 0);
+
+  // Trigger Swing batch Action
+  const swingAction = async () => {
+    tvActionInProgressRef.current = true;
+    if (tvPollTimeoutRef.current) {
+      clearTimeout(tvPollTimeoutRef.current);
+      tvPollTimeoutRef.current = null;
+    }
+    // Abort ongoing poll
+    tvPollAbortRef.current?.abort();
+
+    try {
+      const status = await fetchAndSetTvRuntimeStatusAction({ manual: true, forceAbort: true });
+      if (!status || status.preflight_ready !== true) {
+        throw new Error(status?.preflight_message || "Not ready");
+      }
+      await mockSwingTvConfirm();
+      await fetchAndSetTvRuntimeStatusAction({ manual: true });
+      return { ok: true };
+    } finally {
+      tvActionInProgressRef.current = false;
+    }
+  };
+
+  fetchCalls.length = 0;
+  await act("swing batch tv confirm", swingAction);
+
+  // Verification 1: clicking Swing Run sends one fresh runtime GET, one Swing POST, then post-batch GET
+  assert.equal(fetchCalls[0].type, "runtime-status");
+  assert.equal(fetchCalls[1].type, "swing-tv-confirm");
+  assert.equal(fetchCalls[2].type, "runtime-status");
+
+  // Verification 2: polling cannot cancel or supersede pre-batch validation
+  // and polling pauses during batch, resumes after success
+  assert.equal(tvActionInProgressRef.current, false);
+
+  // Trigger Momentum batch Action
+  const momentumAction = async () => {
+    tvActionInProgressRef.current = true;
+    if (tvPollTimeoutRef.current) {
+      clearTimeout(tvPollTimeoutRef.current);
+      tvPollTimeoutRef.current = null;
+    }
+    tvPollAbortRef.current?.abort();
+
+    try {
+      const status = await fetchAndSetTvRuntimeStatusAction({ manual: true, forceAbort: true });
+      if (!status || status.preflight_ready !== true) {
+        throw new Error(status?.preflight_message || "Not ready");
+      }
+      await mockMomentumTvConfirm();
+      await fetchAndSetTvRuntimeStatusAction({ manual: true });
+      return { ok: true };
+    } finally {
+      tvActionInProgressRef.current = false;
+    }
+  };
+
+  fetchCalls.length = 0;
+  await act("momentum batch tv confirm", momentumAction);
+
+  // Verification 3: clicking Momentum Run sends one fresh runtime GET, one Momentum POST, then post-batch GET
+  assert.equal(fetchCalls[0].type, "runtime-status");
+  assert.equal(fetchCalls[1].type, "momentum-tv-confirm");
+  assert.equal(fetchCalls[2].type, "runtime-status");
+
+  // Verification 4: no POST is sent when genuinely fresh preflight response is not ready
+  shouldPreflightBeReady = false;
+  fetchCalls.length = 0;
+  await assert.rejects(act("swing batch tv confirm", swingAction), /Not ready/);
+  assert.equal(fetchCalls.length, 1);
+  assert.equal(fetchCalls[0].type, "runtime-status"); // only preflight check, no post!
+
+  // Cleanup polling timer
+  pollCancelled = true;
+  if (tvPollTimeoutRef.current) {
+    clearTimeout(tvPollTimeoutRef.current);
+  }
+});
+
+test("invalid configuration throws errors", () => {
+  assert.equal(validateApiBase(""), "http://127.0.0.1:8011");
+  assert.equal(validateApiBase("/api"), "/api");
+  assert.equal(validateApiBase("http://localhost:3000"), "http://localhost:3000");
+  assert.equal(validateApiBase("https://my-backend.com"), "https://my-backend.com");
+
+  assert.throws(() => validateApiBase("ftp://foo"), /protocols are supported/);
+  assert.throws(() => validateApiBase("invalid_url_without_protocol"), /Invalid API base configuration/);
+});
+
+test("oversized response body is rejected safely", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  // 1. Mock fetch with large Content-Length header
+  globalThis.fetch = async () => {
+    return {
+      ok: true,
+      headers: new Map([["Content-Length", "3000000"]]), // 3MB
+      text: async () => "x".repeat(3000000)
+    };
+  };
+
+  await assert.rejects(getHealth(), /limit exceeded/);
+
+  // 2. Mock fetch with chunked reader exceeding limit
+  globalThis.fetch = async () => {
+    return {
+      ok: true,
+      headers: new Map(),
+      body: {
+        getReader: () => {
+          let count = 0;
+          return {
+            read: async () => {
+              count++;
+              if (count > 3) return { done: true };
+              return { done: false, value: new Uint8Array(1000000) }; // 1MB chunk
+            },
+            cancel: () => {}
+          };
+        }
+      }
+    };
+  };
+
+  await assert.rejects(getHealth(), /limit exceeded/);
+});
+
+test("error sanitization redacts paths, IPs, MongoDB URIs and raw HTML", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+  assert.ok(appSource.includes("sanitizeErrorMessage"));
+  assert.ok(appSource.includes("[RAW_HTML_RESPONSE]"));
+  assert.ok(appSource.includes("[PATH]"));
+  assert.ok(appSource.includes("[IP]"));
+  assert.ok(appSource.includes("[MONGO_URI]"));
+  assert.ok(appSource.includes("[REDACTED]"));
+  assert.ok(appSource.includes("[TRUNCATED]"));
+});
+
+test("Settings page unmount cleans up page-scoped abort controllers", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+  const settingsEffectIndex = appSource.indexOf('activePage !== "Settings" && activePage !== "Swing Trading" && activePage !== "Momentum Trading"');
+  assert.ok(settingsEffectIndex !== -1);
+  const chunk = appSource.slice(settingsEffectIndex, settingsEffectIndex + 800);
+  assert.ok(chunk.includes("tvTabsAbortRef.current?.abort()"));
+  assert.ok(chunk.includes("tvActionAbortRef.current?.abort()"));
+});
+
+test("Stock Detail row-open passes exact-row identity and normalizes exchange symbol", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+  assert.ok(appSource.includes("function rowSearchSymbol(row)"));
+  assert.ok(appSource.includes("const exchange = String(row?.exchange || \"NSE\").trim().toUpperCase();"));
+  assert.ok(appSource.includes("return `${exchange}:${symbol}`;"));
+});
+
+test("request cancellation does not display as error", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+  assert.ok(appSource.includes("if (isRequestCancellation(err)) return \"\";"));
 });

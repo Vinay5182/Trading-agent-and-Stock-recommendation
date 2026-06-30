@@ -12,6 +12,16 @@ from fastapi.testclient import TestClient
 from ai.features import OUTCOME_FIELDS
 from main import app
 from routes import ai as ai_routes
+from security.operator_intent import OPERATOR_INTENT_HEADER, OPERATOR_INTENT_VALUE
+
+
+OPERATOR_HEADERS = {OPERATOR_INTENT_HEADER: OPERATOR_INTENT_VALUE}
+
+
+def trusted_client() -> TestClient:
+    client = TestClient(app)
+    client.headers.update(OPERATOR_HEADERS)
+    return client
 
 
 def matches_query(row: dict, query: dict | None) -> bool:
@@ -162,7 +172,7 @@ def assert_paper_trades_unchanged(db: FakeDB) -> None:
 
 def test_attach_outcomes_defaults_to_dry_run_and_writes_nothing(monkeypatch) -> None:
     db = patch_database(monkeypatch, [make_snapshot()], [make_trade()])
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.post("/api/ai/features/attach-outcomes?limit=50")
 
@@ -179,7 +189,7 @@ def test_attach_outcomes_defaults_to_dry_run_and_writes_nothing(monkeypatch) -> 
 
 def test_attach_outcomes_real_mode_updates_only_snapshot(monkeypatch) -> None:
     db = patch_database(monkeypatch, [make_snapshot()], [make_trade()])
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.post("/api/ai/features/attach-outcomes?dry_run=false&limit=50")
 
@@ -209,7 +219,7 @@ def test_attach_outcomes_real_mode_updates_only_snapshot(monkeypatch) -> None:
 @pytest.mark.parametrize("status", ["NOT_TRIGGERED", "ACTIVE", "TARGET_1_HIT"])
 def test_attach_outcomes_skips_open_trade(monkeypatch, status: str) -> None:
     db = patch_database(monkeypatch, [make_snapshot()], [make_trade(status, paper_pnl=None)])
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.post("/api/ai/features/attach-outcomes?dry_run=false")
 
@@ -223,7 +233,7 @@ def test_attach_outcomes_skips_open_trade(monkeypatch, status: str) -> None:
 
 def test_attach_outcomes_skips_missing_paper_trade(monkeypatch) -> None:
     db = patch_database(monkeypatch, [make_snapshot()], [])
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.post("/api/ai/features/attach-outcomes?dry_run=false")
 
@@ -235,7 +245,7 @@ def test_attach_outcomes_skips_missing_paper_trade(monkeypatch) -> None:
 
 def test_attach_outcomes_skips_already_labeled_snapshot(monkeypatch) -> None:
     db = patch_database(monkeypatch, [make_snapshot(result_label="WIN")], [make_trade()])
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.post("/api/ai/features/attach-outcomes?dry_run=false")
 
@@ -259,7 +269,7 @@ def test_outcome_preview_is_read_only_and_reports_eligible_and_skipped_rows(monk
         make_trade(_id="trade-open", status="NOT_TRIGGERED", paper_pnl=None),
     ]
     db = patch_database(monkeypatch, snapshots, trades)
-    client = TestClient(app)
+    client = trusted_client()
 
     response = client.get("/api/ai/features/outcome-preview?limit=50")
 
@@ -276,11 +286,16 @@ def test_outcome_preview_is_read_only_and_reports_eligible_and_skipped_rows(monk
     assert payload["eligible_snapshots"] == [
         {
             "symbol": "ELIGIBLE",
+            "strategy_type": None,
+            "timeframe": None,
             "linked_paper_trade_status": "TARGET_2_HIT",
             "proposed_result_label": "WIN",
             "proposed_outcome_status": "TARGET_2_HIT",
         }
     ]
+    for row in payload["skipped_snapshots"]:
+        assert "strategy_type" in row
+        assert "timeframe" in row
     assert {row["symbol"]: row["reason"] for row in payload["skipped_snapshots"]} == {
         "ATHERENERG": "already_labeled",
         "IGIL": "open_paper_trade",

@@ -1,31 +1,22 @@
 import asyncio
-import json
 import logging
 from typing import Any
 from datetime import datetime
-from urllib.parse import quote
-from urllib.request import Request, build_opener
 from uuid import uuid4
 
-from fastapi import APIRouter, Query
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Header, Query
+from pydantic import BaseModel, Field, StrictBool
 
 from database import get_database
-from services.mongo_indexes import ensure_active_indexes
+from nse_client import fetch_broad_market_nse_quotes as fetch_broad_market_nse_batch
+from nse_client import fetch_nse_index_quotes
+from security.operator_intent import OPERATOR_INTENT_HEADER, require_operator_intent_value
+from services.mongo_indexes import get_collection_index_specs
+from services.pipeline_run_lock import PipelineLockLost, PipelineRunBusy, pipeline_error_response, run_with_pipeline_lock
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-BROAD_MARKET_NSE_INDEXES = [
-    "NIFTY 50",
-    "NIFTY NEXT 50",
-    "NIFTY MIDCAP 150",
-    "NIFTY SMALLCAP 250",
-    "NIFTY MICROCAP 250",
-]
-
-NSE_INDEX_API = "https://www.nseindia.com/api/equity-stockIndices?index={index}"
-NSE_HOME = "https://www.nseindia.com/"
 NSE_PRIMARY_FIELDS = {
     "current_price",
     "ltp",
@@ -47,17 +38,25 @@ class ScanRequest(BaseModel):
     selected_index: str = Field(default="DEFAULT_UNIVERSE")
     limit: int = Field(default=50, ge=1, le=1000)
     force_refresh: bool = False
+    dry_run: StrictBool = True
 
 
 class ScanResponse(BaseModel):
-    scan_run_id: str
+    run_id: str | None = None
+    operation: str | None = None
+    lock_ownership_status: str | None = None
+    lock_name: str | None = None
+    scan_run_id: str | None = None
     selected_index: str
     requested_limit: int
-    rows_count: int
-    inserted_count: int
-    modified_count: int
-    diagnostics: dict[str, Any]
-    rows: list[dict[str, Any]]
+    rows_count: int = 0
+    inserted_count: int = 0
+    modified_count: int = 0
+    diagnostics: dict[str, Any] = {}
+    rows: list[dict[str, Any]] = []
+    dry_run: bool = True
+    mongo_writes: bool = False
+    provider_calls: bool = False
 
 
 def normalize_symbol(symbol: str | None) -> str:
@@ -70,105 +69,48 @@ def normalize_symbol(symbol: str | None) -> str:
     return "".join(ch for ch in normalized if ch.isalnum())
 
 
-def _number(value: Any) -> float | int | None:
-    if value in (None, "", "-", "NA", "N/A"):
-        return None
-    if isinstance(value, (int, float)):
-        return value
-    try:
-        return float(str(value).replace(",", "").strip())
-    except ValueError:
-        return None
-
-
-def _nse_request_json(url: str) -> dict[str, Any]:
-    opener = build_opener()
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json,text/plain,*/*",
-        "Referer": NSE_HOME,
+def _scan_quote_from_provider_quote(quote_row: dict[str, Any]) -> dict[str, Any]:
+    symbol = normalize_symbol(quote_row.get("canonical_symbol") or quote_row.get("symbol"))
+    row = {
+        "symbol": symbol,
+        "current_price": quote_row.get("current_price"),
+        "ltp": quote_row.get("current_price"),
+        "previous_close": quote_row.get("previous_close"),
+        "open_price": quote_row.get("open_price"),
+        "day_high": quote_row.get("day_high"),
+        "day_low": quote_row.get("day_low"),
+        "change_percent": quote_row.get("change_percent"),
+        "traded_volume": quote_row.get("traded_volume"),
+        "traded_value": quote_row.get("traded_value"),
+        "primary_source": quote_row.get("primary_source") or "NSE_COMPONENT_INDEX",
+        "provider_timestamp": quote_row.get("provider_timestamp"),
     }
-    opener.open(Request(NSE_HOME, headers=headers), timeout=10).read()
-    response = opener.open(Request(url, headers=headers), timeout=15)
-    return json.loads(response.read().decode("utf-8"))
-
-
-def _usable_nse_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    rows = payload.get("data") or payload.get("stocks") or []
-    usable = []
-    for row in rows:
-        source = row.get("metadata") if isinstance(row.get("metadata"), dict) else row
-        symbol = normalize_symbol(source.get("symbol") or row.get("symbol"))
-        if not symbol:
-            continue
-        quote = {
-            "symbol": symbol,
-            "current_price": _number(source.get("lastPrice") or source.get("ltp")),
-            "ltp": _number(source.get("lastPrice") or source.get("ltp")),
-            "previous_close": _number(source.get("previousClose")),
-            "open_price": _number(source.get("open")),
-            "day_high": _number(source.get("dayHigh") or source.get("high")),
-            "day_low": _number(source.get("dayLow") or source.get("low")),
-            "change_percent": _number(source.get("pChange") or source.get("changePercent")),
-            "traded_volume": _number(source.get("totalTradedVolume")),
-            "traded_value": _number(source.get("totalTradedValue")),
-            "primary_source": "NSE_COMPONENT_INDEX",
-        }
-        usable.append({key: value for key, value in quote.items() if value is not None})
-    return usable
+    return {key: value for key, value in row.items() if value is not None}
 
 
 def fetch_nse_component_index_quotes(index_name: str) -> dict[str, dict[str, Any]]:
-    encoded_index = quote(index_name, safe="")
-    payload = _nse_request_json(NSE_INDEX_API.format(index=encoded_index))
-    rows = _usable_nse_rows(payload)
+    batch = fetch_nse_index_quotes(index_name)
+    rows = {
+        symbol: _scan_quote_from_provider_quote(quote_row)
+        for symbol, quote_row in batch.quote_map.items()
+    }
     logger.info("NSE index %s returned: %s", index_name, len(rows))
-    return {row["symbol"]: row for row in rows}
+    return rows
 
 
 def fetch_broad_market_nse_quotes() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
-    diagnostics: dict[str, Any] = {
-        "nse_total_market_rows": 0,
-        "nse_component_rows_total": 0,
+    batch = fetch_broad_market_nse_batch()
+    merged = {
+        symbol: _scan_quote_from_provider_quote(quote_row)
+        for symbol, quote_row in batch.quote_map.items()
+    }
+    diagnostics = batch.diagnostics or {
+        "nse_total_market_rows": len(merged),
+        "nse_component_rows_total": len(merged),
         "nse_component_rows_by_index": {},
     }
-    merged: dict[str, dict[str, Any]] = {}
-
-    try:
-        total_payload = _nse_request_json(
-            NSE_INDEX_API.format(index=quote("NIFTY TOTAL MARKET", safe=""))
-        )
-        total_rows = _usable_nse_rows(total_payload)
-        diagnostics["nse_total_market_rows"] = len(total_rows)
-        for row in total_rows:
-            row["primary_source"] = "NSE_TOTAL_MARKET"
-            merged[row["symbol"]] = row
-    except Exception:
-        logger.exception("BROAD_MARKET_750 NIFTY TOTAL MARKET fetch failed")
-
-    logger.info(
-        "BROAD_MARKET_750 NSE total market rows: %s",
-        diagnostics["nse_total_market_rows"],
-    )
-    if diagnostics["nse_total_market_rows"] == 0:
-        logger.warning("NIFTY_TOTAL_MARKET_EMPTY")
-
-    for index_name in BROAD_MARKET_NSE_INDEXES:
-        try:
-            quotes = fetch_nse_component_index_quotes(index_name)
-        except Exception:
-            logger.exception("NSE index %s fetch failed", index_name)
-            quotes = {}
-        diagnostics["nse_component_rows_by_index"][index_name] = len(quotes)
-        diagnostics["nse_component_rows_total"] += len(quotes)
-        for symbol, quote_row in quotes.items():
-            merged.setdefault(symbol, quote_row)
-
-    logger.info(
-        "BROAD_MARKET_750 NSE component rows: %s",
-        diagnostics["nse_component_rows_total"],
-    )
-    if diagnostics["nse_component_rows_total"] == 0:
+    logger.info("BROAD_MARKET_750 NSE rows: %s", len(merged))
+    if not merged:
         logger.warning("NSE_COMPONENTS_EMPTY_YFINANCE_FULL_FALLBACK")
     return merged, diagnostics
 
@@ -239,27 +181,35 @@ def scan_row_from_quote(symbol: str, quote_row: dict[str, Any], scan_run_id: str
     return row
 
 
-async def ensure_scan_indexes(db) -> None:
-    await ensure_active_indexes(db)
+async def ensure_scan_indexes(db) -> dict:
+    return {
+        "startup_owned": [
+            spec.as_dict()
+            for collection_name in ("scan_runs", "scan_rows")
+            for spec in get_collection_index_specs(collection_name)
+        ]
+    }
 
 
-@router.post("", response_model=ScanResponse)
-@router.post("/", response_model=ScanResponse)
-async def run_scan(request: ScanRequest) -> dict:
-    db = get_database()
+async def _run_scan_real(db, request: ScanRequest, selected_index: str, lease=None) -> dict:
     await ensure_scan_indexes(db)
-    selected_index = clean_index_name(request.selected_index)
     now = datetime.utcnow().isoformat()
     scan_run_id = f"scan-{uuid4().hex}"
+    if lease is not None:
+        await lease.update_status(stage="fetching_quotes", processed_count=0, total_count=request.limit)
     if selected_index == "BROAD_MARKET_750":
         quotes, diagnostics = await asyncio.to_thread(fetch_broad_market_nse_quotes)
     else:
         quotes = await asyncio.to_thread(fetch_nse_component_index_quotes, selected_index)
         diagnostics = {"nse_component_rows_by_index": {selected_index: len(quotes)}, "nse_component_rows_total": len(quotes)}
+    if lease is not None:
+        await lease.renew()
     rows = [
         scan_row_from_quote(symbol, quote, scan_run_id, selected_index, now)
         for symbol, quote in list(quotes.items())[: request.limit]
     ]
+    if lease is not None:
+        await lease.update_status(stage="writing_scan_rows", processed_count=0, total_count=len(rows))
     result = None
     if rows:
         from pymongo import UpdateOne
@@ -275,6 +225,8 @@ async def run_scan(request: ScanRequest) -> dict:
             ],
             ordered=False,
         )
+    if lease is not None:
+        await lease.renew()
     await db.scan_runs.update_one(
         {"scan_run_id": scan_run_id},
         {
@@ -300,7 +252,46 @@ async def run_scan(request: ScanRequest) -> dict:
         "modified_count": int(getattr(result, "modified_count", 0) or 0),
         "diagnostics": diagnostics,
         "rows": rows,
+        "dry_run": False,
+        "mongo_writes": True,
+        "provider_calls": True,
     }
+
+
+@router.post("", response_model=ScanResponse)
+@router.post("/", response_model=ScanResponse)
+async def run_scan(
+    request: ScanRequest,
+    operator_intent: str | None = Header(default=None, alias=OPERATOR_INTENT_HEADER),
+) -> dict:
+    selected_index = clean_index_name(request.selected_index)
+    if request.dry_run:
+        return {
+            "scan_run_id": None,
+            "selected_index": selected_index,
+            "requested_limit": request.limit,
+            "rows_count": 0,
+            "inserted_count": 0,
+            "modified_count": 0,
+            "diagnostics": {"preview_only": True},
+            "rows": [],
+            "dry_run": True,
+            "mongo_writes": False,
+            "provider_calls": False,
+        }
+    require_operator_intent_value(operator_intent)
+    db = get_database()
+    try:
+        return await run_with_pipeline_lock(
+            db,
+            operation="scan_run",
+            requested_scope={"selected_index": selected_index, "limit": request.limit},
+            work=lambda lease: _run_scan_real(db, request, selected_index, lease),
+        )
+    except (PipelineRunBusy, PipelineLockLost) as exc:
+        return pipeline_error_response(exc)
+    except Exception as exc:
+        return pipeline_error_response(exc)
 
 
 @router.get("/rows")

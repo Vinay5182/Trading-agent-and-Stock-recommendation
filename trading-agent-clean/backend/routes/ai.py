@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from bson import ObjectId
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query
 from pymongo.errors import DuplicateKeyError
 
 from ai.features import (
@@ -18,6 +18,8 @@ from ai.features import (
     utc_now_iso,
 )
 from database import get_database
+from security.operator_intent import OPERATOR_INTENT_HEADER, require_operator_intent_value
+from services.mongo_indexes import get_collection_index_specs
 
 
 router = APIRouter()
@@ -448,18 +450,30 @@ async def _scan_outcome_attach_candidates(db, limit: int) -> dict:
     for snapshot in snapshots:
         if snapshot.get("_id") is None:
             skipped["missing_snapshot_id"] += 1
-            skipped_rows.append({"symbol": snapshot.get("symbol"), "reason": "missing_snapshot_id"})
+            skipped_rows.append({
+                "symbol": snapshot.get("symbol"),
+                "strategy_type": snapshot.get("strategy_type"),
+                "timeframe": snapshot.get("timeframe"),
+                "reason": "missing_snapshot_id"
+            })
             continue
         paper_trade_id = snapshot.get("paper_trade_id")
         if paper_trade_id in (None, ""):
             skipped["missing_paper_trade_id"] += 1
-            skipped_rows.append({"symbol": snapshot.get("symbol"), "reason": "missing_paper_trade_id"})
+            skipped_rows.append({
+                "symbol": snapshot.get("symbol"),
+                "strategy_type": snapshot.get("strategy_type"),
+                "timeframe": snapshot.get("timeframe"),
+                "reason": "missing_paper_trade_id"
+            })
             continue
         if not snapshot_has_no_attached_outcome(snapshot):
             skipped["already_labeled"] += 1
             skipped_rows.append(
                 {
                     "symbol": snapshot.get("symbol"),
+                    "strategy_type": snapshot.get("strategy_type"),
+                    "timeframe": snapshot.get("timeframe"),
                     "reason": "already_labeled",
                     "result_label": snapshot.get("result_label"),
                     "outcome_status": snapshot.get("outcome_status"),
@@ -469,7 +483,12 @@ async def _scan_outcome_attach_candidates(db, limit: int) -> dict:
         paper_trade = await _find_linked_paper_trade(db.paper_trades, paper_trade_id)
         if paper_trade is None:
             skipped["missing_paper_trade"] += 1
-            skipped_rows.append({"symbol": snapshot.get("symbol"), "reason": "missing_paper_trade"})
+            skipped_rows.append({
+                "symbol": snapshot.get("symbol"),
+                "strategy_type": snapshot.get("strategy_type"),
+                "timeframe": snapshot.get("timeframe"),
+                "reason": "missing_paper_trade"
+            })
             continue
         linked_status = paper_trade.get("status") or paper_trade.get("outcome_status")
         if not is_closed_paper_trade(paper_trade):
@@ -477,18 +496,38 @@ async def _scan_outcome_attach_candidates(db, limit: int) -> dict:
             skipped_rows.append(
                 {
                     "symbol": snapshot.get("symbol"),
+                    "strategy_type": snapshot.get("strategy_type"),
+                    "timeframe": snapshot.get("timeframe"),
                     "reason": "open_paper_trade",
                     "linked_paper_trade_status": linked_status,
                 }
             )
             continue
+        try:
+            from ai.features import attach_closed_paper_trade_outcome
+            outcome = build_closed_paper_trade_outcome(paper_trade, outcome_time=outcome_time)
+            # This will raise ValueError if temporal constraints/horizon are violated
+            attach_closed_paper_trade_outcome(snapshot, paper_trade, outcome_time=outcome_time)
+        except ValueError as e:
+            skipped["write_conflict"] += 1
+            skipped_rows.append(
+                {
+                    "symbol": snapshot.get("symbol"),
+                    "strategy_type": snapshot.get("strategy_type"),
+                    "timeframe": snapshot.get("timeframe"),
+                    "reason": "temporal_overlap_or_invalid",
+                    "error_detail": str(e),
+                }
+            )
+            continue
+
         proposals.append(
             {
                 "snapshot_id": _serialize_id(snapshot.get("_id")),
                 "paper_trade_id": _serialize_id(paper_trade_id),
                 "symbol": snapshot.get("symbol"),
                 "linked_paper_trade_status": linked_status,
-                "outcome": build_closed_paper_trade_outcome(paper_trade, outcome_time=outcome_time),
+                "outcome": outcome,
                 "_snapshot": snapshot,
             }
         )
@@ -814,7 +853,10 @@ async def save_ai_feature_snapshots(
     linked_only: bool = Query(default=True),
     source: str = Query(default="scored_candidates"),
     terminal_only: bool = Query(default=False),
+    operator_intent: str | None = Header(default=None, alias=OPERATOR_INTENT_HEADER),
 ) -> dict:
+    if not dry_run:
+        require_operator_intent_value(operator_intent)
     clean_source = normalize_snapshot_source(source)
     strategy, clean_timeframe = _resolve_snapshot_filters(clean_source, strategy_type, timeframe)
     db = get_database()
@@ -855,11 +897,7 @@ async def save_ai_feature_snapshots(
             "rows": rows,
         }
 
-    await collection.create_index(
-        "snapshot_identity",
-        unique=True,
-        partialFilterExpression={"snapshot_identity": {"$exists": True}},
-    )
+    get_collection_index_specs("ai_feature_snapshots")
     saved_rows = []
     duplicate_count = 0
     for snapshot in snapshots:
@@ -898,6 +936,8 @@ async def get_ai_feature_outcome_preview(
     eligible_rows = [
         {
             "symbol": proposal.get("symbol"),
+            "strategy_type": proposal["_snapshot"].get("strategy_type"),
+            "timeframe": proposal["_snapshot"].get("timeframe"),
             "linked_paper_trade_status": proposal.get("linked_paper_trade_status"),
             "proposed_result_label": proposal["outcome"].get("result_label"),
             "proposed_outcome_status": proposal["outcome"].get("outcome_status"),
@@ -924,7 +964,10 @@ async def get_ai_feature_outcome_preview(
 async def attach_ai_feature_snapshot_outcomes(
     dry_run: bool = Query(default=True),
     limit: int = Query(default=50, ge=1, le=500),
+    operator_intent: str | None = Header(default=None, alias=OPERATOR_INTENT_HEADER),
 ) -> dict:
+    if not dry_run:
+        require_operator_intent_value(operator_intent)
     db = get_database()
     snapshot_collection = db.ai_feature_snapshots
     scan = await _scan_outcome_attach_candidates(db, limit)
@@ -959,4 +1002,36 @@ async def attach_ai_feature_snapshot_outcomes(
         "attached_count": len(attached_rows),
         "skipped": skipped,
         "rows": rows,
+    }
+
+
+@router.get("/features/dataset-split")
+async def get_ai_features_split(
+    strategy_type: str | None = Query(default=None),
+    timeframe: str | None = Query(default=None),
+    train_ratio: float = Query(default=0.7, ge=0.0, le=1.0),
+    val_ratio: float = Query(default=0.15, ge=0.0, le=1.0),
+) -> dict:
+    clean_strategy = (strategy_type or "").strip()
+    strategy = normalize_strategy_type(clean_strategy) if clean_strategy else None
+    clean_timeframe = (timeframe or "").strip().upper() or None
+    query = {
+        "paper_only": True,
+        **({"strategy_type": strategy} if strategy else {}),
+        **({"timeframe": clean_timeframe} if clean_timeframe else {}),
+    }
+    rows = [row async for row in get_database().ai_feature_snapshots.find(query)]
+
+    from ai.features import chronological_split
+    train, val, test = chronological_split(rows, train_ratio=train_ratio, val_ratio=val_ratio)
+
+    return {
+        "paper_only": True,
+        "train_count": len(train),
+        "validation_count": len(val),
+        "test_count": len(test),
+        "train_last_time": train[-1].get("snapshot_time") if train else None,
+        "validation_first_time": val[0].get("snapshot_time") if val else None,
+        "validation_last_time": val[-1].get("snapshot_time") if val else None,
+        "test_first_time": test[0].get("snapshot_time") if test else None,
     }

@@ -1,13 +1,28 @@
-from fastapi import FastAPI
+from uuid import uuid4
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 
-from config import settings
+from config import ConfigValidationError, settings
 from database import lifespan
 from models import SettingsResponse
 from routes import ai as ai_routes, dashboard, market, momentum, paper, scan, score, signals, swing, system, tv
+from security.operator_intent import OperatorIntentRequired, operator_intent_exception_handler
+from services.error_contract import (
+    config_exception_handler,
+    http_exception_handler,
+    unhandled_exception_handler,
+    validation_exception_handler,
+)
 
 
 app = FastAPI(title="Trading Agent Clean", version="0.2.0", lifespan=lifespan)
+app.add_exception_handler(OperatorIntentRequired, operator_intent_exception_handler)
+app.add_exception_handler(HTTPException, http_exception_handler)
+app.add_exception_handler(RequestValidationError, validation_exception_handler)
+app.add_exception_handler(ConfigValidationError, config_exception_handler)
+app.add_exception_handler(Exception, unhandled_exception_handler)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -22,6 +37,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    request.state.request_id = uuid4().hex[:12]
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request.state.request_id
+    return response
 
 app.include_router(scan.router, prefix="/api/scan", tags=["scan"])
 app.include_router(score.router, prefix="/api/score", tags=["score"])

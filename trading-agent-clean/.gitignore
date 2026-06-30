@@ -1,0 +1,14 @@
+.runtime/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+logs/
+.mongo-data/
+backups/
+frontend/dist/
+frontend/node_modules/
+backend/scratch/*.json
+frontend/test_output.txt
+frontend/test_output_utf8.txt
+frontend/test_run.log

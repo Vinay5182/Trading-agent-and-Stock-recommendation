@@ -28,6 +28,7 @@ def fake_scored_candidate() -> dict:
         "nse_score": 86,
         "momentum_score": 71,
         "swing_status": "SWING_SELECTED_FOR_TV",
+        "created_at": "2026-01-01T08:00:00",
         "score_breakdown": {
             "swing": {
                 "price_strength": 21,
@@ -57,6 +58,7 @@ def fake_market_data() -> dict:
         "canonical_symbol": "TEST",
         "current_price": 124.5,
         "source_used": "NSE_PLUS_YFINANCE_FIELD_FALLBACK",
+        "created_at": "2026-01-01T08:15:00",
     }
 
 
@@ -70,6 +72,7 @@ def fake_tv_confirmation() -> dict:
         "stop_loss": 118.0,
         "target_1": 139.0,
         "risk_reward_1": 2.0,
+        "created_at": "2026-01-01T08:30:00",
     }
 
 
@@ -85,6 +88,7 @@ def fake_paper_signal() -> dict:
         "sl": 118.5,
         "t1": 139.5,
         "rr": 2.1,
+        "created_at": "2026-01-01T08:45:00",
     }
 
 
@@ -106,6 +110,7 @@ def fake_paper_trade(status: str = "NOT_TRIGGERED") -> dict:
         "paper_pnl_percent": 99.0,
         "exit_price": 119.0,
         "exit_reason": "STOP_LOSS_HIT",
+        "created_at": "2026-01-01T09:00:00",
         "updated_at": "2026-01-02T12:00:00",
     }
 
@@ -227,7 +232,7 @@ def test_paper_outcome_attaches_only_after_trade_closes() -> None:
             "paper_pnl_percent": 24.0,
             "exit_price": 156.0,
             "exit_reason": "TARGET_2_HIT",
-            "status_updated_at": "2026-01-05T15:30:00",
+            "status_updated_at": "2026-01-07T15:30:00",
         }
     )
 
@@ -239,7 +244,7 @@ def test_paper_outcome_attaches_only_after_trade_closes() -> None:
     assert updated["paper_pnl"] == 300
     assert updated["paper_pnl_percent"] == 24
     assert updated["exit_price"] == 156
-    assert updated["exit_time"] == "2026-01-05T15:30:00"
+    assert updated["exit_time"] == "2026-01-07T15:30:00"
     assert updated["result_label"] == "WIN"
     assert updated["outcome_attached_at"]
     assert updated["outcome_label"] == "WIN"
@@ -247,7 +252,7 @@ def test_paper_outcome_attaches_only_after_trade_closes() -> None:
     assert updated["outcome_pnl_percent"] == 24
     assert updated["outcome_exit_price"] == 156
     assert updated["outcome_exit_reason"] == "TARGET_2_HIT"
-    assert updated["outcome_closed_at"] == "2026-01-05T15:30:00"
+    assert updated["outcome_closed_at"] == "2026-01-07T15:30:00"
 
 
 @pytest.mark.parametrize(
@@ -266,9 +271,11 @@ def test_closed_paper_outcome_result_labels(status: str, paper_pnl: float, expec
         fake_tv_confirmation(),
         fake_paper_signal(),
         fake_paper_trade("ACTIVE"),
+        snapshot_time="2026-01-01T09:15:00",
     )
     trade = fake_paper_trade(status)
     trade["paper_pnl"] = paper_pnl
+    trade["updated_at"] = "2026-01-07T15:30:00"
 
     updated = attach_closed_paper_trade_outcome(snapshot, trade)
 

@@ -267,13 +267,13 @@ def journal_collection(db):
     return getattr(db, "trade_journal", None)
 
 
-async def ensure_trade_journal_indexes(db) -> None:
+async def ensure_trade_journal_indexes(db) -> dict:
     collection = journal_collection(db)
-    if collection is None or not hasattr(collection, "create_index"):
+    if collection is None:
         raise JournalWriteError("NO_JOURNAL_COLLECTION")
-    await collection.create_index("paper_trade_id", unique=True, name="trade_journal_paper_trade_id_unique")
-    await collection.create_index("exit_date", name="trade_journal_exit_date")
-    await collection.create_index("strategy_type", name="trade_journal_strategy_type")
+    from services.mongo_indexes import get_collection_index_specs
+
+    return {"startup_owned": [spec.as_dict() for spec in get_collection_index_specs("trade_journal")]}
 
 
 async def journal_completed_trade(db, trade: dict) -> dict:
@@ -453,12 +453,11 @@ def build_trade_analytics(records: list[dict]) -> dict:
     }
 
 
-async def get_trade_analytics(db, limit: int = 1000, *, sync_missing: bool = True) -> dict:
-    sync_result = await sync_completed_trades_to_journal(db, limit) if sync_missing else None
+async def get_trade_analytics(db, limit: int = 1000) -> dict:
     records = await load_trade_journal(db, limit)
     return {
         "journal_count": len(records),
-        "sync_result": sync_result,
+        "sync_result": None,
         "analytics": build_trade_analytics(records),
         "journal": records,
     }

@@ -102,13 +102,13 @@ def _record_job_error(job_name: str, exc: Exception) -> None:
     AUTOMATION_STATUS["last_error"] = str(exc)
 
 
-async def ensure_scheduler_status_indexes(db) -> None:
+async def ensure_scheduler_status_indexes(db) -> dict | None:
     collection = getattr(db, "scheduler_status", None)
-    if collection is None or not hasattr(collection, "create_index"):
+    if collection is None:
         return
-    await collection.create_index("job_name", unique=True, name="scheduler_status_job_name_unique")
-    await collection.create_index("updated_at", name="scheduler_status_updated_at")
-    await collection.create_index("running", name="scheduler_status_running")
+    from services.mongo_indexes import get_collection_index_specs
+
+    return {"startup_owned": [spec.as_dict() for spec in get_collection_index_specs("scheduler_status")]}
 
 
 async def persist_scheduler_status(db, job_name: str, fields: dict, inc: dict | None = None) -> None:

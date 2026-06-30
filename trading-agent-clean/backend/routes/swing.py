@@ -2,14 +2,17 @@ import hashlib
 import logging
 import time
 from datetime import datetime
+from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi.responses import JSONResponse
 
 from config import settings
 from database import get_database
 from routes.staleness import score_staleness_for_query
+from security.operator_intent import OPERATOR_INTENT_HEADER, require_operator_intent_value
 from services.system_errors import record_system_error
-from services.tradingview_manager import tradingview_manager
+from services.tradingview_manager import tradingview_manager, TradingViewPreflightError
 from tv_client import validate_timeframe
 from tv_confirmation import confirm_swing_symbol_timeframes, enforce_tv_confirmation_safety
 
@@ -250,7 +253,11 @@ async def save_confirmation_row(row: dict) -> None:
         document["failure_run_id"] = identity["failure_run_id"]
     await get_database().swing_tv_confirmations.update_one(
         identity,
-        {"$set": document, "$setOnInsert": {"created_at": now}},
+        {
+            "$set": document,
+            "$setOnInsert": {"created_at": now},
+            "$unset": {"trade_allowed": ""}
+        },
         upsert=True,
     )
 
@@ -275,7 +282,28 @@ async def run_swing_tv_confirmation(
     symbol: str | None = None,
     tradingview_symbol: str | None = None,
     exchange: str = "NSE",
-) -> dict:
+) -> Any:
+    # Advisory-only preflight: reject immediately only for hard failures
+    # (no attached target AND no CDP connection recorded). This uses ONLY
+    # in-memory state and cached results — no live CDP calls.
+    # Transient/busy states are handled by run_sync serialization.
+    if not tradingview_manager.attached_target_id and not tradingview_manager._connected:
+        cached = tradingview_manager._cached_preflight
+        if cached and not cached.get("preflight_ready") and cached.get("preflight_code") not in ("TV_MANAGER_BUSY", "OK"):
+            details = {
+                "code": cached.get("preflight_code"),
+                "message": cached.get("preflight_message"),
+                "cdp_reachable": cached.get("cdp_reachable"),
+                "valid_target_count": cached.get("valid_chart_target_count"),
+                "attached_target_id": None,
+                "attached_title": cached.get("attached_title"),
+                "attached_url": cached.get("attached_url"),
+                "chart_ready": False,
+                "manual_attachment_required": cached.get("manual_attachment_required"),
+                "retryable": False,
+            }
+            return JSONResponse(status_code=400, content=details)
+
     clean_index = clean_index_name(index_name)
     available_candidates_count = None
     warning = None
@@ -303,7 +331,11 @@ async def run_swing_tv_confirmation(
                 tradingview_manager.attached_target_id,
                 timeout_seconds=settings.TRADINGVIEW_SYMBOL_TIMEOUT_SECONDS + 10 if hasattr(settings, "TRADINGVIEW_SYMBOL_TIMEOUT_SECONDS") else 100,
                 retries=1,
+                require_preflight=True,
             )
+        except TradingViewPreflightError as exc:
+            logger.error("Swing TV preflight failed during candidate loop: %s", exc)
+            return JSONResponse(status_code=400, content=exc.details)
         except Exception as exc:
             logger.exception("Swing TV symbol exception symbol=%s", symbol_name)
             if save:
@@ -381,7 +413,10 @@ async def confirm_swing_tv(
     symbol: str | None = Query(default=None),
     tradingview_symbol: str | None = Query(default=None),
     exchange: str = Query(default="NSE"),
+    operator_intent: str | None = Header(default=None, alias=OPERATOR_INTENT_HEADER),
 ) -> dict:
+    if save:
+        require_operator_intent_value(operator_intent)
     return await run_swing_tv_confirmation(index_name, limit, parse_timeframes(timeframes, timeframe), save, offset, batch_number, batch_size, single_symbol, symbol, tradingview_symbol, exchange)
 
 
@@ -416,17 +451,29 @@ async def get_swing_tv_confirmed(
     if checked_timeframes:
         query["timeframes_hash"] = timeframes_hash(checked_timeframes)
     db = get_database()
-    saved_rows_count = await db.swing_tv_confirmations.count_documents(query)
-    cursor = db.swing_tv_confirmations.find(query, {"_id": 0}).sort("updated_at", -1)
+    cursor = db.swing_tv_confirmations.find(query).sort([("updated_at", -1), ("symbol", 1)])
+    seen = set()
+    deduped_rows = []
+    async for row in cursor:
+        row.pop("_id", None)
+        key = (
+            row.get("symbol"),
+            row.get("tradingview_symbol"),
+            row.get("index_name"),
+            row.get("timeframes_hash"),
+        )
+        if key not in seen:
+            seen.add(key)
+            deduped_rows.append(row)
+    saved_rows_count = len(seen)
     if limit is not None:
-        cursor = cursor.limit(limit)
-    rows = [row async for row in cursor]
+        deduped_rows = deduped_rows[:limit]
     response = {
         "index_name": clean_index,
         "limit": limit,
         "saved_rows_count": saved_rows_count,
-        "count": len(rows),
-        "rows": rows,
+        "count": len(deduped_rows),
+        "rows": deduped_rows,
     }
     if checked_timeframes:
         response["timeframes_checked"] = checked_timeframes

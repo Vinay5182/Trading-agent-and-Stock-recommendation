@@ -1,12 +1,15 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 import os
+import re
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 import json
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 
 SOURCE_NSE_PRIMARY = "NSE_PRIMARY"
@@ -16,6 +19,19 @@ SOURCE_NSE_PLUS_YFINANCE = "NSE_PLUS_YFINANCE_FIELD_FALLBACK"
 SOURCE_YFINANCE_ONLY = "YFINANCE_ONLY"
 SOURCE_FETCH_FAILED = "FETCH_FAILED"
 SOURCE_SKIPPED_INVALID_SYMBOL = "SKIPPED_INVALID_SYMBOL"
+
+PROVIDER_TIMEOUT_SECONDS = 8
+PROVIDER_MAX_RETRIES = 2
+PROVIDER_BACKOFF_SECONDS = 0.25
+YFINANCE_MAX_THREADS = 4
+RATE_LIMIT_STATUS_CODES = {429}
+ERROR_TEXT_LIMIT = 400
+IST = ZoneInfo("Asia/Kolkata")
+SECRET_QUERY_RE = re.compile(
+    r"([?&](?:api[_-]?key|apikey|access[_-]?token|token|secret|password|pass)=)[^&\s]+",
+    re.IGNORECASE,
+)
+AUTH_HEADER_RE = re.compile(r"(authorization\s*[:=]\s*(?:bearer\s+)?)[^\s,;]+", re.IGNORECASE)
 
 REQUIRED_FIELDS = [
     "current_price",
@@ -34,8 +50,98 @@ SCORING_FIELDS = [
 ]
 
 
+class ProviderFetchError(RuntimeError):
+    def __init__(self, provider: str, operation: str, message: str, *, rate_limited: bool = False):
+        self.provider = provider
+        self.operation = operation
+        self.rate_limited = rate_limited
+        super().__init__(message)
+
+
 def utc_now_iso() -> str:
     return datetime.utcnow().isoformat()
+
+
+def sanitize_provider_error(value: Any) -> str:
+    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+
+    # Redact URL query parameters first (for backward compatibility with existing tests)
+    text = SECRET_QUERY_RE.sub(r"\1<redacted>", text)
+    text = AUTH_HEADER_RE.sub(r"\1<redacted>", text)
+
+    # Redact MongoDB URI
+    text = re.sub(r"mongodb(\+srv)?://[^\s\"'>]+", "[MONGO_URI]", text, flags=re.IGNORECASE)
+
+    # Redact general credentials, secrets, tokens, passwords
+    text = re.sub(r"(?:api[_-]?key|apikey|token|secret|password|pass|credential|auth)[^\s\"'>:=]*[:=]\s*[^\s\"'<>,;]+", "[REDACTED_CREDENTIAL]", text, flags=re.IGNORECASE)
+
+    # Redact Windows paths
+    text = re.sub(r"[A-Za-z]:\\[^:\n]+", "[PATH]", text)
+
+    # Redact Unix paths
+    def path_sub(match):
+        m = match.group(0)
+        if m.count("/") > 1:
+            return "[PATH]"
+        return m
+    text = re.sub(r"/[a-zA-Z0-9_\-\./]+", path_sub, text)
+
+    # Redact IPs
+    text = re.sub(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", "[IP]", text)
+
+    if len(text) > ERROR_TEXT_LIMIT:
+        text = f"{text[:ERROR_TEXT_LIMIT]}..."
+    return text
+
+
+def is_provider_rate_limited(error: Any = None, status_code: int | None = None) -> bool:
+    if status_code in RATE_LIMIT_STATUS_CODES:
+        return True
+    response = getattr(error, "response", None)
+    if getattr(response, "status_code", None) in RATE_LIMIT_STATUS_CODES:
+        return True
+    text = str(error or "").lower()
+    return "429" in text or "rate limit" in text or "too many requests" in text
+
+
+def provider_retry_delay_seconds(attempt_index: int) -> float:
+    return PROVIDER_BACKOFF_SECONDS * (2 ** max(attempt_index, 0))
+
+
+def provider_error_text(provider: str, operation: str, error: Any, status_code: int | None = None) -> str:
+    if isinstance(error, ProviderFetchError):
+        return sanitize_provider_error(error)
+    prefix = f"{provider}_{operation}"
+    if is_provider_rate_limited(error, status_code):
+        prefix = f"{prefix}_RATE_LIMITED"
+    else:
+        prefix = f"{prefix}_FAILED"
+    return f"{prefix}: {sanitize_provider_error(error)}"
+
+
+def run_provider_call(
+    provider: str,
+    operation: str,
+    call,
+    *,
+    retries: int = PROVIDER_MAX_RETRIES,
+):
+    attempts = max(1, retries)
+    last_error = None
+    for attempt_index in range(attempts):
+        try:
+            return call()
+        except Exception as exc:
+            last_error = exc
+            if attempt_index < attempts - 1:
+                time.sleep(provider_retry_delay_seconds(attempt_index))
+    message = provider_error_text(provider, operation, last_error)
+    raise ProviderFetchError(
+        provider,
+        operation,
+        message,
+        rate_limited=is_provider_rate_limited(last_error),
+    )
 
 
 def clean_number(value: Any) -> float | int | None:
@@ -50,6 +156,48 @@ def clean_number(value: Any) -> float | int | None:
         if number != number:
             return None
         return int(number) if number.is_integer() else number
+    except Exception:
+        return None
+
+
+def normalize_non_negative_number(value: Any) -> float | int | None:
+    number = clean_number(value)
+    if number is None or number < 0:
+        return None
+    return number
+
+
+def normalize_price(value: Any) -> float | int | None:
+    return normalize_non_negative_number(value)
+
+
+def normalize_provider_timestamp(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        if hasattr(value, "to_pydatetime"):
+            value = value.to_pydatetime()
+        if isinstance(value, datetime):
+            timestamp = value
+        else:
+            text = str(value).strip()
+            if not text:
+                return None
+            try:
+                timestamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                timestamp = None
+                for date_format in ("%d-%b-%Y %H:%M:%S", "%d-%b-%Y %H:%M"):
+                    try:
+                        timestamp = datetime.strptime(text, date_format).replace(tzinfo=IST)
+                        break
+                    except ValueError:
+                        continue
+                if timestamp is None:
+                    return None
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        return timestamp.astimezone(timezone.utc).isoformat()
     except Exception:
         return None
 
@@ -159,6 +307,8 @@ def build_market_data_document(
             "history_enriched_at",
             "history_enrichment_date",
             "history_source",
+            "provider_timestamp",
+            "provider_timezone",
         ):
             if field in data:
                 row[field] = data[field]
@@ -183,27 +333,30 @@ def fetch_nse_quote(symbol: str) -> dict[str, Any]:
     row = build_market_data_document("NSE", canonical_symbol, source_used=SOURCE_NSE_PRIMARY)
     row.update({"nse_ok": False, "nse_error": None})
     try:
-        opener = urllib.request.build_opener()
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json,text/plain,*/*",
-            "Referer": "https://www.nseindia.com/get-quotes/equity",
-        }
-        opener.open(urllib.request.Request("https://www.nseindia.com", headers=headers), timeout=6).read()
-        url = "https://www.nseindia.com/api/quote-equity?symbol=" + urllib.parse.quote(canonical_symbol)
-        payload = opener.open(urllib.request.Request(url, headers=headers), timeout=8).read().decode("utf-8")
-        data = json.loads(payload)
+        def read_quote_payload():
+            opener = urllib.request.build_opener()
+            headers = {
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json,text/plain,*/*",
+                "Referer": "https://www.nseindia.com/get-quotes/equity",
+            }
+            opener.open(urllib.request.Request("https://www.nseindia.com", headers=headers), timeout=6).read()
+            url = "https://www.nseindia.com/api/quote-equity?symbol=" + urllib.parse.quote(canonical_symbol)
+            payload = opener.open(urllib.request.Request(url, headers=headers), timeout=PROVIDER_TIMEOUT_SECONDS).read().decode("utf-8")
+            return json.loads(payload)
+
+        data = run_provider_call("NSE", "QUOTE", read_quote_payload)
         price = data.get("priceInfo") or {}
         trade = ((data.get("marketDeptOrderBook") or {}).get("tradeInfo") or {})
         intraday = price.get("intraDayHighLow") or {}
         row.update({
-            "current_price": clean_number(price.get("lastPrice")),
-            "previous_close": clean_number(price.get("previousClose")),
-            "open_price": clean_number(price.get("open")),
-            "day_high": clean_number(intraday.get("max") or price.get("intraDayHighLowMax")),
-            "day_low": clean_number(intraday.get("min") or price.get("intraDayHighLowMin")),
-            "traded_volume": clean_number(trade.get("totalTradedVolume") or price.get("totalTradedVolume")),
-            "traded_value": clean_number(trade.get("totalTradedValue") or price.get("totalTradedValue")),
+            "current_price": normalize_price(price.get("lastPrice")),
+            "previous_close": normalize_price(price.get("previousClose")),
+            "open_price": normalize_price(price.get("open")),
+            "day_high": normalize_price(intraday.get("max") or price.get("intraDayHighLowMax")),
+            "day_low": normalize_price(intraday.get("min") or price.get("intraDayHighLowMin")),
+            "traded_volume": normalize_non_negative_number(trade.get("totalTradedVolume") or price.get("totalTradedVolume")),
+            "traded_value": normalize_non_negative_number(trade.get("totalTradedValue") or price.get("totalTradedValue")),
             "change_percent": clean_number(price.get("pChange")),
             "nse_ok": True,
             "field_sources": {},
@@ -212,7 +365,7 @@ def fetch_nse_quote(symbol: str) -> dict[str, Any]:
             if row.get(field) is not None:
                 row["field_sources"][field] = "NSE"
     except Exception as exc:
-        row["nse_error"] = str(exc)
+        row["nse_error"] = provider_error_text("NSE", "QUOTE", exc)
     return row
 
 
@@ -234,11 +387,14 @@ def fetch_yfinance_quote_for_missing_fields(symbol: str, missing_fields: list[st
             yf.cache.set_cache_location(cache_dir)
 
         ticker = yf.Ticker(row["yfinance_symbol"])
-        history = None
-        try:
-            history = ticker.history(period="2mo", interval="1d", timeout=8)
-        except TypeError:
-            history = ticker.history(period="2mo", interval="1d")
+
+        def read_history():
+            try:
+                return ticker.history(period="2mo", interval="1d", timeout=PROVIDER_TIMEOUT_SECONDS)
+            except TypeError:
+                return ticker.history(period="2mo", interval="1d")
+
+        history = run_provider_call("YFINANCE", "HISTORY", read_history)
 
         last = None
         previous = None
@@ -248,12 +404,12 @@ def fetch_yfinance_quote_for_missing_fields(symbol: str, missing_fields: list[st
 
         if wanted & {"current_price", "previous_close", "open_price", "day_high", "day_low", "traded_volume", "traded_value", "change_percent"}:
             mapping = {
-                "current_price": last.get("Close") if last is not None else None,
-                "previous_close": previous.get("Close") if previous is not None else None,
-                "open_price": last.get("Open") if last is not None else None,
-                "day_high": last.get("High") if last is not None else None,
-                "day_low": last.get("Low") if last is not None else None,
-                "traded_volume": last.get("Volume") if last is not None else None,
+                "current_price": normalize_price(last.get("Close")) if last is not None else None,
+                "previous_close": normalize_price(previous.get("Close")) if previous is not None else None,
+                "open_price": normalize_price(last.get("Open")) if last is not None else None,
+                "day_high": normalize_price(last.get("High")) if last is not None else None,
+                "day_low": normalize_price(last.get("Low")) if last is not None else None,
+                "traded_volume": normalize_non_negative_number(last.get("Volume")) if last is not None else None,
             }
             for field, value in mapping.items():
                 if field in wanted:
@@ -277,9 +433,12 @@ def fetch_yfinance_quote_for_missing_fields(symbol: str, missing_fields: list[st
         for field in wanted:
             if row.get(field) is not None:
                 row["field_sources"][field] = "YFINANCE"
+        row["provider_timestamp"] = normalize_provider_timestamp(getattr(last, "name", None))
+        if row["provider_timestamp"]:
+            row["provider_timezone"] = "UTC"
         row["yfinance_ok"] = any(row.get(field) is not None for field in REQUIRED_FIELDS + SCORING_FIELDS)
     except Exception as exc:
-        row["yfinance_error"] = str(exc)
+        row["yfinance_error"] = provider_error_text("YFINANCE", "HISTORY", exc)
     return row
 
 
@@ -317,12 +476,12 @@ def _history_to_yfinance_row(symbol: str, history: Any, wanted: set[str]) -> dic
     last = history.iloc[-1]
     previous = history.iloc[-2] if len(history) >= 2 else None
     mapping = {
-        "current_price": _safe_series_value(last, "Close"),
-        "previous_close": _safe_series_value(previous, "Close") if previous is not None else None,
-        "open_price": _safe_series_value(last, "Open"),
-        "day_high": _safe_series_value(last, "High"),
-        "day_low": _safe_series_value(last, "Low"),
-        "traded_volume": _safe_series_value(last, "Volume"),
+        "current_price": normalize_price(_safe_series_value(last, "Close")),
+        "previous_close": normalize_price(_safe_series_value(previous, "Close")) if previous is not None else None,
+        "open_price": normalize_price(_safe_series_value(last, "Open")),
+        "day_high": normalize_price(_safe_series_value(last, "High")),
+        "day_low": normalize_price(_safe_series_value(last, "Low")),
+        "traded_volume": normalize_non_negative_number(_safe_series_value(last, "Volume")),
     }
     for field, value in mapping.items():
         if field in wanted:
@@ -346,6 +505,9 @@ def _history_to_yfinance_row(symbol: str, history: Any, wanted: set[str]) -> dic
     for field in wanted:
         if row.get(field) is not None:
             row["field_sources"][field] = "YFINANCE"
+    row["provider_timestamp"] = normalize_provider_timestamp(getattr(last, "name", None))
+    if row["provider_timestamp"]:
+        row["provider_timezone"] = "UTC"
     row["yfinance_ok"] = any(row.get(field) is not None for field in REQUIRED_FIELDS + SCORING_FIELDS)
     return row
 
@@ -368,15 +530,22 @@ def fetch_yfinance_batch_for_missing(symbols: list[str], missing_by_symbol: dict
 
         _configure_yfinance_cache(yf)
         tickers = [f"{symbol}.NS" for symbol in clean_symbols]
-        history = yf.download(
-            tickers=tickers,
-            period="2mo",
-            interval="1d",
-            group_by="ticker",
-            threads=True,
-            progress=False,
-            auto_adjust=False,
-        )
+        def read_download():
+            kwargs = {
+                "tickers": tickers,
+                "period": "2mo",
+                "interval": "1d",
+                "group_by": "ticker",
+                "threads": min(YFINANCE_MAX_THREADS, max(len(tickers), 1)),
+                "progress": False,
+                "auto_adjust": False,
+            }
+            try:
+                return yf.download(**kwargs, timeout=PROVIDER_TIMEOUT_SECONDS)
+            except TypeError:
+                return yf.download(**kwargs)
+
+        history = run_provider_call("YFINANCE", "DOWNLOAD", read_download)
         for symbol in clean_symbols:
             yf_symbol = f"{symbol}.NS"
             wanted = set(missing_by_symbol.get(symbol) or REQUIRED_FIELDS + SCORING_FIELDS)
@@ -394,7 +563,7 @@ def fetch_yfinance_batch_for_missing(symbols: list[str], missing_by_symbol: dict
             rows[symbol]["field_sources"] = {}
             rows[symbol]["yfinance_symbol"] = f"{symbol}.NS"
             rows[symbol]["yfinance_ok"] = False
-            rows[symbol]["yfinance_error"] = str(exc)
+            rows[symbol]["yfinance_error"] = provider_error_text("YFINANCE", "DOWNLOAD", exc)
     return rows
 
 
@@ -465,10 +634,10 @@ async def fetch_market_data_for_symbol(
     return merged
 
 
-async def ensure_market_data_indexes(db) -> None:
-    await db.market_data.create_index([("exchange", 1), ("canonical_symbol", 1)], unique=True)
-    await db.market_data.create_index("index_name")
-    await db.market_data.create_index("updated_at")
+async def ensure_market_data_indexes(db) -> dict:
+    from services.mongo_indexes import get_collection_index_specs
+
+    return {"startup_owned": [spec.as_dict() for spec in get_collection_index_specs("market_data")]}
 
 
 async def upsert_market_data(db, row: dict[str, Any]):

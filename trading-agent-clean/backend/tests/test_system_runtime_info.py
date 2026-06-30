@@ -26,3 +26,70 @@ def test_runtime_info_identifies_current_project_and_process() -> None:
     assert result["git_commit"]
     assert isinstance(result["git_commit"], str)
     datetime.fromisoformat(result["started_at"])
+    assert result["automation_disabled"] is False
+    assert result["smoke_read_only_mode"] is False
+
+
+def test_runtime_info_reports_smoke_automation_disabled() -> None:
+    original = system.settings.SMOKE_READ_ONLY_MODE
+    object.__setattr__(system.settings, "SMOKE_READ_ONLY_MODE", True)
+    try:
+        result = asyncio.run(system.get_runtime_info())
+    finally:
+        object.__setattr__(system.settings, "SMOKE_READ_ONLY_MODE", original)
+
+    assert result["automation_disabled"] is True
+    assert result["smoke_read_only_mode"] is True
+
+
+def test_runtime_info_sanitizes_public_requests() -> None:
+    from fastapi.testclient import TestClient
+    client = TestClient(app)
+    response = client.get("/api/system/runtime-info")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["project_root"] == "REDACTED"
+    assert data["backend_pid"] == -1
+
+
+def test_runtime_info_proxy_security_enforcement() -> None:
+    from fastapi.testclient import TestClient
+    client = TestClient(app)
+
+    # 1. Direct loopback request (but without headers / env vars configured) -> redacted
+    response = client.get("/api/system/runtime-info")
+    assert response.status_code == 200
+    assert response.json()["project_root"] == "REDACTED"
+    assert response.json()["backend_pid"] == -1
+
+    # 2. Spoof headers like X-Forwarded-For -> redacted
+    response = client.get("/api/system/runtime-info", headers={"X-Forwarded-For": "127.0.0.1"})
+    assert response.json()["project_root"] == "REDACTED"
+
+    # 3. Enable diagnostics but pass no token -> redacted
+    os.environ["TRADING_AGENT_DIAGNOSTICS_ENABLED"] = "true"
+    try:
+        response = client.get("/api/system/runtime-info")
+        assert response.json()["project_root"] == "REDACTED"
+    finally:
+        os.environ.pop("TRADING_AGENT_DIAGNOSTICS_ENABLED", None)
+
+    # 4. Enable diagnostics and configure a token, but pass incorrect token -> redacted
+    os.environ["TRADING_AGENT_DIAGNOSTICS_ENABLED"] = "true"
+    os.environ["TRADING_AGENT_DIAGNOSTICS_TOKEN"] = "my-secret-token"
+    try:
+        response = client.get("/api/system/runtime-info", headers={"X-Trading-Agent-Diagnostics": "wrong-token"})
+        assert response.json()["project_root"] == "REDACTED"
+
+        # 5. Correct token -> authorized (returns real PID and path)
+        response = client.get("/api/system/runtime-info", headers={"X-Trading-Agent-Diagnostics": "my-secret-token"})
+        assert response.json()["project_root"] != "REDACTED"
+        assert response.json()["backend_pid"] == os.getpid()
+
+        # 6. Diagnostics-disabled configuration -> always redacted even with correct token
+        os.environ["TRADING_AGENT_DIAGNOSTICS_ENABLED"] = "false"
+        response = client.get("/api/system/runtime-info", headers={"X-Trading-Agent-Diagnostics": "my-secret-token"})
+        assert response.json()["project_root"] == "REDACTED"
+    finally:
+        os.environ.pop("TRADING_AGENT_DIAGNOSTICS_ENABLED", None)
+        os.environ.pop("TRADING_AGENT_DIAGNOSTICS_TOKEN", None)

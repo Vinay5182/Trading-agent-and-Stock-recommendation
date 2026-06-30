@@ -1,3 +1,5 @@
+import contextlib
+import contextvars
 import json
 import logging
 import time
@@ -19,6 +21,8 @@ MAX_MANAGED_TABS = 1
 MANAGED_TAB_IDS: set[str] = set()
 CHART_NAVIGATION_TIMEOUT_SECONDS = 20.0
 CDP_RECV_POLL_SECONDS = 0.5
+_MANAGER_OPERATION_CONTEXT = contextvars.ContextVar("tradingview_manager_operation", default=None)
+_ALLOW_UNMANAGED_TEST_CONTEXT = contextvars.ContextVar("allow_unmanaged_tradingview_test_context", default=False)
 
 
 class TradingViewTabNavigationError(RuntimeError):
@@ -33,6 +37,37 @@ class TradingViewTabDisconnectedError(RuntimeError):
     def __init__(self, target_id: str | None = None, message: str | None = None) -> None:
         self.target_id = target_id
         super().__init__(message or "TV_TAB_DISCONNECTED")
+
+
+@contextlib.contextmanager
+def manager_operation_context(operation_name: str, generation: int):
+    token = _MANAGER_OPERATION_CONTEXT.set({"operation_name": operation_name, "generation": generation})
+    try:
+        yield
+    finally:
+        _MANAGER_OPERATION_CONTEXT.reset(token)
+
+
+@contextlib.contextmanager
+def allow_unmanaged_tradingview_client_for_tests():
+    token = _ALLOW_UNMANAGED_TEST_CONTEXT.set(True)
+    try:
+        yield
+    finally:
+        _ALLOW_UNMANAGED_TEST_CONTEXT.reset(token)
+
+
+def manager_operation_active() -> bool:
+    return _MANAGER_OPERATION_CONTEXT.get() is not None
+
+
+def require_manager_available(action: str = "TradingView helper") -> None:
+    if manager_operation_active() or _ALLOW_UNMANAGED_TEST_CONTEXT.get():
+        return
+    raise RuntimeError(
+        "TV_MANAGER_OWNERSHIP_REQUIRED: "
+        f"{action} must run inside TradingViewExecutionManager.run_sync or an explicit test context."
+    )
 
 
 @dataclass
@@ -848,10 +883,10 @@ def is_tradingview_location(url: object, title: object = None) -> bool:
 def is_real_tradingview_chart_target(tab: dict) -> bool:
     if tab.get("type") != "page":
         return False
-    url = tab.get("url", "")
+    url = str(tab.get("url", "")).strip().lower()
     if is_blank_url(url):
         return False
-    return "tradingview.com" in str(url).lower() and is_tradingview_tab(tab)
+    return "tradingview.com/chart" in url
 
 
 def is_blank_url(url: object) -> bool:
@@ -947,32 +982,40 @@ def extract_interval_from_url(url: str) -> str | None:
 
 
 def connect_to_debug_port(port: int = settings.TRADINGVIEW_DEBUG_PORT) -> bool:
+    require_manager_available("connect_to_debug_port")
     return TradingViewClient(port).connect_to_debug_port()
 
 
 def list_tabs(port: int = settings.TRADINGVIEW_DEBUG_PORT) -> list[dict]:
+    require_manager_available("list_tabs")
     return TradingViewClient(port).list_tabs()
 
 
 def open_or_reuse_chart_tab(port: int = settings.TRADINGVIEW_DEBUG_PORT) -> dict:
+    require_manager_available("open_or_reuse_chart_tab")
     return TradingViewClient(port).open_or_reuse_chart_tab()
 
 
 def open_symbol(tradingview_symbol: str, port: int = settings.TRADINGVIEW_DEBUG_PORT) -> dict:
+    require_manager_available("open_symbol")
     return TradingViewClient(port).open_symbol(tradingview_symbol)
 
 
 def set_timeframe(timeframe: str, port: int = settings.TRADINGVIEW_DEBUG_PORT) -> dict:
+    require_manager_available("set_timeframe")
     return TradingViewClient(port).set_timeframe(timeframe)
 
 
 def verify_symbol_loaded(tradingview_symbol: str, port: int = settings.TRADINGVIEW_DEBUG_PORT) -> bool:
+    require_manager_available("verify_symbol_loaded")
     return TradingViewClient(port).verify_symbol_loaded(tradingview_symbol)
 
 
 def fetch_visible_chart_status(port: int = settings.TRADINGVIEW_DEBUG_PORT) -> dict:
+    require_manager_available("fetch_visible_chart_status")
     return TradingViewClient(port).fetch_visible_chart_status()
 
 
 def fetch_candles(timeframe: str, min_candles: int = 50, port: int = settings.TRADINGVIEW_DEBUG_PORT) -> list[dict]:
+    require_manager_available("fetch_candles")
     return TradingViewClient(port).fetch_candles(timeframe, min_candles)

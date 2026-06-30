@@ -2,7 +2,7 @@ import time
 from datetime import datetime, timezone
 
 from config import settings
-from tv_client import TradingViewClient, validate_timeframe
+from tv_client import TradingViewClient, validate_timeframe, TradingViewTabNotAttachedError, TradingViewTabDisconnectedError
 
 
 def _to_float(value) -> float | None:
@@ -1902,96 +1902,270 @@ def _fetch_swing_timeframe_with_validation(
     previous_debug: dict | None,
     previous_timeframe: str | None,
 ) -> tuple[list[dict], dict]:
-    last_candles = []
-    last_debug = {}
-    total_wait = 0
+    from tv_client import normalize_timeframe
+    import json
+    import time
+    start_time = time.monotonic()
     min_candles = settings.TRADINGVIEW_MIN_CANDLES
-    for attempt in range(1, settings.TRADINGVIEW_OHLCV_RETRIES + 1):
+    requested_norm = normalize_timeframe(timeframe)
+
+    # We will run a polling loop with a total deadline
+    # Use TRADINGVIEW_RESOLUTION_WAIT_SECONDS as the deadline (e.g. 10s)
+    deadline = start_time + settings.TRADINGVIEW_RESOLUTION_WAIT_SECONDS
+
+    # Maintain tracking variables
+    attempts = 0
+    candles = []
+    first = []
+    second = []
+    resolution_ok = False
+    symbol_ok = False
+    stable_ok = False
+    stale_ok = False
+
+    last_error_stage = "TV_TIMEFRAME_SET_TIMEOUT"
+    last_error_message = "Initial state"
+
+    # 1. Set timeframe once initially
+    try:
+        client.set_timeframe(timeframe)
+    except (TradingViewTabNotAttachedError, TradingViewTabDisconnectedError) as exc:
+        client.diagnostics["error_stage"] = "TV_TARGET_LOST"
+        client.diagnostics["error_message"] = str(exc)
+        debug = _build_timeframe_debug(timeframe, [], client.diagnostics)
+        debug.update({
+            "timeout_location": "TV_TARGET_LOST",
+            "stale_or_merged_candle_warning": True,
+            "symbol": client.diagnostics.get("loaded_symbol"),
+            "timeframe": timeframe,
+            "requested_symbol": client.diagnostics.get("requested_tradingview_symbol"),
+            "detected_symbol": client.diagnostics.get("loaded_symbol"),
+            "requested_timeframe": timeframe,
+            "detected_timeframe": client.diagnostics.get("resolution_after"),
+            "success": False,
+            "code": "TV_TARGET_LOST",
+            "message": str(exc),
+            "elapsed_ms": int((time.monotonic() - start_time) * 1000),
+            "attempts": 1,
+            "candles_received": 0,
+            "latest_candle_timestamp": None,
+        })
+        return [], debug
+    except Exception as exc:
+        client.diagnostics["error_stage"] = "TV_TIMEFRAME_SET_TIMEOUT"
+        client.diagnostics["error_message"] = str(exc)
+        debug = _build_timeframe_debug(timeframe, [], client.diagnostics)
+        debug.update({
+            "timeout_location": "TV_TIMEFRAME_SET_TIMEOUT",
+            "stale_or_merged_candle_warning": True,
+            "symbol": client.diagnostics.get("loaded_symbol"),
+            "timeframe": timeframe,
+            "requested_symbol": client.diagnostics.get("requested_tradingview_symbol"),
+            "detected_symbol": client.diagnostics.get("loaded_symbol"),
+            "requested_timeframe": timeframe,
+            "detected_timeframe": client.diagnostics.get("resolution_after"),
+            "success": False,
+            "code": "TV_TIMEFRAME_SET_TIMEOUT",
+            "message": str(exc),
+            "elapsed_ms": int((time.monotonic() - start_time) * 1000),
+            "attempts": 1,
+            "candles_received": 0,
+            "latest_candle_timestamp": None,
+        })
+        return [], debug
+
+    # 2. Polling loop
+    while time.monotonic() <= deadline:
+        attempts += 1
+        client.check_deadline(f"timeframe:{timeframe}:poll_attempt_{attempts}")
+
+        # Check active resolution and symbol
         try:
-            client.check_deadline(f"timeframe:{timeframe}:attempt:{attempt}")
-            client.set_timeframe(timeframe)
-            resolution_ok = client.wait_for_resolution(timeframe, settings.TRADINGVIEW_RESOLUTION_WAIT_SECONDS)
-            total_wait += settings.TRADINGVIEW_RESOLUTION_WAIT_SECONDS
-            client.sleep(settings.TRADINGVIEW_TIMEFRAME_STABILIZE_SECONDS, f"timeframe:{timeframe}:stabilize")
-            total_wait += settings.TRADINGVIEW_TIMEFRAME_STABILIZE_SECONDS
-            first = client.extract_candles_from_active_chart(initial_wait_seconds=0, retry_wait_seconds=0, max_attempts=1)
-            client.sleep(settings.TRADINGVIEW_CANDLE_STABILITY_WAIT_SECONDS, f"timeframe:{timeframe}:candle_stability")
-            total_wait += settings.TRADINGVIEW_CANDLE_STABILITY_WAIT_SECONDS
-            candles = client.extract_candles_from_active_chart(initial_wait_seconds=0, retry_wait_seconds=0, max_attempts=1)
-            diagnostics = dict(client.diagnostics)
+            client.refresh_resolution_status(timeframe)
+            active_res = client.diagnostics.get("resolution_after")
+            resolution_ok = (normalize_timeframe(active_res) == requested_norm)
+
+            active_sym = client.get_active_chart_symbol()
+            requested_sym = client.diagnostics.get("requested_tradingview_symbol")
+            symbol_ok = client.symbol_matches(active_sym, requested_sym)
+        except (TradingViewTabNotAttachedError, TradingViewTabDisconnectedError) as exc:
+            last_error_stage = "TV_TARGET_LOST"
+            last_error_message = str(exc)
+            break
         except Exception as exc:
-            diagnostics = dict(client.diagnostics)
-            diagnostics["wait_seconds_used"] = total_wait
-            diagnostics["retry_count"] = attempt - 1
-            diagnostics["stable_check_passed"] = False
-            diagnostics["error_stage"] = "TRADINGVIEW_CANDLE_LOAD_RETRY"
-            diagnostics["error_message"] = str(exc)
-            debug = _build_timeframe_debug(timeframe, [], diagnostics)
-            debug["timeout_location"] = diagnostics.get("timeout_location")
-            debug["stale_or_merged_candle_warning"] = True
-            last_debug = debug
-            if isinstance(exc, TimeoutError):
-                return [], debug
-            if attempt < settings.TRADINGVIEW_OHLCV_RETRIES:
-                client.sleep(2, f"timeframe:{timeframe}:retry")
-                total_wait += 2
-                continue
-            return [], debug
+            last_error_stage = "TV_TIMEFRAME_VERIFY_TIMEOUT"
+            last_error_message = str(exc)
+            client.sleep(0.2, f"timeframe:{timeframe}:poll_error_wait")
+            continue
+
+        if not symbol_ok:
+            last_error_stage = "TV_SYMBOL_VERIFY_TIMEOUT"
+            last_error_message = f"Active symbol mismatch: requested={requested_sym}, active={active_sym}"
+            try:
+                client.open_symbol(requested_sym)
+            except Exception:
+                pass
+            client.sleep(0.2, f"timeframe:{timeframe}:symbol_retry_wait")
+            continue
+
+        if not resolution_ok:
+            last_error_stage = "TV_TIMEFRAME_VERIFY_TIMEOUT"
+            last_error_message = f"Active resolution mismatch: requested={requested_norm}, active={active_res}"
+            try:
+                client.set_timeframe(timeframe)
+            except Exception:
+                pass
+            client.sleep(0.2, f"timeframe:{timeframe}:resolution_retry_wait")
+            continue
+
+        # Extract candles (first fetch)
+        try:
+            first = client.extract_candles_from_active_chart(initial_wait_seconds=0, retry_wait_seconds=0, max_attempts=1)
+        except (TradingViewTabNotAttachedError, TradingViewTabDisconnectedError) as exc:
+            last_error_stage = "TV_TARGET_LOST"
+            last_error_message = str(exc)
+            break
+        except Exception as exc:
+            last_error_stage = "TV_CANDLE_FETCH_TIMEOUT"
+            last_error_message = str(exc)
+            client.sleep(0.2, f"timeframe:{timeframe}:extract_retry_wait")
+            continue
+
+        if not first:
+            last_error_stage = "TV_CANDLE_FETCH_TIMEOUT"
+            last_error_message = "No candles retrieved from chart on first fetch"
+            client.sleep(0.2, f"timeframe:{timeframe}:no_candles_wait")
+            continue
+
+        if len(first) < min_candles:
+            last_error_stage = "TV_CANDLE_INVALID"
+            last_error_message = f"CANDLES_BELOW_MINIMUM: first count={len(first)}"
+            client.sleep(0.2, f"timeframe:{timeframe}:count_wait")
+            continue
+
+        # Extract second fetch for stability check
+        client.sleep(0.2, f"timeframe:{timeframe}:stability_wait")
+        try:
+            second = client.extract_candles_from_active_chart(initial_wait_seconds=0, retry_wait_seconds=0, max_attempts=1)
+        except (TradingViewTabNotAttachedError, TradingViewTabDisconnectedError) as exc:
+            last_error_stage = "TV_TARGET_LOST"
+            last_error_message = str(exc)
+            break
+        except Exception as exc:
+            last_error_stage = "TV_CANDLE_FETCH_TIMEOUT"
+            last_error_message = str(exc)
+            continue
+
+        if not second:
+            last_error_stage = "TV_CANDLE_FETCH_TIMEOUT"
+            last_error_message = "No candles retrieved from chart on second fetch"
+            continue
+
+        # Stability evaluation
         first_last_time = _normalize_candle_time(_candle_time_value(first[-1])) if first else None
-        second_last_time = _normalize_candle_time(_candle_time_value(candles[-1])) if candles else None
-        same_count = len(first) == len(candles)
-        same_signature = same_count and _last_candle_signature(first) == _last_candle_signature(candles)
+        second_last_time = _normalize_candle_time(_candle_time_value(second[-1])) if second else None
+        same_count = len(first) == len(second)
+        same_signature = same_count and _last_candle_signature(first) == _last_candle_signature(second)
         current_bar_update = timeframe in {"4H", "1H"} and same_count and first_last_time == second_last_time
-        diagnostics["candles_count_first_fetch"] = len(first)
-        diagnostics["candles_count_second_fetch"] = len(candles)
-        diagnostics["first_last_candle_time"] = first_last_time
-        diagnostics["second_last_candle_time"] = second_last_time
-        diagnostics["stable_check_mode"] = "last_signature"
-        diagnostics["current_bar_update_allowed"] = False
-        if current_bar_update and not same_signature:
-            diagnostics["stable_check_mode"] = "intraday_current_bar_time"
-            diagnostics["current_bar_update_allowed"] = True
-        diagnostics["stable_check_passed"] = same_signature or current_bar_update
-        diagnostics["wait_seconds_used"] = total_wait
-        diagnostics["retry_count"] = attempt - 1
-        debug = _build_timeframe_debug(timeframe, candles, diagnostics)
+        stable_ok = same_signature or current_bar_update
+
+        if not stable_ok:
+            last_error_stage = "TV_CHART_READY_TIMEOUT"
+            last_error_message = "SECOND_FETCH_NOT_STABLE"
+            continue
+
+        # Build debug for staleness / gap validation
+        diagnostics = dict(client.diagnostics)
+        diagnostics.update({
+            "candles_count_first_fetch": len(first),
+            "candles_count_second_fetch": len(second),
+            "first_last_candle_time": first_last_time,
+            "second_last_candle_time": second_last_time,
+            "stable_check_passed": stable_ok,
+            "wait_seconds_used": time.monotonic() - start_time,
+            "retry_count": attempts - 1,
+            "target_resolution": requested_norm,
+            "resolution_after": active_res,
+            "resolution_match": True,
+            "loaded_symbol": active_sym,
+        })
+
+        debug = _build_timeframe_debug(timeframe, second, diagnostics)
         possible_stale = _same_latest_ohlcv(debug, previous_debug, timeframe, previous_timeframe)
-        resolution_failed = not resolution_ok or debug.get("resolution_match") is not True
-        count_failed = len(candles) < min_candles
-        stable_failed = diagnostics["stable_check_passed"] is not True
         gap_failed = debug.get("gap_validation_passed") is not True
-        debug["possible_stale_latest_bar"] = possible_stale
-        debug["stale_or_merged_candle_warning"] = bool(resolution_failed or count_failed or stable_failed or gap_failed or possible_stale)
-        if debug["stale_or_merged_candle_warning"]:
-            debug["error_stage"] = "STALE_OR_MERGED_CANDLES"
-            reasons = []
-            if resolution_failed:
-                reasons.append("RESOLUTION_MISMATCH")
-            if count_failed:
-                reasons.append("CANDLES_BELOW_MINIMUM")
-            if stable_failed:
-                reasons.append("SECOND_FETCH_NOT_STABLE")
-            if gap_failed:
-                reasons.append("GAP_VALIDATION_FAILED")
-            if possible_stale:
-                reasons.append("MATCHES_PREVIOUS_TIMEFRAME")
-            debug["error_message"] = ",".join(reasons)
-        last_candles = candles
-        last_debug = debug
-        if not debug["stale_or_merged_candle_warning"]:
-            return candles, debug
-        has_loaded_intraday_candles = (
-            timeframe in {"4H", "1H"}
-            and debug.get("resolution_match") is True
-            and len(candles) >= min_candles
-        )
-        if has_loaded_intraday_candles:
-            debug["retry_skipped_reason"] = "INTRADAY_CANDLES_LOADED_MOVE_TO_NEXT_TIMEFRAME"
-            return candles, debug
-        if attempt < settings.TRADINGVIEW_OHLCV_RETRIES:
-            client.sleep(2, f"timeframe:{timeframe}:retry")
-            total_wait += 2
-    return last_candles, last_debug
+
+        if possible_stale:
+            last_error_stage = "TV_CANDLE_INVALID"
+            last_error_message = "MATCHES_PREVIOUS_TIMEFRAME"
+            continue
+
+        if gap_failed:
+            last_error_stage = "TV_CANDLE_INVALID"
+            last_error_message = "GAP_VALIDATION_FAILED"
+            continue
+
+        # If we reach here, everything is successful!
+        elapsed_ms = int((time.monotonic() - start_time) * 1000)
+        latest_ts = int(_candle_time_seconds(_candle_time_value(second[-1]))) if second else None
+        debug.update({
+            "timeout_location": None,
+            "stale_or_merged_candle_warning": False,
+            "symbol": active_sym,
+            "timeframe": timeframe,
+            "requested_symbol": requested_sym,
+            "detected_symbol": active_sym,
+            "requested_timeframe": timeframe,
+            "detected_timeframe": active_res,
+            "success": True,
+            "code": "passed",
+            "message": None,
+            "elapsed_ms": elapsed_ms,
+            "attempts": attempts,
+            "candles_received": len(second),
+            "latest_candle_timestamp": latest_ts,
+            "error_stage": None,
+            "error_message": None,
+        })
+        return second, debug
+
+    # If the loop exited or timed out, construct the failure payload
+    elapsed_ms = int((time.monotonic() - start_time) * 1000)
+    diagnostics = dict(client.diagnostics)
+    diagnostics.update({
+        "wait_seconds_used": time.monotonic() - start_time,
+        "retry_count": attempts,
+        "error_stage": last_error_stage,
+        "error_message": last_error_message,
+        "stable_check_passed": stable_ok,
+    })
+
+    # Determine the fallback candles
+    fallback_candles = second if second else first if first else []
+    debug = _build_timeframe_debug(timeframe, fallback_candles, diagnostics)
+
+    latest_ts = int(_candle_time_seconds(_candle_time_value(fallback_candles[-1]))) if fallback_candles else None
+
+    debug.update({
+        "timeout_location": last_error_stage,
+        "stale_or_merged_candle_warning": True,
+        "symbol": diagnostics.get("loaded_symbol") or diagnostics.get("active_symbol_after_set"),
+        "timeframe": timeframe,
+        "requested_symbol": diagnostics.get("requested_tradingview_symbol"),
+        "detected_symbol": diagnostics.get("loaded_symbol") or diagnostics.get("active_symbol_after_set"),
+        "requested_timeframe": timeframe,
+        "detected_timeframe": diagnostics.get("resolution_after"),
+        "success": False,
+        "code": last_error_stage,
+        "message": last_error_message,
+        "elapsed_ms": elapsed_ms,
+        "attempts": attempts,
+        "candles_received": len(fallback_candles),
+        "latest_candle_timestamp": latest_ts,
+        "error_stage": last_error_stage,
+        "error_message": last_error_message,
+    })
+
+    return fallback_candles, debug
 
 
 def confirm_swing_symbol_timeframes(
@@ -2157,7 +2331,7 @@ def confirm_swing_symbol_timeframes(
                 **weekly_history_diagnostics,
                 **symbol_meta,
                 **_symbol_diagnostics(client),
-                "reason": "SYMBOL_TIMEOUT" if timeout_location else reason,
+                "reason": timeout_location if timeout_location else reason,
                 "error": "; ".join(f"{tf}:{err}" for tf, err in fetch_errors.items()) or reason,
                 "timeout_location": timeout_location,
             }
@@ -2366,7 +2540,7 @@ def confirm_swing_symbol_timeframes(
             **paper_plan,
         }, "swing")
     except Exception as exc:
-        reason = "SYMBOL_TIMEOUT" if isinstance(exc, TimeoutError) else "TV_ERROR"
+        reason = client.diagnostics.get("symbol_error_stage") or ("TV_SYMBOL_VERIFY_TIMEOUT" if isinstance(exc, TimeoutError) else "TV_ERROR")
         return {**empty, **symbol_meta, **_symbol_diagnostics(client), "reason": reason, "error": str(exc), "timeout_location": client.diagnostics.get("timeout_location")}
 
 
@@ -2657,7 +2831,7 @@ def confirm_momentum_symbol_timeframes(
                 "candle_integrity_summary": candle_integrity_summary,
                 **symbol_meta,
                 **_symbol_diagnostics(client),
-                "reason": "SYMBOL_TIMEOUT" if timeout_location else reason,
+                "reason": timeout_location if timeout_location else reason,
                 "error": "; ".join(f"{tf}:{err}" for tf, err in fetch_errors.items()) or reason,
                 "timeout_location": timeout_location,
             }
@@ -2770,7 +2944,7 @@ def confirm_momentum_symbol_timeframes(
             **paper_plan,
         }, "momentum")
     except Exception as exc:
-        reason = "SYMBOL_TIMEOUT" if isinstance(exc, TimeoutError) else "TV_ERROR"
+        reason = client.diagnostics.get("symbol_error_stage") or ("TV_SYMBOL_VERIFY_TIMEOUT" if isinstance(exc, TimeoutError) else "TV_ERROR")
         return {**empty, **symbol_meta, **_symbol_diagnostics(client), "reason": reason, "error": str(exc), "timeout_location": client.diagnostics.get("timeout_location")}
 
 

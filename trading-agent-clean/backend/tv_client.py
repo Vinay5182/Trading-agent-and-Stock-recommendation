@@ -352,45 +352,101 @@ class TradingViewClient:
         validate_symbol(tradingview_symbol)
         tab = self.ensure_managed_tab()
         interval = SUPPORTED_TIMEFRAMES["1D"]
-        url = tradingview_url(tradingview_symbol, interval)
         self.diagnostics["requested_symbol"] = tradingview_symbol
         self.diagnostics["symbol_navigation_attempted"] = True
-        encoded_url = quote(url, safe="")
+
+        # Try to use TradingViewApi first!
+        try:
+            res = self.evaluate_runtime(
+                f"""
+                (() => {{
+                  const api = window.TradingViewApi;
+                  const chart = api && typeof api.activeChart === 'function' ? api.activeChart() : null;
+                  if (chart && typeof chart.setSymbol === 'function') {{
+                    chart.setSymbol({json.dumps(tradingview_symbol)});
+                    return true;
+                  }}
+                  return false;
+                }})()
+                """
+            )
+            if res is True:
+                self.diagnostics["symbol_navigation_method"] = "api"
+                return tab
+        except Exception as e:
+            logger.warning("Failed to set symbol via TradingViewApi: %s", e)
+
+        url = tradingview_url(tradingview_symbol, interval)
         self.diagnostics["json_new_method_used"] = "GET"
         self.diagnostics["open_url"] = url
+        self.diagnostics["symbol_navigation_method"] = "cdp_navigate"
         return self.navigate_with_cdp(tab, url, "open_symbol")
 
     def set_timeframe(self, timeframe: str) -> dict:
         interval = validate_timeframe(timeframe)
         tab = self.ensure_managed_tab()
-        current_symbol = self.diagnostics.get("requested_tradingview_symbol") or extract_symbol_from_url(tab.get("url", "")) or "NSE:RELIANCE"
-        url = tradingview_url(current_symbol, interval)
-        encoded_url = quote(url, safe="")
+
+        # Check if already active and matches
+        current_res = self.get_active_chart_resolution()
+        current_sym = self.get_active_chart_symbol()
+        requested_sym = self.diagnostics.get("requested_tradingview_symbol")
+
+        if (
+            current_sym
+            and requested_sym
+            and self.symbol_matches(current_sym, requested_sym)
+            and normalize_timeframe(current_res) == normalize_timeframe(timeframe)
+        ):
+            self.diagnostics["resolution_after"] = normalize_timeframe(current_res)
+            self.diagnostics["resolution_match"] = True
+            return tab
+
         self.diagnostics["requested_timeframe"] = timeframe
         self.diagnostics["target_resolution"] = interval
-        self.diagnostics["resolution_before"] = extract_interval_from_url(tab.get("url", ""))
+        self.diagnostics["resolution_before"] = normalize_timeframe(current_res)
+
+        # Try to use TradingViewApi first!
+        try:
+            res = self.evaluate_runtime(
+                f"""
+                (() => {{
+                  const api = window.TradingViewApi;
+                  const chart = api && typeof api.activeChart === 'function' ? api.activeChart() : null;
+                  if (chart && typeof chart.setResolution === 'function') {{
+                    chart.setResolution({json.dumps(interval)});
+                    return true;
+                  }}
+                  return false;
+                }})()
+                """
+            )
+            if res is True:
+                self.diagnostics["resolution_navigation_method"] = "api"
+                self.refresh_resolution_status(timeframe)
+                return tab
+        except Exception as e:
+            logger.warning("Failed to set timeframe via TradingViewApi: %s", e)
+
+        current_symbol = requested_sym or extract_symbol_from_url(tab.get("url", "")) or "NSE:RELIANCE"
+        url = tradingview_url(current_symbol, interval)
         self.diagnostics["json_new_method_used"] = "GET"
         self.diagnostics["open_url"] = url
+        self.diagnostics["resolution_navigation_method"] = "cdp_navigate"
         opened = self.navigate_with_cdp(tab, url, "set_timeframe")
         self.diagnostics["resolution_after"] = extract_interval_from_url(opened.get("url", ""))
         self.diagnostics["resolution_match"] = (
-            self.diagnostics["resolution_after"] == interval
-            if self.diagnostics["resolution_after"] is not None
-            else None
+            normalize_timeframe(self.diagnostics["resolution_after"]) == normalize_timeframe(timeframe)
         )
         return opened
 
     def refresh_resolution_status(self, timeframe: str) -> None:
-        interval = validate_timeframe(timeframe)
-        self.diagnostics["target_resolution"] = interval
+        requested_norm = normalize_timeframe(timeframe)
+        self.diagnostics["target_resolution"] = requested_norm
         tab = self.open_or_reuse_chart_tab()
         chart_resolution = self.get_active_chart_resolution()
-        self.diagnostics["resolution_after"] = chart_resolution or extract_interval_from_url(tab.get("url", ""))
-        self.diagnostics["resolution_match"] = (
-            self.diagnostics["resolution_after"] == interval
-            if self.diagnostics["resolution_after"] is not None
-            else None
-        )
+        active_norm = normalize_timeframe(chart_resolution or extract_interval_from_url(tab.get("url", "")))
+        self.diagnostics["resolution_after"] = active_norm
+        self.diagnostics["resolution_match"] = (active_norm == requested_norm)
 
     def get_active_chart_resolution(self) -> str | None:
         try:
@@ -434,16 +490,14 @@ class TradingViewClient:
         except Exception as exc:
             self.diagnostics["runtime_evaluate_error"] = str(exc)
             return None
-
     def symbol_matches(self, active_symbol: str | None, requested_symbol: str) -> bool:
-        active = normalize_symbol(active_symbol)
-        requested = normalize_symbol(requested_symbol)
-        return bool(active and requested and (active == requested or active == requested.split(":", 1)[-1]))
+        return compare_symbols(active_symbol, requested_symbol)
 
     def load_symbol_strict(self, tradingview_symbol: str) -> bool:
         validate_symbol(tradingview_symbol)
         requested = normalize_symbol(tradingview_symbol)
         self.diagnostics["requested_tradingview_symbol"] = requested
+
         try:
             previous = self.get_active_chart_symbol()
         except (TradingViewTabNavigationError, TradingViewTabNotAttachedError, TradingViewTabDisconnectedError) as exc:
@@ -454,50 +508,84 @@ class TradingViewClient:
             self.diagnostics["symbol_retry_count"] = 0
             self.diagnostics["symbol_wait_seconds_used"] = 0
             return False
+
+        if previous and self.symbol_matches(previous, requested):
+            self.diagnostics["active_symbol_before_set"] = previous
+            self.diagnostics["active_symbol_after_set"] = previous
+            self.diagnostics["active_symbol_after_stabilize"] = previous
+            self.diagnostics["loaded_symbol"] = previous
+            self.diagnostics["symbol_match"] = True
+            self.diagnostics["symbol_stable_check_passed"] = True
+            self.diagnostics["symbol_retry_count"] = 0
+            self.diagnostics["symbol_wait_seconds_used"] = 0
+            self.diagnostics["symbol_error_stage"] = None
+            self.diagnostics["symbol_error_message"] = None
+            return True
+
         previous_is_different = bool(previous and not self.symbol_matches(previous, requested))
         self.diagnostics["previous_active_symbol"] = previous
         self.diagnostics["active_symbol_before_set"] = previous
         self.diagnostics["stale_previous_symbol_warning"] = False
         wait_used = 0
-        for attempt in range(1, settings.TRADINGVIEW_SYMBOL_RETRIES + 1):
+
+        max_attempts = settings.TRADINGVIEW_SYMBOL_RETRIES
+        for attempt in range(1, max_attempts + 1):
             try:
                 self.check_deadline(f"symbol_load_attempt_{attempt}")
                 self.open_symbol(tradingview_symbol)
+
                 deadline = time.time() + settings.TRADINGVIEW_SYMBOL_WAIT_SECONDS
                 active_after_set = None
+                verified_changed = False
                 while time.time() <= deadline:
                     self.check_deadline("symbol_wait")
                     active_after_set = self.get_active_chart_symbol()
                     self.diagnostics["active_symbol_after_set"] = active_after_set
                     if self.symbol_matches(active_after_set, requested) and not (previous_is_different and active_after_set == previous):
+                        verified_changed = True
                         break
-                    self.sleep(1, "symbol_wait")
-                    wait_used += 1
+                    self.sleep(0.2, "symbol_wait")
+                    wait_used += 0.2
+
+                if not verified_changed:
+                    self.diagnostics["symbol_error_stage"] = "TV_SYMBOL_VERIFY_TIMEOUT"
+                    self.diagnostics["symbol_error_message"] = f"Symbol loaded but verify timed out: requested={requested}, active={active_after_set}"
+                    if attempt < max_attempts:
+                        self.sleep(1.0, "symbol_retry_wait")
+                        wait_used += 1.0
+                        continue
+                    return False
+
                 self.sleep(settings.TRADINGVIEW_SYMBOL_STABILIZE_SECONDS, "symbol_stabilize")
                 wait_used += settings.TRADINGVIEW_SYMBOL_STABILIZE_SECONDS
                 active_after_stabilize = self.get_active_chart_symbol()
                 self.diagnostics["active_symbol_after_stabilize"] = active_after_stabilize
                 self.diagnostics["loaded_symbol"] = active_after_stabilize
+
                 symbol_match = self.symbol_matches(active_after_set, requested) and self.symbol_matches(active_after_stabilize, requested)
                 stable = active_after_set == active_after_stabilize and symbol_match and not (previous_is_different and active_after_stabilize == previous)
+
                 self.diagnostics["symbol_match"] = symbol_match
                 self.diagnostics["symbol_stable_check_passed"] = stable
                 self.diagnostics["symbol_retry_count"] = attempt - 1
                 self.diagnostics["symbol_wait_seconds_used"] = wait_used
                 self.diagnostics["stale_previous_symbol_warning"] = (previous_is_different and active_after_stabilize == previous) or not stable
+
                 if stable:
                     self.diagnostics["symbol_error_stage"] = None
                     self.diagnostics["symbol_error_message"] = None
                     return True
+
                 if active_after_stabilize and not self.symbol_matches(active_after_stabilize, requested):
-                    self.diagnostics["symbol_error_stage"] = "SYMBOL_MISMATCH"
+                    self.diagnostics["symbol_error_stage"] = "TV_SYMBOL_VERIFY_TIMEOUT"
                     self.diagnostics["symbol_error_message"] = f"requested_symbol={requested}, loaded_symbol={active_after_stabilize}"
                 elif previous_is_different and active_after_stabilize == previous:
-                    self.diagnostics["symbol_error_stage"] = "STALE_PREVIOUS_SYMBOL"
+                    self.diagnostics["symbol_error_stage"] = "TV_SYMBOL_VERIFY_TIMEOUT"
                     self.diagnostics["symbol_error_message"] = f"requested_symbol={requested}, stale_previous_symbol={previous}"
                 else:
-                    self.diagnostics["symbol_error_stage"] = "SYMBOL_LOAD_FAILED"
+                    self.diagnostics["symbol_error_stage"] = "TV_SYMBOL_SET_TIMEOUT"
                     self.diagnostics["symbol_error_message"] = f"requested_symbol={requested}, loaded_symbol={active_after_stabilize}"
+
             except (TradingViewTabNavigationError, TradingViewTabNotAttachedError, TradingViewTabDisconnectedError) as exc:
                 self.diagnostics["symbol_error_stage"] = tv_tab_error_stage(exc)
                 self.diagnostics["symbol_error_message"] = str(exc)
@@ -507,25 +595,29 @@ class TradingViewClient:
                 self.diagnostics["symbol_wait_seconds_used"] = wait_used
                 return False
             except Exception as exc:
-                self.diagnostics["symbol_error_stage"] = "SYMBOL_LOAD_FAILED"
+                self.diagnostics["symbol_error_stage"] = "TV_SYMBOL_SET_TIMEOUT"
                 self.diagnostics["symbol_error_message"] = str(exc)
-            if attempt < settings.TRADINGVIEW_SYMBOL_RETRIES:
-                self.sleep(2, "symbol_retry_wait")
-                wait_used += 2
+
+            if attempt < max_attempts:
+                self.sleep(1.0, "symbol_retry_wait")
+                wait_used += 1.0
+
         return False
 
     def wait_for_resolution(self, timeframe: str, timeout_seconds: int = 10) -> bool:
-        interval = validate_timeframe(timeframe)
+        requested_norm = normalize_timeframe(timeframe)
         deadline = time.time() + timeout_seconds
         while time.time() <= deadline:
             self.check_deadline(f"resolution_wait:{timeframe}")
             self.refresh_resolution_status(timeframe)
-            if self.diagnostics.get("resolution_after") == interval:
+            active_norm = normalize_timeframe(self.diagnostics.get("resolution_after"))
+            if active_norm == requested_norm:
                 self.diagnostics["resolution_match"] = True
                 return True
-            self.sleep(1, f"resolution_wait:{timeframe}")
+            self.sleep(0.2, f"resolution_wait:{timeframe}")
         self.refresh_resolution_status(timeframe)
-        self.diagnostics["resolution_match"] = self.diagnostics.get("resolution_after") == interval
+        active_norm = normalize_timeframe(self.diagnostics.get("resolution_after"))
+        self.diagnostics["resolution_match"] = (active_norm == requested_norm)
         return bool(self.diagnostics["resolution_match"])
 
     def navigate_with_cdp(self, tab: dict, url: str, stage: str) -> dict:
@@ -833,10 +925,6 @@ class TradingViewClient:
             if high_val < low_val:
                 continue
 
-            # Reject stale candles (older than 30 days)
-            if time.time() - time_val > 30 * 86400:
-                continue
-
             # Handle future timestamp safely
             if time_val > time.time() + 86400:
                 continue
@@ -1004,9 +1092,10 @@ def is_app_managed_tab(tab: dict) -> bool:
 
 
 def validate_timeframe(timeframe: str) -> str:
-    if timeframe not in SUPPORTED_TIMEFRAMES:
-        raise ValueError("Unsupported timeframe. Use 1W, 1D, 4H, or 1H")
-    return SUPPORTED_TIMEFRAMES[timeframe]
+    norm = normalize_timeframe(timeframe)
+    if norm not in SUPPORTED_TIMEFRAMES:
+        raise ValueError(f"Unsupported timeframe: {timeframe}. Use 1W, 1D, 4H, or 1H")
+    return SUPPORTED_TIMEFRAMES[norm]
 
 
 def tradingview_url(tradingview_symbol: str, interval: str) -> str:
@@ -1028,8 +1117,93 @@ def extract_symbol_from_url(url: str) -> str | None:
 def normalize_symbol(value: object) -> str | None:
     if value is None:
         return None
-    text = unquote(str(value)).strip().upper()
-    return text or None
+    val = str(value).strip()
+    if not val:
+        return None
+    try:
+        val = unquote(val)
+    except Exception:
+        pass
+    val = val.replace("%3A", ":").replace("%3a", ":")
+    parts = [p.strip() for p in val.split("·") if p.strip()]
+    if not parts:
+        return None
+    main_token = parts[0]
+    main_token = main_token.split(" ")[0].strip()
+
+    exchange = None
+    symbol = main_token
+    if ":" in main_token:
+        ex_part, sym_part = main_token.split(":", 1)
+        if ex_part.strip().upper() in {"NSE", "BSE"}:
+            exchange = ex_part.strip().upper()
+            symbol = sym_part.strip().upper()
+
+    if not exchange:
+        for p in parts[1:]:
+            p_upper = p.upper().strip()
+            if p_upper in {"NSE", "BSE"}:
+                exchange = p_upper
+                break
+
+    symbol = symbol.strip().upper()
+    for suffix in (".NS", ".BO"):
+        if symbol.endswith(suffix):
+            symbol = symbol[:-len(suffix)]
+
+    if exchange:
+        return f"{exchange}:{symbol}"
+    return symbol
+
+
+def compare_symbols(active: str | None, requested: str | None) -> bool:
+    if not active or not requested:
+        return False
+    norm_active = normalize_symbol(active)
+    norm_requested = normalize_symbol(requested)
+    if not norm_active or not norm_requested:
+        return False
+    if ":" in norm_active and ":" in norm_requested:
+        return norm_active == norm_requested
+    active_sym = norm_active.split(":", 1)[-1]
+    requested_sym = norm_requested.split(":", 1)[-1]
+    return active_sym == requested_sym
+
+
+def normalize_timeframe(tf: str | None) -> str | None:
+    if not tf:
+        return None
+    val = str(tf).strip().upper()
+    if val.endswith("S"):
+        val = val[:-1]
+    mapping = {
+        "1W": "1W",
+        "W": "1W",
+        "1WEEK": "1W",
+        "WEEK": "1W",
+        "1D": "1D",
+        "D": "1D",
+        "1DAY": "1D",
+        "DAY": "1D",
+        "4H": "4H",
+        "240": "4H",
+        "4HOUR": "4H",
+        "1H": "1H",
+        "60": "1H",
+        "1HOUR": "1H",
+    }
+    cleaned_val = val.replace(" ", "")
+    if cleaned_val in mapping:
+        return mapping[cleaned_val]
+    if "WEEK" in val or val == "W":
+        return "1W"
+    if "DAY" in val or val == "D":
+        return "1D"
+    if "240" in val or "4H" in val:
+        return "4H"
+    if "60" in val or "1H" in val:
+        return "1H"
+    return cleaned_val
 
 
 def extract_interval_from_url(url: str) -> str | None:

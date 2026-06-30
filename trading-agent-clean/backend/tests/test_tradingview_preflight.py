@@ -653,3 +653,84 @@ def test_cdp_unreachable_preflight(monkeypatch):
     assert status["preflight_ready"] is False
     assert status["preflight_code"] == "TV_CDP_UNREACHABLE"
     assert status["cdp_reachable"] is False
+
+
+def test_symbol_timeframe_normalization_and_routing():
+    from tv_client import normalize_symbol, compare_symbols, normalize_timeframe, validate_timeframe
+
+    # 1. NSE:SBIN equals detected NSE:SBIN
+    assert compare_symbols("NSE:SBIN", "NSE:SBIN") is True
+
+    # 2. NSE:SBIN equals safely normalized SBIN with known exchange
+    assert compare_symbols("SBIN", "NSE:SBIN") is True
+    assert compare_symbols("NSE:SBIN · 1D", "NSE:SBIN") is True
+    assert compare_symbols("SBIN · 1D · NSE", "NSE:SBIN") is True
+
+    # 3. Unrelated symbol is rejected
+    assert compare_symbols("NSE:SBIN", "NSE:RELIANCE") is False
+    assert compare_symbols("NSE:SBIN", "BSE:SBIN") is False
+
+    # 4. 1W equals W
+    assert normalize_timeframe("W") == "1W"
+    assert normalize_timeframe("1W") == "1W"
+    assert normalize_timeframe("1 week") == "1W"
+
+    # 5. 1D equals D
+    assert normalize_timeframe("D") == "1D"
+    assert normalize_timeframe("1D") == "1D"
+
+    # 6. 4H equals 240
+    assert normalize_timeframe("240") == "4H"
+    assert normalize_timeframe("4H") == "4H"
+
+    # 7. 1H equals 60
+    assert normalize_timeframe("60") == "1H"
+    assert normalize_timeframe("1H") == "1H"
+
+    # 8. validate_timeframe accepts raw and normalized values
+    assert validate_timeframe("W") == "W"
+    assert validate_timeframe("1W") == "W"
+    assert validate_timeframe("240") == "240"
+    assert validate_timeframe("4H") == "240"
+
+
+def test_client_level_timeframe_and_symbol_avoidance(monkeypatch):
+    from tv_client import TradingViewClient
+
+    calls = []
+
+    def mock_get_active_chart_symbol(self):
+        return "NSE:SBIN"
+
+    def mock_get_active_chart_resolution(self):
+        return "W"
+
+    def mock_open_symbol(self, symbol):
+        calls.append(("open_symbol", symbol))
+
+    def mock_navigate_with_cdp(self, tab, url, stage):
+        calls.append(("navigate", url, stage))
+        return tab
+
+    monkeypatch.setattr(TradingViewClient, "get_active_chart_symbol", mock_get_active_chart_symbol)
+    monkeypatch.setattr(TradingViewClient, "get_active_chart_resolution", mock_get_active_chart_resolution)
+    monkeypatch.setattr(TradingViewClient, "open_symbol", mock_open_symbol)
+    monkeypatch.setattr(TradingViewClient, "navigate_with_cdp", mock_navigate_with_cdp)
+    monkeypatch.setattr(TradingViewClient, "ensure_managed_tab", lambda self: {"id": "fake_tab", "url": "https://www.tradingview.com/chart/?symbol=NSE:SBIN&interval=W"})
+    monkeypatch.setattr(TradingViewClient, "evaluate_runtime", lambda self, expr: (_ for _ in ()).throw(RuntimeError("Mocked CDP error")))
+
+    client = TradingViewClient()
+    client.diagnostics["requested_tradingview_symbol"] = "NSE:SBIN"
+
+    # load_symbol_strict when symbol already active
+    res = client.load_symbol_strict("NSE:SBIN")
+    assert res is True
+    assert ("open_symbol", "NSE:SBIN") not in calls  # Skipped!
+
+    # set_timeframe when timeframe already active
+    client.set_timeframe("1W")
+    assert not any(c[0] == "navigate" for c in calls)  # Skipped!
+
+    # set_timeframe when timeframe different
+    client.set_timeframe("1D")
+    assert any(c[0] == "navigate" for c in calls)  # Navigated!

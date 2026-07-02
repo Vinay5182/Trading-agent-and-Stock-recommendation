@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+import hashlib
 from typing import Any
 
 from bson import ObjectId
@@ -17,9 +17,27 @@ from ai.features import (
     snapshot_has_no_attached_outcome,
     utc_now_iso,
 )
+from ai.training_schema import (
+    CANONICAL_SCHEMA_VERSION,
+    build_canonical_training_row,
+    canonical_schema_definition,
+)
 from database import get_database
 from security.operator_intent import OPERATOR_INTENT_HEADER, require_operator_intent_value
 from services.mongo_indexes import get_collection_index_specs
+from services.timestamps import (
+    FUTURE_CLOCK_SKEW_TOLERANCE_SECONDS,
+    TIMESTAMP_LEGACY_TIMEZONE_UNKNOWN,
+    TIMESTAMP_MALFORMED,
+    TIMESTAMP_MISSING,
+    TIMESTAMP_NON_UTC_AWARE,
+    TIMESTAMP_UTC_AWARE,
+    canonical_utc_iso,
+    classify_timestamp,
+    parse_legacy_timestamp_for_ordering,
+    parse_strict_utc,
+    utc_now,
+)
 
 
 router = APIRouter()
@@ -47,6 +65,329 @@ SNAPSHOT_DISPLAY_FIELDS = (
     "created_at",
     "snapshot_time",
     "outcome_attached_at",
+)
+
+TIMESTAMP_AUDIT_FIELDS = {
+    "ai_feature_snapshots": (
+        "created_at",
+        "updated_at",
+        "source_confirmation_created_at",
+        "source_candle_at",
+        "feature_as_of",
+        "snapshot_time",
+        "generated_at",
+        "calculation_timestamp",
+        "maximum_source_timestamp",
+        "feature_source_timestamp",
+        "entry_time",
+        "exit_time",
+        "completed_at",
+        "journaled_at",
+        "label_timestamp",
+        "outcome_attached_at",
+    ),
+    "scored_candidates": (
+        "created_at",
+        "updated_at",
+        "source_candle_at",
+        "calculation_timestamp",
+        "provider_timestamp",
+    ),
+    "market_data": (
+        "created_at",
+        "updated_at",
+        "provider_timestamp",
+        "history_enriched_at",
+        "source_candle_at",
+    ),
+    "paper_signals": (
+        "created_at",
+        "updated_at",
+        "source_confirmation_created_at",
+        "source_candle_at",
+        "confirmed_at",
+        "calculation_timestamp",
+        "entry_time",
+    ),
+    "paper_trades": (
+        "created_at",
+        "updated_at",
+        "source_confirmation_created_at",
+        "source_candle_at",
+        "entry_time",
+        "entry_triggered_at",
+        "exit_time",
+        "closed_at",
+        "completed_at",
+        "status_updated_at",
+        "journaled_at",
+    ),
+    "swing_tv_confirmations": (
+        "created_at",
+        "updated_at",
+        "confirmed_at",
+        "swing_confirmed_at",
+        "source_candle_at",
+        "calculation_timestamp",
+    ),
+    "momentum_tv_confirmations": (
+        "created_at",
+        "updated_at",
+        "confirmed_at",
+        "momentum_confirmed_at",
+        "source_candle_at",
+        "calculation_timestamp",
+    ),
+    "paper_market_snapshots": (
+        "created_at",
+        "updated_at",
+        "snapshot_time",
+        "market_data_updated_at",
+        "provider_timestamp",
+    ),
+    "trade_journal": (
+        "created_at",
+        "updated_at",
+        "completed_at",
+        "journaled_at",
+        "exit_time",
+        "label_timestamp",
+    ),
+}
+
+TIMESTAMP_REQUIRED_GROUPS = {
+    "ai_feature_snapshots": {
+        "source_candle_at": ("source_candle_at",),
+        "feature_as_of": ("feature_as_of", "snapshot_time"),
+    },
+    "paper_signals": {
+        "source_candle_at": ("source_candle_at",),
+    },
+    "paper_trades": {
+        "created_at": ("created_at",),
+    },
+}
+
+TIMESTAMP_FIELD_RULES = {
+    "created_at": {
+        "semantic": "record insertion metadata",
+        "known_at_prediction_time": "not a decision-time substitute",
+        "safe_usage": "audit metadata only",
+    },
+    "updated_at": {
+        "semantic": "record mutation metadata",
+        "known_at_prediction_time": "mutable after prediction",
+        "safe_usage": "audit metadata only",
+    },
+    "confirmed_at": {
+        "semantic": "strategy confirmation time",
+        "known_at_prediction_time": "only when confirmation exists",
+        "safe_usage": "decision lifecycle metadata",
+    },
+    "swing_confirmed_at": {
+        "semantic": "swing strategy confirmation time",
+        "known_at_prediction_time": "only when confirmation exists",
+        "safe_usage": "decision lifecycle metadata",
+    },
+    "momentum_confirmed_at": {
+        "semantic": "momentum strategy confirmation time",
+        "known_at_prediction_time": "only when confirmation exists",
+        "safe_usage": "decision lifecycle metadata",
+    },
+    "source_confirmation_created_at": {
+        "semantic": "legacy source-confirmation insertion time",
+        "known_at_prediction_time": "not authoritative",
+        "safe_usage": "audit metadata only",
+    },
+    "source_candle_at": {
+        "semantic": "latest source candle available to the decision",
+        "known_at_prediction_time": "yes",
+        "safe_usage": "identity and decision metadata when timezone-aware",
+    },
+    "feature_as_of": {
+        "semantic": "feature-vector freeze time",
+        "known_at_prediction_time": "yes",
+        "safe_usage": "decision metadata when timezone-aware",
+    },
+    "snapshot_time": {
+        "semantic": "legacy feature snapshot time",
+        "known_at_prediction_time": "yes when timezone-aware",
+        "safe_usage": "feature_as_of fallback for legacy preview only",
+    },
+    "generated_at": {
+        "semantic": "canonical preview generation time",
+        "known_at_prediction_time": "generated during preview",
+        "safe_usage": "audit metadata only",
+    },
+    "calculation_timestamp": {
+        "semantic": "score or plan calculation run time",
+        "known_at_prediction_time": "yes when produced by the decision calculation",
+        "safe_usage": "decision metadata",
+    },
+    "maximum_source_timestamp": {
+        "semantic": "latest source document timestamp used by feature assembly",
+        "known_at_prediction_time": "must be <= feature_as_of",
+        "safe_usage": "feature leakage audit",
+    },
+    "feature_source_timestamp": {
+        "semantic": "feature input source timestamp",
+        "known_at_prediction_time": "must be <= feature_as_of",
+        "safe_usage": "feature leakage audit",
+    },
+    "market_data_updated_at": {
+        "semantic": "market-data record update time",
+        "known_at_prediction_time": "only if <= feature_as_of",
+        "safe_usage": "feature leakage audit",
+    },
+    "provider_timestamp": {
+        "semantic": "external market-data provider timestamp",
+        "known_at_prediction_time": "only if <= feature_as_of",
+        "safe_usage": "feature leakage audit",
+    },
+    "history_enriched_at": {
+        "semantic": "market history enrichment time",
+        "known_at_prediction_time": "only if <= feature_as_of",
+        "safe_usage": "feature leakage audit",
+    },
+    "entry_time": {
+        "semantic": "paper-trade entry lifecycle time",
+        "known_at_prediction_time": "absent before entry",
+        "safe_usage": "decision lifecycle or label metadata, never identity",
+    },
+    "entry_triggered_at": {
+        "semantic": "paper-trade entry trigger lifecycle time",
+        "known_at_prediction_time": "absent before entry",
+        "safe_usage": "decision lifecycle or label metadata, never identity",
+    },
+    "exit_time": {
+        "semantic": "paper-trade exit lifecycle time",
+        "known_at_prediction_time": "absent before exit",
+        "safe_usage": "label metadata, never identity or pre-decision feature",
+    },
+    "closed_at": {
+        "semantic": "paper-trade close time",
+        "known_at_prediction_time": "absent before close",
+        "safe_usage": "label metadata",
+    },
+    "completed_at": {
+        "semantic": "trade lifecycle completion time",
+        "known_at_prediction_time": "absent before completion",
+        "safe_usage": "label metadata",
+    },
+    "status_updated_at": {
+        "semantic": "mutable status update time",
+        "known_at_prediction_time": "mutable after prediction",
+        "safe_usage": "audit metadata or legacy ordering only",
+    },
+    "journaled_at": {
+        "semantic": "journal entry creation time",
+        "known_at_prediction_time": "post-outcome",
+        "safe_usage": "label audit metadata",
+    },
+    "label_timestamp": {
+        "semantic": "outcome label timestamp",
+        "known_at_prediction_time": "post-outcome",
+        "safe_usage": "label metadata",
+    },
+    "outcome_attached_at": {
+        "semantic": "time an outcome was attached to a feature snapshot",
+        "known_at_prediction_time": "post-outcome",
+        "safe_usage": "label audit metadata",
+    },
+}
+
+TIMESTAMP_EVENT_ERROR_CODES = {
+    "SOURCE_CANDLE_AFTER_FEATURE_AS_OF",
+    "FEATURE_AS_OF_AFTER_CONFIRMATION",
+    "CONFIRMED_AFTER_ENTRY",
+    "ENTRY_AFTER_EXIT",
+    "EXIT_AFTER_COMPLETED",
+    "SOURCE_CANDLE_AFTER_CALCULATION_TIMESTAMP",
+    "FEATURE_SOURCE_AFTER_FEATURE_AS_OF",
+    "POST_DECISION_TIMESTAMP_USED_AS_FEATURE_SOURCE",
+}
+
+TIMESTAMP_BLOCKING_FUTURE_CODES_BY_FIELD = {
+    "source_candle_at": "TIMESTAMP_IN_FUTURE_SOURCE_CANDLE",
+    "feature_as_of": "TIMESTAMP_IN_FUTURE_FEATURE_AS_OF",
+    "snapshot_time": "TIMESTAMP_IN_FUTURE_FEATURE_AS_OF",
+    "feature_source_timestamp": "TIMESTAMP_IN_FUTURE_FEATURE_SOURCE",
+    "maximum_source_timestamp": "TIMESTAMP_IN_FUTURE_FEATURE_SOURCE",
+    "market_data_updated_at": "TIMESTAMP_IN_FUTURE_FEATURE_SOURCE",
+    "provider_timestamp": "TIMESTAMP_IN_FUTURE_FEATURE_SOURCE",
+    "history_enriched_at": "TIMESTAMP_IN_FUTURE_FEATURE_SOURCE",
+    "confirmed_at": "TIMESTAMP_IN_FUTURE_CONFIRMATION",
+    "swing_confirmed_at": "TIMESTAMP_IN_FUTURE_CONFIRMATION",
+    "momentum_confirmed_at": "TIMESTAMP_IN_FUTURE_CONFIRMATION",
+    "calculation_timestamp": "TIMESTAMP_IN_FUTURE_CALCULATION",
+    "entry_time": "TIMESTAMP_IN_FUTURE_ENTRY",
+    "entry_triggered_at": "TIMESTAMP_IN_FUTURE_ENTRY",
+    "exit_time": "TIMESTAMP_IN_FUTURE_EXIT",
+    "closed_at": "TIMESTAMP_IN_FUTURE_EXIT",
+    "label_timestamp": "TIMESTAMP_IN_FUTURE_LABEL",
+    "completed_at": "TIMESTAMP_IN_FUTURE_LABEL",
+    "journaled_at": "TIMESTAMP_IN_FUTURE_LABEL",
+    "outcome_attached_at": "TIMESTAMP_IN_FUTURE_LABEL",
+}
+
+TIMESTAMP_AUDIT_ONLY_FUTURE_FIELDS = {
+    "created_at",
+    "updated_at",
+    "status_updated_at",
+    "generated_at",
+    "source_confirmation_created_at",
+}
+
+TIMESTAMP_ORDER_RULES = (
+    {
+        "rule": "source_candle_at <= feature_as_of",
+        "earlier": ("source_candle_at",),
+        "later": ("feature_as_of", "snapshot_time"),
+        "code": "SOURCE_CANDLE_AFTER_FEATURE_AS_OF",
+        "required_for_row_evaluation": True,
+    },
+    {
+        "rule": "feature_as_of <= confirmed_at",
+        "earlier": ("feature_as_of", "snapshot_time"),
+        "later": ("confirmed_at", "swing_confirmed_at", "momentum_confirmed_at"),
+        "code": "FEATURE_AS_OF_AFTER_CONFIRMATION",
+        "required_for_row_evaluation": False,
+    },
+    {
+        "rule": "confirmed_at <= entry_time",
+        "earlier": ("confirmed_at", "swing_confirmed_at", "momentum_confirmed_at"),
+        "later": ("entry_time", "entry_triggered_at"),
+        "code": "CONFIRMED_AFTER_ENTRY",
+        "required_for_row_evaluation": False,
+    },
+    {
+        "rule": "entry_time <= exit_time",
+        "earlier": ("entry_time", "entry_triggered_at"),
+        "later": ("exit_time", "closed_at"),
+        "code": "ENTRY_AFTER_EXIT",
+        "required_for_row_evaluation": False,
+    },
+    {
+        "rule": "exit_time <= completed_at",
+        "earlier": ("exit_time", "closed_at"),
+        "later": ("completed_at", "journaled_at"),
+        "code": "EXIT_AFTER_COMPLETED",
+        "required_for_row_evaluation": False,
+    },
+    {
+        "rule": "source_candle_at <= calculation_timestamp",
+        "earlier": ("source_candle_at",),
+        "later": ("calculation_timestamp",),
+        "code": "SOURCE_CANDLE_AFTER_CALCULATION_TIMESTAMP",
+        "required_for_row_evaluation": False,
+    },
+    {
+        "rule": "feature_source_timestamp <= feature_as_of",
+        "earlier": ("feature_source_timestamp", "maximum_source_timestamp", "market_data_updated_at", "provider_timestamp"),
+        "later": ("feature_as_of", "snapshot_time"),
+        "code": "FEATURE_SOURCE_AFTER_FEATURE_AS_OF",
+        "required_for_row_evaluation": False,
+    },
 )
 
 
@@ -82,17 +423,8 @@ def _strategy_type_from_document(document: dict) -> str | None:
     return None
 
 
-def _parse_timestamp(value: Any) -> datetime | None:
-    if isinstance(value, datetime):
-        parsed = value
-    elif value not in (None, ""):
-        try:
-            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        except ValueError:
-            return None
-    else:
-        return None
-    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+def _parse_timestamp(value: Any) -> Any:
+    return parse_legacy_timestamp_for_ordering(value)
 
 
 def _is_document_safe_at(document: dict | None, cutoff: Any) -> bool:
@@ -599,6 +931,514 @@ def _is_open_paper_trade(trade: dict) -> bool:
     return bool(statuses & OPEN_PAPER_TRADE_STATUSES) and not bool(statuses & CLOSED_TRADE_STATUSES)
 
 
+def _timestamp_quality_counts() -> dict[str, int]:
+    return {
+        TIMESTAMP_UTC_AWARE: 0,
+        TIMESTAMP_NON_UTC_AWARE: 0,
+        TIMESTAMP_LEGACY_TIMEZONE_UNKNOWN: 0,
+        TIMESTAMP_MALFORMED: 0,
+        TIMESTAMP_MISSING: 0,
+    }
+
+
+def _timestamp_quality_key(quality: Any) -> str:
+    return str(quality or TIMESTAMP_MALFORMED)
+
+
+def _sample_timestamp_value(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    text = str(value)
+    return text if len(text) <= 80 else f"{text[:77]}..."
+
+
+def _add_timestamp_example(
+    examples: dict[str, list[dict[str, Any]]],
+    bucket: str,
+    *,
+    collection: str,
+    field: str,
+    classified: dict[str, Any],
+) -> None:
+    if len(examples.setdefault(bucket, [])) >= 5:
+        return
+    examples[bucket].append(
+        {
+            "collection": collection,
+            "field": field,
+            "storage_type": classified.get("storage_type"),
+            "quality": classified.get("quality"),
+            "original_sample": _sample_timestamp_value(classified.get("original")),
+            "canonical": classified.get("canonical"),
+        }
+    )
+
+
+def _document_identity(collection_name: str, row: dict) -> dict[str, Any]:
+    raw_identity = (
+        row.get("_id")
+        or row.get("id")
+        or row.get("run_id")
+        or row.get("snapshot_identity")
+        or row.get("data_source_ids")
+        or {
+            "symbol": row.get("symbol") or row.get("canonical_symbol") or row.get("tradingview_symbol"),
+            "timeframe": row.get("timeframe"),
+            "strategy_type": row.get("strategy_type") or row.get("source_signal_type"),
+        }
+    )
+    digest = hashlib.sha256(f"{collection_name}:{raw_identity}".encode("utf-8")).hexdigest()[:12]
+    identity = {"document_ref": f"{collection_name}:{digest}"}
+    for field in ("symbol", "canonical_symbol", "timeframe", "strategy_type", "source_mode"):
+        if row.get(field) not in (None, ""):
+            identity[field] = str(row[field])
+    return identity
+
+
+async def _read_timestamp_audit_rows(collection: Any, limit: int) -> list[dict]:
+    find = getattr(collection, "find", None)
+    if find is None:
+        return []
+    cursor = find({})
+    if hasattr(cursor, "limit"):
+        cursor = cursor.limit(limit)
+    return [row async for row in cursor]
+
+
+def _increment(counter: dict[str, int], key: str) -> None:
+    counter[key] = counter.get(key, 0) + 1
+
+
+def _has_any_timestamp(row: dict, fields: tuple[str, ...]) -> bool:
+    return any(row.get(field) not in (None, "") for field in fields)
+
+
+def _canonical_row_timestamp_status(row: dict, generated_at: str) -> dict[str, Any] | None:
+    if not _has_any_timestamp(row, ("feature_as_of", "snapshot_time", "source_candle_at")):
+        return None
+    canonical_row = build_canonical_training_row(row, generated_at=generated_at)
+    return {
+        "training_eligible": canonical_row["audit"].get("training_eligible"),
+        "training_row_id": canonical_row.get("training_row_id"),
+        "timestamp_exclusion_reason": canonical_row["audit"].get("timestamp_exclusion_reason"),
+        "exclusion_reason": canonical_row["audit"].get("exclusion_reason"),
+        "timestamp_warnings": canonical_row["audit"].get("timestamp_warnings") or [],
+        "validation_errors": canonical_row["audit"].get("validation_errors") or [],
+        "event_errors": [
+            error
+            for error in canonical_row["audit"].get("validation_errors") or []
+            if error in TIMESTAMP_EVENT_ERROR_CODES
+        ],
+    }
+
+
+def _first_present_timestamp(row: dict, fields: tuple[str, ...], now: Any) -> tuple[str | None, dict[str, Any]]:
+    for field in fields:
+        if row.get(field) not in (None, ""):
+            return field, classify_timestamp(row.get(field), now=now)
+    return None, classify_timestamp(None, now=now)
+
+
+def _evaluate_order_rule(row: dict, rule: dict[str, Any], now: Any) -> str:
+    _earlier_field, earlier_info = _first_present_timestamp(row, rule["earlier"], now)
+    _later_field, later_info = _first_present_timestamp(row, rule["later"], now)
+    if earlier_info.get("canonical") is None or later_info.get("canonical") is None:
+        return "not_evaluable"
+    earlier_dt, _ = parse_strict_utc(earlier_info["canonical"], now=now)
+    later_dt, _ = parse_strict_utc(later_info["canonical"], now=now)
+    if earlier_dt and later_dt and earlier_dt > later_dt:
+        return "failed"
+    return "passed"
+
+
+def _initial_order_rule_counts() -> dict[str, dict[str, int]]:
+    return {
+        str(rule["rule"]): {
+            "compared_count": 0,
+            "passed_count": 0,
+            "failed_count": 0,
+            "not_evaluable_count": 0,
+        }
+        for rule in TIMESTAMP_ORDER_RULES
+    }
+
+
+def _event_order_summary(rows: list[dict], now: Any) -> dict[str, Any]:
+    rule_counts = _initial_order_rule_counts()
+    valid_rows = invalid_rows = not_evaluable_rows = 0
+
+    for row in rows:
+        row_failed = False
+        row_required_not_evaluable = False
+        for rule in TIMESTAMP_ORDER_RULES:
+            status = _evaluate_order_rule(row, rule, now)
+            counts = rule_counts[str(rule["rule"])]
+            if status == "not_evaluable":
+                counts["not_evaluable_count"] += 1
+                if rule["required_for_row_evaluation"]:
+                    row_required_not_evaluable = True
+                continue
+            counts["compared_count"] += 1
+            if status == "failed":
+                counts["failed_count"] += 1
+                row_failed = True
+            else:
+                counts["passed_count"] += 1
+
+        if row_failed:
+            invalid_rows += 1
+        elif row_required_not_evaluable:
+            not_evaluable_rows += 1
+        else:
+            valid_rows += 1
+
+    return {
+        "scope": "ai_feature_snapshots",
+        "event_order_valid_rows": valid_rows,
+        "event_order_invalid_rows": invalid_rows,
+        "event_order_not_evaluable_rows": not_evaluable_rows,
+        "rules": rule_counts,
+    }
+
+
+def _future_exclusion_code(field: str) -> str | None:
+    return TIMESTAMP_BLOCKING_FUTURE_CODES_BY_FIELD.get(field)
+
+
+def _future_detail(
+    *,
+    collection_name: str,
+    row: dict,
+    field: str,
+    classified: dict[str, Any],
+    audit_now: Any,
+    canonical_status: dict[str, Any] | None,
+) -> dict[str, Any]:
+    delta_seconds = float(classified.get("future_delta_seconds") or 0)
+    training_critical = field in TIMESTAMP_BLOCKING_FUTURE_CODES_BY_FIELD
+    exclusion_code = _future_exclusion_code(field)
+    if field in TIMESTAMP_AUDIT_ONLY_FUTURE_FIELDS:
+        training_critical = False
+        exclusion_code = None
+
+    if canonical_status is None:
+        canonical_excluded = None
+        reason = "SOURCE_RECORD_AUDIT_ONLY" if training_critical else "WARNING_ONLY_AUDIT_METADATA"
+    else:
+        canonical_excluded = canonical_status.get("training_eligible") is False
+        reason = (
+            canonical_status.get("timestamp_exclusion_reason")
+            or canonical_status.get("exclusion_reason")
+            or ("WARNING_ONLY_AUDIT_METADATA" if not training_critical else None)
+        )
+
+    return {
+        "collection": collection_name,
+        "document_identity": _document_identity(collection_name, row),
+        "field": field,
+        "original_value": classified.get("original"),
+        "canonical_utc": classified.get("canonical"),
+        "audit_current_utc": canonical_utc_iso(audit_now),
+        "future_delta_seconds": delta_seconds,
+        "future_delta_minutes": delta_seconds / 60,
+        "future_delta_days": delta_seconds / 86400,
+        "timestamp_quality": classified.get("quality"),
+        "semantic_category": (TIMESTAMP_FIELD_RULES.get(field) or {}).get("semantic", "unknown"),
+        "training_critical": training_critical,
+        "canonical_row_excluded": canonical_excluded,
+        "exclusion_code": exclusion_code,
+        "exclusion_or_non_blocking_reason": reason,
+    }
+
+
+@router.get("/features/timestamp-audit")
+async def get_ai_timestamp_audit(
+    limit: int = Query(default=250, ge=1, le=5000),
+) -> dict:
+    db = get_database()
+    audit_now = utc_now()
+    audit_now_iso = canonical_utc_iso(audit_now)
+    generated_at = audit_now_iso
+    field_occurrence_count_by_quality = _timestamp_quality_counts()
+    affected_documents_by_quality = {key: set() for key in field_occurrence_count_by_quality}
+    examples: dict[str, list[dict[str, Any]]] = {key: [] for key in field_occurrence_count_by_quality}
+    collections: dict[str, Any] = {}
+    rows_excluded_by_timestamp_reason: dict[str, int] = {}
+    timestamp_warning_rows_by_reason: dict[str, int] = {}
+    equivalent_instants_with_inconsistent_formatting: list[dict[str, Any]] = []
+    created_at_confirmation_fallback_count = 0
+    created_at_confirmation_by_collection: dict[str, dict[str, Any]] = {}
+    documents_scanned = 0
+    timestamp_fields_examined = 0
+    timestamp_values_present = 0
+    documents_with_any_timestamp_issue: set[str] = set()
+    affected_documents_by_collection: dict[str, set[str]] = {}
+    affected_documents_by_field: dict[str, set[str]] = {}
+    future_timestamp_details: list[dict[str, Any]] = []
+    future_documents: set[str] = set()
+    future_blocking_occurrences = 0
+    future_warning_occurrences = 0
+    future_by_collection: dict[str, int] = {}
+    future_by_field: dict[str, int] = {}
+    future_delta_seconds: list[float] = []
+    all_ai_feature_snapshot_rows: list[dict] = []
+
+    def mark_issue(collection_name: str, doc_ref: str, field: str | None = None) -> None:
+        documents_with_any_timestamp_issue.add(doc_ref)
+        affected_documents_by_collection.setdefault(collection_name, set()).add(doc_ref)
+        if field:
+            affected_documents_by_field.setdefault(field, set()).add(doc_ref)
+
+    for collection_name, fields in TIMESTAMP_AUDIT_FIELDS.items():
+        collection = getattr(db, collection_name, None)
+        if collection is None:
+            collections[collection_name] = {
+                "available": False,
+                "rows_seen": 0,
+                "fields": list(fields),
+            }
+            continue
+
+        rows = await _read_timestamp_audit_rows(collection, limit)
+        if collection_name == "ai_feature_snapshots":
+            all_ai_feature_snapshot_rows = rows
+        documents_scanned += len(rows)
+        collection_counts = _timestamp_quality_counts()
+        collection_documents_by_quality = {key: set() for key in collection_counts}
+        field_counts = {field: _timestamp_quality_counts() for field in fields}
+        missing_required: dict[str, int] = {}
+        equivalent_seen: dict[tuple[str, str], set[str]] = {}
+        collection_created_at_fallbacks = 0
+        collection_affected_docs: set[str] = set()
+
+        for row in rows:
+            document_identity = _document_identity(collection_name, row)
+            doc_ref = str(document_identity["document_ref"])
+            canonical_status = (
+                _canonical_row_timestamp_status(row, generated_at)
+                if collection_name == "ai_feature_snapshots"
+                else None
+            )
+            if canonical_status:
+                reason = canonical_status.get("timestamp_exclusion_reason")
+                if reason:
+                    _increment(rows_excluded_by_timestamp_reason, str(reason))
+                    mark_issue(collection_name, doc_ref)
+                    collection_affected_docs.add(doc_ref)
+                for warning in canonical_status.get("timestamp_warnings") or []:
+                    warning_reason = str(warning).split(":", 1)[-1]
+                    _increment(timestamp_warning_rows_by_reason, warning_reason)
+
+            for field in fields:
+                timestamp_fields_examined += 1
+                value = row.get(field)
+                if value not in (None, ""):
+                    timestamp_values_present += 1
+                classified = classify_timestamp(value, now=audit_now)
+                quality = _timestamp_quality_key(classified.get("quality"))
+                _increment(collection_counts, quality)
+                _increment(field_counts[field], quality)
+                _increment(field_occurrence_count_by_quality, quality)
+                collection_documents_by_quality.setdefault(quality, set()).add(doc_ref)
+                affected_documents_by_quality.setdefault(quality, set()).add(doc_ref)
+                _add_timestamp_example(
+                    examples,
+                    quality,
+                    collection=collection_name,
+                    field=field,
+                    classified=classified,
+                )
+                if quality in {TIMESTAMP_LEGACY_TIMEZONE_UNKNOWN, TIMESTAMP_MALFORMED}:
+                    mark_issue(collection_name, doc_ref, field)
+                    collection_affected_docs.add(doc_ref)
+                if classified.get("is_future"):
+                    detail = _future_detail(
+                        collection_name=collection_name,
+                        row=row,
+                        field=field,
+                        classified=classified,
+                        audit_now=audit_now,
+                        canonical_status=canonical_status,
+                    )
+                    future_timestamp_details.append(detail)
+                    future_documents.add(doc_ref)
+                    future_delta_seconds.append(float(detail["future_delta_seconds"]))
+                    _increment(future_by_collection, collection_name)
+                    _increment(future_by_field, field)
+                    if detail["training_critical"]:
+                        future_blocking_occurrences += 1
+                    else:
+                        future_warning_occurrences += 1
+                    mark_issue(collection_name, doc_ref, field)
+                    collection_affected_docs.add(doc_ref)
+                canonical = classified.get("canonical")
+                original = classified.get("original")
+                if canonical and original:
+                    equivalent_seen.setdefault((field, str(canonical)), set()).add(str(original))
+
+            for requirement, alternatives in TIMESTAMP_REQUIRED_GROUPS.get(collection_name, {}).items():
+                if not any(row.get(field) not in (None, "") for field in alternatives):
+                    _increment(missing_required, requirement)
+                    mark_issue(collection_name, doc_ref, requirement)
+                    collection_affected_docs.add(doc_ref)
+
+            if collection_name in {"swing_tv_confirmations", "momentum_tv_confirmations", "paper_signals"}:
+                confirmation_fields = ("confirmed_at", "swing_confirmed_at", "momentum_confirmed_at")
+                if not any(row.get(field) not in (None, "") for field in confirmation_fields) and row.get("created_at"):
+                    collection_created_at_fallbacks += 1
+                    created_at_confirmation_fallback_count += 1
+                    mark_issue(collection_name, doc_ref, "confirmed_at")
+                    collection_affected_docs.add(doc_ref)
+
+        for (field, canonical), originals in equivalent_seen.items():
+            if len(originals) > 1:
+                equivalent_instants_with_inconsistent_formatting.append(
+                    {
+                        "collection": collection_name,
+                        "field": field,
+                        "canonical": canonical,
+                        "format_count": len(originals),
+                        "examples": sorted(_sample_timestamp_value(value) for value in originals)[:5],
+                    }
+                )
+
+        if collection_created_at_fallbacks:
+            created_at_confirmation_by_collection[collection_name] = {
+                "candidate_count": collection_created_at_fallbacks,
+                "created_at_used_as_confirmed_at": False,
+                "confirmation_time_quality": TIMESTAMP_MISSING,
+                "exclusion_policy": "exclude only when confirmation is required for that row type",
+            }
+
+        collections[collection_name] = {
+            "available": True,
+            "rows_seen": len(rows),
+            "fields": list(fields),
+            "timestamp_fields_examined": len(rows) * len(fields),
+            "timestamp_values_present": sum(
+                1
+                for row in rows
+                for field in fields
+                if row.get(field) not in (None, "")
+            ),
+            "field_occurrence_count_by_quality": collection_counts,
+            "affected_document_count_by_quality": {
+                quality: len(documents)
+                for quality, documents in collection_documents_by_quality.items()
+            },
+            "field_quality_counts": field_counts,
+            "missing_required_timestamps": missing_required,
+            "created_at_confirmation_fallback_candidates": collection_created_at_fallbacks,
+            "documents_with_any_timestamp_issue": len(collection_affected_docs),
+        }
+
+    event_order_summary = _event_order_summary(all_ai_feature_snapshot_rows, audit_now)
+    if event_order_summary["event_order_invalid_rows"] or event_order_summary["event_order_not_evaluable_rows"]:
+        for row in all_ai_feature_snapshot_rows:
+            doc_ref = str(_document_identity("ai_feature_snapshots", row)["document_ref"])
+            base_rule = TIMESTAMP_ORDER_RULES[0]
+            base_status = _evaluate_order_rule(row, base_rule, audit_now)
+            if base_status != "passed":
+                mark_issue("ai_feature_snapshots", doc_ref, str(base_rule["rule"]))
+
+    future_summary = {
+        "field_occurrence_count": len(future_timestamp_details),
+        "affected_document_count": len(future_documents),
+        "blocking_field_occurrence_count": future_blocking_occurrences,
+        "warning_only_field_occurrence_count": future_warning_occurrences,
+        "by_collection": future_by_collection,
+        "by_field": future_by_field,
+        "delta_seconds": {
+            "min": min(future_delta_seconds) if future_delta_seconds else None,
+            "max": max(future_delta_seconds) if future_delta_seconds else None,
+        },
+        "delta_minutes": {
+            "min": min(future_delta_seconds) / 60 if future_delta_seconds else None,
+            "max": max(future_delta_seconds) / 60 if future_delta_seconds else None,
+        },
+        "delta_days": {
+            "min": min(future_delta_seconds) / 86400 if future_delta_seconds else None,
+            "max": max(future_delta_seconds) / 86400 if future_delta_seconds else None,
+        },
+    }
+
+    return {
+        "paper_only": True,
+        "read_only": True,
+        "preview_only": True,
+        "mongo_writes_enabled": False,
+        "sample_limit": limit,
+        "audit_current_utc": audit_now_iso,
+        "canonical_timestamp_format": "YYYY-MM-DDTHH:MM:SS.ffffffZ",
+        "future_clock_skew_tolerance_seconds": FUTURE_CLOCK_SKEW_TOLERANCE_SECONDS,
+        "timestamp_quality_categories": {
+            "UTC_AWARE": "timezone-aware UTC timestamp normalized to canonical Z",
+            "NON_UTC_AWARE": "timezone-aware non-UTC timestamp converted to canonical UTC Z",
+            "LEGACY_TIMEZONE_UNKNOWN": "timezone-naive legacy value; never assumed UTC for canonical training",
+            "MALFORMED": "unparseable timestamp value",
+            "MISSING": "missing timestamp value",
+        },
+        "count_definitions": {
+            "documents_scanned": "documents read across audited collections, up to sample_limit per collection",
+            "timestamp_fields_examined": "document-field checks, including missing values",
+            "timestamp_values_present": "document-field checks with a non-empty value",
+            "field_occurrence_count_by_quality": "timestamp field occurrences by parse quality; these are not row counts",
+            "affected_document_count_by_quality": "unique documents with at least one field of that parse quality",
+            "documents_with_any_timestamp_issue": "unique documents with future, malformed, timezone-unknown, missing-required, or created_at-confirmation-fallback issue",
+        },
+        "documents_scanned": documents_scanned,
+        "documents_with_any_timestamp_issue": len(documents_with_any_timestamp_issue),
+        "timestamp_fields_examined": timestamp_fields_examined,
+        "timestamp_values_present": timestamp_values_present,
+        "affected_document_count_by_quality": {
+            quality: len(documents)
+            for quality, documents in affected_documents_by_quality.items()
+        },
+        "field_occurrence_count_by_quality": field_occurrence_count_by_quality,
+        "affected_document_count_by_collection": {
+            collection: len(documents)
+            for collection, documents in affected_documents_by_collection.items()
+        },
+        "affected_document_count_by_field": {
+            field: len(documents)
+            for field, documents in affected_documents_by_field.items()
+        },
+        "future_timestamp_policy": {
+            "training_critical_fields": TIMESTAMP_BLOCKING_FUTURE_CODES_BY_FIELD,
+            "audit_only_warning_fields": sorted(TIMESTAMP_AUDIT_ONLY_FUTURE_FIELDS),
+        },
+        "future_timestamp_summary": future_summary,
+        "future_timestamps": future_timestamp_details,
+        "created_at_confirmation_fallback": {
+            "total_candidates": created_at_confirmation_fallback_count,
+            "created_at_used_as_confirmed_at": False,
+            "by_collection": created_at_confirmation_by_collection,
+        },
+        "event_order_rules": [
+            "source_candle_at <= feature_as_of",
+            "feature_as_of <= confirmed_at or strategy-specific confirmation timestamp",
+            "confirmed_at <= entry_time",
+            "entry_time <= exit_time",
+            "exit_time <= completed_at",
+            "source_candle_at <= calculation_timestamp",
+            "feature_source_timestamp <= feature_as_of",
+        ],
+        "event_order_summary": event_order_summary,
+        "field_rules": TIMESTAMP_FIELD_RULES,
+        "collections": collections,
+        "representative_examples": examples,
+        "equivalent_instants_with_inconsistent_formatting": equivalent_instants_with_inconsistent_formatting[:20],
+        "rows_excluded_by_timestamp_reason": rows_excluded_by_timestamp_reason,
+        "timestamp_warning_rows_by_reason": timestamp_warning_rows_by_reason,
+        "canonical_row_exclusion_reconciliation": {
+            "scope": "ai_feature_snapshots",
+            "canonical_rows_evaluated": len(all_ai_feature_snapshot_rows),
+            "rows_excluded_by_timestamp_reason": rows_excluded_by_timestamp_reason,
+            "rows_with_timestamp_warnings_by_reason": timestamp_warning_rows_by_reason,
+        },
+    }
+
+
 @router.get("/features/summary")
 async def get_ai_feature_dataset_summary(
     strategy_type: str | None = Query(default=None),
@@ -841,6 +1681,58 @@ async def preview_ai_feature_snapshots(
         "returned_count": len(rows),
         "count": len(rows),
         "rows": rows,
+    }
+
+
+@router.get("/features/canonical-preview")
+async def preview_canonical_training_rows(
+    strategy_type: str | None = Query(default=None),
+    limit: int = Query(default=10, ge=1, le=100),
+    timeframe: str | None = Query(default=None),
+    linked_only: bool = Query(default=True),
+    source: str = Query(default="scored_candidates"),
+    terminal_only: bool = Query(default=False),
+) -> dict:
+    clean_source = normalize_snapshot_source(source)
+    strategy, clean_timeframe = _resolve_snapshot_filters(clean_source, strategy_type, timeframe)
+    built_rows = await _build_feature_snapshots(
+        get_database(),
+        strategy,
+        limit,
+        clean_timeframe,
+        clean_source,
+        terminal_only,
+    )
+    rows, skipped_unlinked_count = _filter_linked_snapshots(built_rows, linked_only)
+    generated_at = utc_now_iso()
+    canonical_rows = [
+        build_canonical_training_row(row, generated_at=generated_at)
+        for row in rows
+    ]
+    invalid_rows = [
+        row for row in canonical_rows if not row["audit"]["training_eligible"]
+    ]
+
+    return {
+        "paper_only": True,
+        "read_only": True,
+        "preview_only": True,
+        "mongo_writes_enabled": False,
+        "schema_version": CANONICAL_SCHEMA_VERSION,
+        "schema": canonical_schema_definition(),
+        "strategy_type": strategy,
+        "timeframe": clean_timeframe,
+        "source": clean_source,
+        "terminal_only": terminal_only,
+        "linked_only": linked_only,
+        "warning": _unlinked_snapshot_warning(linked_only),
+        "built_count": len(built_rows),
+        "skipped_unlinked_count": skipped_unlinked_count,
+        "returned_count": len(canonical_rows),
+        "count": len(canonical_rows),
+        "eligible_count": len(canonical_rows) - len(invalid_rows),
+        "excluded_count": len(invalid_rows),
+        "rows": canonical_rows,
     }
 
 

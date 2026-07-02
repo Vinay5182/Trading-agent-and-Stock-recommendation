@@ -21,7 +21,7 @@ from services.mongo_indexes import get_collection_index_specs
 from services.paper_identity import apply_setup_identity, paper_trade_setup_filter
 from services.paper_sync import sync_trade_ready
 from services.system_errors import record_system_error
-from services.capital_accounting import try_activate_trade_with_capital, get_current_virtual_balance_and_pnl, get_portfolio_totals
+from services.capital_accounting import try_activate_trade_with_capital, get_current_virtual_balance_and_pnl, get_portfolio_totals, trade_open_margin_used
 
 from services.paper_update_scheduler import (
     SCHEDULER_DRY_RUN_ENDPOINT_MODE,
@@ -830,7 +830,170 @@ def setup_time_value(trade: dict):
     )
 
 
-def paper_api_row(trade: dict) -> dict:
+async def get_market_map(db) -> dict:
+    try:
+        collection = getattr(db, "market_data", None)
+        if collection is None:
+            return {}
+        cursor = collection.find({}, {"_id": 0})
+        rows = [r async for r in cursor]
+        market_map = {}
+        for row in rows:
+            exc = str(row.get("exchange") or "NSE").strip().upper()
+            sym = str(row.get("canonical_symbol") or row.get("symbol") or "").strip().upper()
+            if sym:
+                market_map[(exc, sym)] = row
+        return market_map
+    except Exception:
+        return {}
+
+
+def canonical_market_exchange_for_trade(trade: dict) -> str:
+    exchange = trade.get("exchange")
+    if exchange:
+        return str(exchange).strip().upper()
+    for field in ("tradingview_symbol", "requested_tradingview_symbol"):
+        val = trade.get(field)
+        if val and ":" in str(val):
+            exc = str(val).split(":")[0].strip().upper()
+            if exc in {"NSE", "BSE"}:
+                return exc
+    return "NSE"
+
+
+def resolve_fresh_quote(trade: dict, market_map: dict) -> tuple[float | None, str | None, str | None, str | None]:
+    """
+    Resolves price and checks freshness from market_map.
+    Returns (price, updated_at, source, price_warning).
+    """
+    from services.timestamps import parse_strict_utc, utc_now
+
+    symbol = canonical_market_symbol_for_trade(trade)
+    if not symbol:
+        return None, None, None, "MISSING_SYMBOL"
+    symbol_upper = symbol.upper()
+
+    exchange = canonical_market_exchange_for_trade(trade)
+
+    # Direct lookup strictly by exchange + symbol
+    row = market_map.get((exchange, symbol_upper))
+    if not row:
+        return None, None, None, "QUOTE_NOT_FOUND"
+
+    # Verify exact exchange and symbol match
+    quote_exchange = str(row.get("exchange") or "NSE").strip().upper()
+    quote_symbol = str(row.get("canonical_symbol") or row.get("symbol") or "").strip().upper()
+
+    if quote_exchange != exchange or quote_symbol != symbol_upper:
+        return None, None, None, "EXCHANGE_OR_SYMBOL_MISMATCH"
+
+    ts_val = row.get("provider_timestamp") or row.get("updated_at")
+    if not ts_val:
+        return None, None, f"market_data_{exchange}_NO_TIMESTAMP", "TIMESTAMP_MISSING"
+
+    if isinstance(ts_val, datetime) and ts_val.tzinfo is None:
+        ts_val = ts_val.replace(tzinfo=timezone.utc)
+
+    dt, info = parse_strict_utc(ts_val)
+    quality = info.get("quality")
+    if not dt or info.get("is_future") or quality in ("MALFORMED", "LEGACY_TIMEZONE_UNKNOWN"):
+        warn_code = f"TIMESTAMP_UNSAFE_{quality or 'UNKNOWN'}"
+        return None, None, f"market_data_{exchange}_UNSAFE", warn_code
+
+    threshold = getattr(settings, "MARKET_DATA_STALENESS_THRESHOLD_SECONDS", 86400)
+    now = utc_now()
+    age = (now - dt).total_seconds()
+    if age > threshold:
+        return None, info.get("canonical"), f"market_data_{exchange}_STALE", "TIMESTAMP_STALE"
+
+    price = number_or_none(row.get("current_price"))
+    return price, info.get("canonical"), f"market_data_{exchange}", None
+
+
+def select_pnl(trade: dict, force_zero: bool = False) -> float:
+    if force_zero:
+        return 0.0
+    pnl_val = trade.get("paper_pnl")
+    if pnl_val is not None:
+        return float(pnl_val)
+    fallback_val = trade.get("total_trade_pnl")
+    if fallback_val is not None:
+        return float(fallback_val)
+    return 0.0
+
+
+def paper_api_row(trade: dict, market_map: dict | None = None) -> dict:
+    status = normalize_status(trade.get("status"))
+
+    # 1. Planned quantity (null when unresolved)
+    planned_q = None
+    for field in ("final_quantity", "quantity", "quantity_by_risk"):
+        val = trade.get(field)
+        if val is not None:
+            num = number_or_none(val)
+            if num is not None:
+                planned_q = num
+                break
+    planned_quantity = int(planned_q) if planned_q is not None else None
+
+    # 2. Bought & Open quantity & Reserved Margin & P&L
+    if status == "WAITING_FOR_ENTRY":
+        bought_quantity = 0
+        open_quantity = 0
+        reserved_margin = 0.0
+        paper_pnl = 0.0
+        pnl = 0.0
+    elif status in {"ACTIVE", "T1_PARTIAL", "T2_PARTIAL"}:
+        bq = number_or_none(trade.get("original_quantity")) or number_or_none(trade.get("quantity"))
+        bought_quantity = int(bq) if bq is not None else None
+
+        oq = trade.get("quantity_remaining")
+        if oq is not None:
+            open_quantity = int(oq)
+        else:
+            open_quantity = bought_quantity
+
+        reserved_margin = float(trade_open_margin_used(trade))
+        paper_pnl = select_pnl(trade)
+        pnl = select_pnl(trade)
+    else:
+        # Terminal statuses
+        bq = number_or_none(trade.get("original_quantity")) or number_or_none(trade.get("quantity"))
+        bought_quantity = int(bq) if bq is not None else None
+
+        open_quantity = 0
+        reserved_margin = 0.0
+        paper_pnl = select_pnl(trade)
+        pnl = select_pnl(trade)
+
+    integrity_warnings = []
+    if planned_quantity is None:
+        integrity_warnings.append("UNRESOLVED_PLANNED_QUANTITY")
+    if status != "WAITING_FOR_ENTRY" and bought_quantity is None:
+        integrity_warnings.append("UNRESOLVED_BOUGHT_QUANTITY")
+    integrity_warning = integrity_warnings[0] if integrity_warnings else None
+
+    # 3. Price resolution by status:
+    current_price = None
+    exit_price = None
+    price_updated_at = None
+    price_source = None
+    price_warning = None
+
+    if status in {"WAITING_FOR_ENTRY", "ACTIVE", "T1_PARTIAL", "T2_PARTIAL"}:
+        if market_map:
+            price_val, updated_at, source, price_warn = resolve_fresh_quote(trade, market_map)
+            current_price = price_val
+            price_updated_at = updated_at
+            price_source = source
+            price_warning = price_warn
+    else:
+        exit_price_val = number_or_none(trade.get("exit_price"))
+        current_price = exit_price_val
+        exit_price = exit_price_val
+        price_updated_at = trade.get("status_updated_at") or trade.get("updated_at")
+        price_source = "recorded_exit"
+
     return {
         "paper_trade_id": str(trade.get("_id")) if trade.get("_id") is not None else trade.get("paper_trade_id"),
         "setup_id": trade.get("setup_id"),
@@ -842,13 +1005,21 @@ def paper_api_row(trade: dict) -> dict:
         "outcome_status": trade.get("outcome_status"),
         "ui_status": ui_status_for_trade(trade),
         "entry_price": trade.get("entry_price") or trade.get("entry"),
-        "current_price": trade.get("latest_close") or trade.get("current_price"),
+
+        "current_price": current_price,
+        "exit_price": exit_price,
+        "current_price_updated_at": price_updated_at,
+        "current_price_source": price_source,
+        "price_warning": price_warning,
+
         "stop_loss": trade.get("current_stop_loss") or trade.get("stop_loss") or trade.get("sl"),
         "target_1": trade.get("target_1") or trade.get("t1"),
         "target_2": trade.get("target_2") or trade.get("t2"),
         "target_3": trade.get("target_3") or trade.get("t3"),
-        "paper_pnl": trade.get("paper_pnl") or trade.get("total_trade_pnl"),
-        "pnl": trade.get("paper_pnl") or trade.get("total_trade_pnl"),
+
+        "paper_pnl": paper_pnl,
+        "pnl": pnl,
+
         "setup_time": setup_time_value(trade),
         "entry_triggered_at": trade.get("entry_triggered_at"),
         "updated_at": trade.get("updated_at"),
@@ -858,7 +1029,14 @@ def paper_api_row(trade: dict) -> dict:
         "partial_exit_2": trade.get("partial_exit_2"),
         "partial_exit_3": trade.get("partial_exit_3"),
         "paper_only": True,
+
+        "planned_quantity": planned_quantity,
+        "bought_quantity": bought_quantity,
+        "open_quantity": open_quantity,
+        "reserved_margin": reserved_margin,
+        "quantity_integrity_warning": integrity_warning,
     }
+
 
 
 def tv_symbol_for_trade(trade: dict) -> str | None:
@@ -3356,9 +3534,11 @@ async def load_paper_trade_rows(db, limit: int = 500) -> list[dict]:
 
 @router.get("/open")
 async def get_open_paper_trades(limit: int = Query(default=100, ge=1, le=500)) -> dict:
-    trades = await load_paper_trade_rows(get_database(), limit=500)
-    waiting = [paper_api_row(trade) for trade in trades if is_waiting_trade(trade)][:limit]
-    active_partial = [paper_api_row(trade) for trade in trades if is_open_trade(trade)][:limit]
+    db = get_database()
+    market_map = await get_market_map(db)
+    trades = await load_paper_trade_rows(db, limit=500)
+    waiting = [paper_api_row(trade, market_map) for trade in trades if is_waiting_trade(trade)][:limit]
+    active_partial = [paper_api_row(trade, market_map) for trade in trades if is_open_trade(trade)][:limit]
     return {
         "paper_only": True,
         "count": len(waiting) + len(active_partial),
@@ -3371,10 +3551,12 @@ async def get_open_paper_trades(limit: int = Query(default=100, ge=1, le=500)) -
 
 @router.get("/history")
 async def get_paper_trade_history(limit: int = Query(default=100, ge=1, le=500)) -> dict:
-    trades = await load_paper_trade_rows(get_database(), limit=1000)
-    completed = [paper_api_row(trade) for trade in trades if is_completed_target_trade(trade)][:limit]
-    sl_hit = [paper_api_row(trade) for trade in trades if is_sl_hit_trade(trade)][:limit]
-    ambiguous = [paper_api_row(trade) for trade in trades if is_ambiguous_paper_trade(trade)][:limit]
+    db = get_database()
+    market_map = await get_market_map(db)
+    trades = await load_paper_trade_rows(db, limit=1000)
+    completed = [paper_api_row(trade, market_map) for trade in trades if is_completed_target_trade(trade)][:limit]
+    sl_hit = [paper_api_row(trade, market_map) for trade in trades if is_sl_hit_trade(trade)][:limit]
+    ambiguous = [paper_api_row(trade, market_map) for trade in trades if is_ambiguous_paper_trade(trade)][:limit]
     return {
         "paper_only": True,
         "count": len(completed) + len(sl_hit) + len(ambiguous),
@@ -3390,10 +3572,11 @@ async def get_paper_trade_history(limit: int = Query(default=100, ge=1, le=500))
 @router.get("/pipeline-details")
 async def get_paper_pipeline_details(limit: int = Query(default=100, ge=1, le=500)) -> dict:
     db = get_database()
+    market_map = await get_market_map(db)
     signal_cursor = db.paper_signals.find({"paper_only": True}, {"_id": 0}).sort("updated_at", -1).limit(limit)
     plan_cursor = db.paper_trades.find({"paper_only": True}, {"_id": 0}).sort("updated_at", -1).limit(limit)
-    signals = [paper_api_row(row) for row in [row async for row in signal_cursor]]
-    plans = [paper_api_row(row) for row in [row async for row in plan_cursor]]
+    signals = [paper_api_row(row, market_map) for row in [row async for row in signal_cursor]]
+    plans = [paper_api_row(row, market_map) for row in [row async for row in plan_cursor]]
     return {
         "paper_only": True,
         "signals_count": len(signals),
@@ -3405,8 +3588,10 @@ async def get_paper_pipeline_details(limit: int = Query(default=100, ge=1, le=50
 
 @router.get("/trades")
 async def get_paper_trades(limit: int = Query(default=100, ge=1, le=500)) -> dict:
-    cursor = get_database().paper_trades.find({"paper_only": True}, {"_id": 0}).sort("updated_at", -1).limit(limit)
-    trades = [row async for row in cursor]
+    db = get_database()
+    market_map = await get_market_map(db)
+    cursor = db.paper_trades.find({"paper_only": True}, {"_id": 0}).sort("updated_at", -1).limit(limit)
+    trades = [paper_api_row(row, market_map) for row in [row async for row in cursor]]
     return {"count": len(trades), "trades": trades}
 
 

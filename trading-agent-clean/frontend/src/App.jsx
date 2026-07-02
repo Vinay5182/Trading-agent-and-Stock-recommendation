@@ -7,6 +7,7 @@ import {
   swingTvConfirm, testTvSymbol, tradingViewBadge, deriveTradingViewBusy, isBatchReady, canStartTradingViewOperation,
 } from "./api";
 import { aiDataCollectionChecklist, aiOutcomeEligibleRows, aiOutcomeSkippedRows, aiSnapshotDisplayRows } from "./aiDataset";
+import { confirmationTimestampLabel } from "./timestampUtils";
 
 const NAV_ITEMS = [
   { label: "Dashboard", icon: "◆" },
@@ -884,6 +885,7 @@ function SavedResultCard({ row, mode, onOpenStock }) {
       {row?.trade_quality_grade && <Badge tone={qualityTone(row.trade_quality_grade)}>{qualityLabel(row.trade_quality_grade)}</Badge>}
     </div>
     <div className="savedResultMeta">
+      <span>Confirmed: {confirmationTimestampLabel(row, mode)}</span>
       <span>{fmt(row?.confidence_score ?? row?.score ?? row?.momentum_score)} confidence</span>
       <span>{shortReason}</span>
       {isMomentum && row?.trap_status && <span>trap: {row.trap_status}</span>}
@@ -1714,10 +1716,10 @@ function StockDetailPage({
   const momentumFields = ["tv_status", "confidence_score", "reason", "daily_momentum", "four_hour_confirmation", "one_hour_entry", "entry_quality", "trap_status", "trap_reason", "trade_quality_grade"];
   const fullMarketFields = ["current_price", "previous_close", "open_price", "day_high", "day_low", "change_percent", "traded_volume", "traded_value", "relative_volume", "thirty_day_change_percent", "source_used", "primary_source", "field_sources", "nse_ok", "yfinance_ok", "nse_source_index", "nse_source_indexes", "is_complete", "missing_fields", "updated_at"];
   const swingPrecheckDebugFields = ["swing_score", "selected_for_tv", "swing_status", "reason", "eligible_for_tv_confirm", "score_breakdown"];
-  const swingTvDebugFields = ["tv_status", "tv_confirmed", "confidence_score", "reason", "rejection_reason", "weekly_bias", "daily_setup", "four_hour_confirmation", "one_hour_entry", "candles_1W", "candles_1D", "candles_4H", "candles_1H", "paper_plan_valid", "paper_plan_reason", "entry_readiness", "next_action_for_paper_trade", "fake_breakout_risk", "retail_trap_risk", "trade_quality_grade", "swing_explanation", "entry_comment", "error"];
+  const swingTvDebugFields = ["tv_status", "tv_confirmed", "swing_confirmed_at", "confirmed_at", "source_candle_at", "calculation_timestamp", "confidence_score", "reason", "rejection_reason", "weekly_bias", "daily_setup", "four_hour_confirmation", "one_hour_entry", "candles_1W", "candles_1D", "candles_4H", "candles_1H", "paper_plan_valid", "paper_plan_reason", "entry_readiness", "next_action_for_paper_trade", "fake_breakout_risk", "retail_trap_risk", "trade_quality_grade", "swing_explanation", "entry_comment", "error"];
   const momentumPrecheckDebugFields = ["momentum_score", "momentum_candidate", "momentum_status", "overextended", "eligible_for_tv_confirm", "score_breakdown"];
-  const momentumTvDebugFields = ["tv_status", "tv_confirmed", "confidence_score", "reason", "rejection_reason", "daily_momentum", "four_hour_confirmation", "one_hour_entry", "candles_1D", "candles_4H", "candles_1H", "paper_plan_valid", "paper_plan_reason", "entry_readiness", "next_action_for_paper_trade", "fake_breakout_risk", "overextended_risk", "volume_confirmation", "entry_quality", "trap_status", "trap_reason", "momentum_trap_score", "momentum_trap_summary", "trade_quality_grade", "momentum_explanation", "entry_comment", "error"];
-  const savedConfirmationFields = ["symbol", "tradingview_symbol", "tv_status", "trade_quality_grade", "reason", "updated_at"];
+  const momentumTvDebugFields = ["tv_status", "tv_confirmed", "momentum_confirmed_at", "confirmed_at", "source_candle_at", "calculation_timestamp", "confidence_score", "reason", "rejection_reason", "daily_momentum", "four_hour_confirmation", "one_hour_entry", "candles_1D", "candles_4H", "candles_1H", "paper_plan_valid", "paper_plan_reason", "entry_readiness", "next_action_for_paper_trade", "fake_breakout_risk", "overextended_risk", "volume_confirmation", "entry_quality", "trap_status", "trap_reason", "momentum_trap_score", "momentum_trap_summary", "trade_quality_grade", "momentum_explanation", "entry_comment", "error"];
+  const savedConfirmationFields = ["symbol", "tradingview_symbol", "tv_status", "trade_quality_grade", "reason", "confirmed_at", "swing_confirmed_at", "momentum_confirmed_at", "updated_at", "created_at", "source_candle_at", "calculation_timestamp"];
   const swingPrecheckDebugRow = { ...swingPrecheckRow, eligible_for_tv_confirm: swingPrecheckRow?.selected_for_tv === true ? "yes" : "no" };
   const momentumPrecheckDebugRow = { ...momentumPrecheckRow, eligible_for_tv_confirm: momentumPrecheckRow?.momentum_candidate === true ? "yes" : "no" };
   const hasMarketSummary = hasFieldValue(marketRow, marketFields);
@@ -1835,13 +1837,15 @@ const PAPER_TABLE_COLUMNS = [
   { key: "symbol", label: "Symbol" },
   { key: "strategy", label: "Strategy", type: "strategy" },
   { key: "status", label: "Status", type: "status" },
+  { key: "shares", label: "Shares", type: "shares" },
   { key: "entry", label: "Entry" },
-  { key: "current_price", label: "Current Price" },
+  { key: "current_price", label: "Price", type: "price" },
   { key: "stop_loss", label: "Stop Loss" },
   { key: "target_1", label: "T1" },
   { key: "target_2", label: "T2" },
   { key: "target_3", label: "T3" },
   { key: "pnl", label: "P&L", type: "pnl" },
+  { key: "reserved_margin", label: "Reserved Margin", type: "margin" },
   { key: "setup_time", label: "Setup Time" },
 ];
 const PAPER_TRADE_FILTERS = [
@@ -1940,6 +1944,8 @@ function paperCellValue(row, column) {
   if (column.key === "target_3") return row?.target_3 ?? row?.t3;
   if (column.key === "pnl") return row?.paper_pnl ?? row?.pnl;
   if (column.key === "setup_time") return row?.setup_time ?? row?.created_at ?? row?.source_confirmation_created_at;
+  if (column.key === "shares") return row;
+  if (column.key === "reserved_margin") return row?.reserved_margin;
   return row?.[column.key];
 }
 function paperPnlClass(value) {
@@ -1958,6 +1964,42 @@ function PaperTradeTable({ rows, loading, emptyMessage }) {
       if (column.type === "strategy") return <td key={column.key}><Badge tone={paperStrategyTone(row)}>{paperStrategyText(row)}</Badge></td>;
       if (column.type === "status") return <td key={column.key}><Badge tone={paperStatusToneFromLabel(value)}>{val(value)}</Badge></td>;
       if (column.type === "pnl") return <td key={column.key}><span className={`paperPnl ${paperPnlClass(value)}`}>{fmt(value)}</span></td>;
+      if (column.type === "shares") {
+        const normStatus = normalizePaperStatus(row?.status);
+        const warning = row?.quantity_integrity_warning;
+        let text = "Unavailable";
+        if (!warning && row?.bought_quantity !== null && row?.bought_quantity !== undefined) {
+          if (PAPER_WAITING_STATUSES.has(normStatus)) {
+            text = `0 bought / ${row.planned_quantity} planned`;
+          } else if (PAPER_ACTIVE_STATUSES.has(normStatus) || PAPER_PARTIAL_STATUSES.has(normStatus)) {
+            text = `${row.bought_quantity} bought / ${row.open_quantity} open`;
+          } else if (PAPER_COMPLETED_STATUSES.has(normStatus) || PAPER_STOPPED_STATUSES.has(normStatus)) {
+            text = `${row.bought_quantity} bought / 0 open`;
+          }
+        }
+        return <td key={column.key} className="sharesCell">{text}</td>;
+      }
+      if (column.type === "margin") {
+        return <td key={column.key} className="marginCell">{money(value)}</td>;
+      }
+      if (column.type === "price") {
+        const normStatus = normalizePaperStatus(row?.status);
+        if (PAPER_COMPLETED_STATUSES.has(normStatus) || PAPER_STOPPED_STATUSES.has(normStatus)) {
+          return (
+            <td key={column.key} className="priceCell priceExit">
+              <span className="priceLabel textMuted" style={{ fontSize: "10px", opacity: 0.7, marginRight: "4px" }}>Exit:</span>
+              <strong>{value !== null && value !== undefined ? fmt(value) : "—"}</strong>
+            </td>
+          );
+        } else {
+          return (
+            <td key={column.key} className="priceCell priceCurrent">
+              <span className="priceLabel textMuted" style={{ fontSize: "10px", opacity: 0.7, marginRight: "4px" }}>Current:</span>
+              <strong>{value !== null && value !== undefined ? fmt(value) : "—"}</strong>
+            </td>
+          );
+        }
+      }
       return <td key={column.key}>{fmt(value)}</td>;
     })}</tr>) : <tr><td colSpan={PAPER_TABLE_COLUMNS.length}>{emptyMessage}</td></tr>}
   </tbody></table></div>;

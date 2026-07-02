@@ -1,7 +1,6 @@
 import hashlib
 import logging
 import time
-from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Query
@@ -12,9 +11,10 @@ from database import get_database
 from routes.staleness import score_staleness_for_query
 from security.operator_intent import OPERATOR_INTENT_HEADER, require_operator_intent_value
 from services.system_errors import record_system_error
+from services.timestamps import to_utc_iso, utc_now_iso
 from services.tradingview_manager import tradingview_manager, TradingViewPreflightError
 from tv_client import validate_timeframe
-from tv_confirmation import confirm_swing_symbol_timeframes, enforce_tv_confirmation_safety
+from tv_confirmation import confirm_swing_symbol_timeframes, enforce_tv_confirmation_safety, latest_source_candle_at
 
 
 router = APIRouter()
@@ -233,11 +233,41 @@ def build_response_row(candidate: dict, confirmation: dict, index_name: str, tim
     row["canonical_symbol"] = candidate.get("canonical_symbol") or confirmation.get("canonical_symbol")
     row["exchange"] = candidate.get("exchange") or confirmation.get("exchange")
     row["tradingview_symbol"] = confirmation.get("requested_tradingview_symbol") or candidate.get("tradingview_symbol")
+    row["source_candle_at"] = row.get("source_candle_at") or latest_source_candle_at(row)
     return enforce_tv_confirmation_safety(row, "swing", timeframes)
 
 
+TIMESTAMP_FIELDS = (
+    "created_at",
+    "updated_at",
+    "confirmed_at",
+    "swing_confirmed_at",
+    "momentum_confirmed_at",
+    "source_candle_at",
+    "calculation_timestamp",
+)
+
+
+def stamp_swing_confirmation_row(row: dict, confirmed_at: str | None = None) -> dict:
+    timestamp = confirmed_at or utc_now_iso()
+    row["confirmed_at"] = timestamp
+    row["swing_confirmed_at"] = timestamp
+    row["updated_at"] = timestamp
+    row["source_candle_at"] = row.get("source_candle_at") or latest_source_candle_at(row)
+    return row
+
+
+def serialize_swing_confirmation_row(row: dict) -> dict:
+    serialized = dict(row)
+    serialized["source_candle_at"] = serialized.get("source_candle_at") or latest_source_candle_at(serialized)
+    for field in TIMESTAMP_FIELDS:
+        serialized[field] = to_utc_iso(serialized.get(field))
+    return serialized
+
+
 async def save_confirmation_row(row: dict) -> None:
-    now = datetime.utcnow()
+    now = row.get("swing_confirmed_at") or row.get("confirmed_at") or utc_now_iso()
+    row = stamp_swing_confirmation_row(row, now)
     base_identity = {
         "symbol": row.get("symbol"),
         "tradingview_symbol": row.get("tradingview_symbol"),
@@ -245,10 +275,11 @@ async def save_confirmation_row(row: dict) -> None:
         "timeframes_hash": row.get("timeframes_hash"),
     }
     if row.get("tv_status") == "TECHNICAL_FAILED":
-        identity = {**base_identity, "tv_status": "TECHNICAL_FAILED", "failure_run_id": row.get("failure_run_id") or now.isoformat()}
+        identity = {**base_identity, "tv_status": "TECHNICAL_FAILED", "failure_run_id": row.get("failure_run_id") or now}
     else:
         identity = {**base_identity, "tv_status": {"$ne": "TECHNICAL_FAILED"}}
     document = {**row, **base_identity, "updated_at": now}
+    document.pop("created_at", None)
     if row.get("tv_status") == "TECHNICAL_FAILED":
         document["failure_run_id"] = identity["failure_run_id"]
     await get_database().swing_tv_confirmations.update_one(
@@ -344,8 +375,10 @@ async def run_swing_tv_confirmation(
             confirmation.get("timeout_location"),
         )
         row = build_response_row(candidate, confirmation, clean_index, checked_timeframes)
-        if save and should_save_confirmation_row(row):
-            await save_confirmation_row(row)
+        if should_save_confirmation_row(row):
+            stamp_swing_confirmation_row(row)
+            if save:
+                await save_confirmation_row(row)
         rows.append(row)
 
     confirmed_count = sum(1 for row in rows if row.get("tv_status") == "CONFIRMED_SIGNAL")
@@ -441,6 +474,7 @@ async def get_swing_tv_confirmed(
     deduped_rows = []
     async for row in cursor:
         row.pop("_id", None)
+        row = serialize_swing_confirmation_row(row)
         key = (
             row.get("symbol"),
             row.get("tradingview_symbol"),

@@ -171,33 +171,80 @@ def normalize_price(value: Any) -> float | int | None:
     return normalize_non_negative_number(value)
 
 
-def normalize_provider_timestamp(value: Any) -> str | None:
+def normalize_provider_timestamp(
+    value: Any,
+    *,
+    naive_timezone: "ZoneInfo | timezone | None" = None,
+    source_name: str | None = None,
+) -> str | None:
+    """Normalize a provider timestamp to canonical UTC ISO 8601 with Z suffix.
+
+    Parameters
+    ----------
+    value:
+        The raw timestamp value from the provider. May be a datetime object,
+        a pandas Timestamp, or a string in one of the recognized formats.
+    naive_timezone:
+        The timezone to assign when *value* is a timezone-naive datetime or
+        string.  Must be supplied by the caller to reflect the actual timezone
+        semantics of the source field.  When omitted, any naive value is
+        treated as an unresolvable timezone and ``None`` is returned (fail-
+        closed, never UTC by assumption).
+    source_name:
+        Optional human-readable label for the field source (e.g.
+        ``"NSE.lastUpdateTime"``); currently used only for documentation /
+        future diagnostics.
+
+    Returns
+    -------
+    str or None
+        Canonical UTC string ``YYYY-MM-DDTHH:MM:SS.ffffffZ``, or ``None``
+        when the input is absent, malformed, or timezone-naive without an
+        explicit ``naive_timezone``.
+    """
     if value is None:
         return None
     try:
+        # --- 1. Convert pandas Timestamp to plain datetime ---
         if hasattr(value, "to_pydatetime"):
             value = value.to_pydatetime()
+
+        # --- 2. Obtain a datetime object ---
         if isinstance(value, datetime):
             timestamp = value
         else:
             text = str(value).strip()
             if not text:
                 return None
+            # Try ISO-like parsing first (handles "2026-07-02 16:00:26",
+            # "2026-07-02T16:00:26", "2026-07-02T16:00:26Z", etc.)
             try:
                 timestamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
             except ValueError:
+                # Fall back to legacy NSE formats: "02-Jul-2026 16:00:26"
                 timestamp = None
                 for date_format in ("%d-%b-%Y %H:%M:%S", "%d-%b-%Y %H:%M"):
                     try:
-                        timestamp = datetime.strptime(text, date_format).replace(tzinfo=IST)
+                        timestamp = datetime.strptime(text, date_format)
                         break
                     except ValueError:
                         continue
                 if timestamp is None:
+                    # Unrecognised format – fail closed
                     return None
+
+        # --- 3. Attach timezone when naive ---
         if timestamp.tzinfo is None:
-            timestamp = timestamp.replace(tzinfo=timezone.utc)
-        return timestamp.astimezone(timezone.utc).isoformat()
+            if naive_timezone is None:
+                # Fail closed: caller must tell us the source timezone;
+                # we do NOT assume UTC.
+                return None
+            timestamp = timestamp.replace(tzinfo=naive_timezone)
+
+        # --- 4. Convert to canonical UTC with Z suffix ---
+        utc_dt = timestamp.astimezone(timezone.utc)
+        return utc_dt.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
     except Exception:
         return None
 
@@ -433,9 +480,13 @@ def fetch_yfinance_quote_for_missing_fields(symbol: str, missing_fields: list[st
         for field in wanted:
             if row.get(field) is not None:
                 row["field_sources"][field] = "YFINANCE"
-        row["provider_timestamp"] = normalize_provider_timestamp(getattr(last, "name", None))
+        row["provider_timestamp"] = normalize_provider_timestamp(
+            getattr(last, "name", None),
+            source_name="YFINANCE.history",
+        )
         if row["provider_timestamp"]:
-            row["provider_timezone"] = "UTC"
+            row["provider_timezone"] = "YFINANCE"
+            row["provider_timestamp_source"] = "YFINANCE.history"
         row["yfinance_ok"] = any(row.get(field) is not None for field in REQUIRED_FIELDS + SCORING_FIELDS)
     except Exception as exc:
         row["yfinance_error"] = provider_error_text("YFINANCE", "HISTORY", exc)
@@ -505,9 +556,13 @@ def _history_to_yfinance_row(symbol: str, history: Any, wanted: set[str]) -> dic
     for field in wanted:
         if row.get(field) is not None:
             row["field_sources"][field] = "YFINANCE"
-    row["provider_timestamp"] = normalize_provider_timestamp(getattr(last, "name", None))
+    row["provider_timestamp"] = normalize_provider_timestamp(
+        getattr(last, "name", None),
+        source_name="YFINANCE.history",
+    )
     if row["provider_timestamp"]:
-        row["provider_timezone"] = "UTC"
+        row["provider_timezone"] = "YFINANCE"
+        row["provider_timestamp_source"] = "YFINANCE.history"
     row["yfinance_ok"] = any(row.get(field) is not None for field in REQUIRED_FIELDS + SCORING_FIELDS)
     return row
 

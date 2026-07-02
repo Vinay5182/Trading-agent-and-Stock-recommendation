@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import datetime
 from config import settings
+from services.timestamps import utc_now_iso
 
 def tick_round(val: float | None, tick: float = 0.05) -> float | None:
     if val is None:
@@ -54,13 +54,14 @@ def calculate_trade_plan(
     """
     res = {
         "calculation_version": 2,
-        "calculation_timestamp": datetime.utcnow().isoformat(),
+        "calculation_timestamp": utc_now_iso(),
         "activation_allowed": False,
         "block_code": None,
         "block_message": None,
         "validation_errors": [],
         "stop_loss_overridden": False,
         "stop_loss_override_reason": None,
+        "target_logic": None,
     }
 
     # Validate inputs
@@ -368,6 +369,28 @@ def calculate_trade_plan(
         res[f"{prefix}_structure_zone_lower"] = target_struct.get("lower_bound")
         res[f"{prefix}_structure_zone_upper"] = target_struct.get("upper_bound")
         res[f"{prefix}_flag"] = res["target_flags"][i]
+
+    # Generate target_logic
+    logic_parts = []
+    for i in range(3):
+        prefix = f"t{i+1}"
+        raw = res[f"{prefix}_target_raw"]
+        final = res[f"{prefix}_target_final"]
+        rr = res[f"{prefix}_final_rr"]
+        confidence = res[f"{prefix}_confidence"]
+        flag = res[f"{prefix}_flag"]
+        basis = res[f"{prefix}_structure_basis"]
+
+        part = f"T{i+1} at {final} ({rr}R, {confidence} confidence"
+        if flag == "STRUCTURE_CAPS_TARGET_BELOW_RAW_R":
+            part += f" - capped by resistance structure {basis}"
+        elif flag == "STRUCTURE_CONFIRMED":
+            part += f" - confirmed by resistance structure {basis}"
+        else:
+            part += " - no structure, trail SL preferred"
+        part += ")"
+        logic_parts.append(part)
+    res["target_logic"] = "; ".join(logic_parts)
 
     res["activation_allowed"] = True
     return res

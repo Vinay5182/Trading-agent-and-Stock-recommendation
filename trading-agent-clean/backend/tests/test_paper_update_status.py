@@ -1063,3 +1063,127 @@ def test_v2_allocation_integrity_scenarios() -> None:
     sync_res = asyncio.run(sync_completed_trades_to_journal(dummy_db))
     assert sync_res["skipped"] == 1
     assert sync_res["journaled"] == 0
+
+
+def test_paper_trades_quantities_margin_and_prices():
+    from routes.paper import paper_api_row
+
+    # 1. Waiting trade with current price still has P&L 0
+    # Waiting stale persisted P&L is suppressed
+    # Waiting has 0 bought shares and planned quantity
+    trade_waiting = {
+        "status": "WAITING_FOR_ENTRY",
+        "quantity": 100,
+        "final_quantity": 100,
+        "entry_price": 50.0,
+        "paper_pnl": -254.71,
+        "total_trade_pnl": -254.71,
+        "symbol": "KEI",
+    }
+
+    market_map = {
+        ("NSE", "KEI"): {
+            "exchange": "NSE",
+            "canonical_symbol": "KEI",
+            "symbol": "KEI",
+            "current_price": 60.0,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    }
+
+
+    row = paper_api_row(trade_waiting, market_map)
+    assert row["planned_quantity"] == 100
+    assert row["bought_quantity"] == 0
+    assert row["open_quantity"] == 0
+    assert row["reserved_margin"] == 0.0
+    assert row["paper_pnl"] == 0.0
+    assert row["pnl"] == 0.0
+    assert row["current_price"] == 60.0
+    assert row["current_price_source"] == "market_data_NSE"
+    assert row["exit_price"] is None
+
+    # 2. Active quantity and remaining quantity
+    trade_active = {
+        "status": "ACTIVE",
+        "original_quantity": 200,
+        "quantity_remaining": 200,
+        "quantity": 200,
+        "entry_price": 50.0,
+        "margin_remaining": 4000.0,
+        "paper_pnl": 100.0,
+        "symbol": "SBIN",
+    }
+    row_active = paper_api_row(trade_active)
+    assert row_active["planned_quantity"] == 200
+    assert row_active["bought_quantity"] == 200
+    assert row_active["open_quantity"] == 200
+    assert row_active["reserved_margin"] == 4000.0
+    assert row_active["paper_pnl"] == 100.0
+
+    # 3. Partial quantity after exits
+    trade_partial = {
+        "status": "T1_PARTIAL",
+        "original_quantity": 300,
+        "quantity_remaining": 100,
+        "quantity": 300,
+        "entry_price": 10.0,
+        "margin_remaining": 1500.0,
+        "paper_pnl": 50.0,
+        "symbol": "RELIANCE",
+    }
+    row_partial = paper_api_row(trade_partial)
+    assert row_partial["planned_quantity"] == 300
+    assert row_partial["bought_quantity"] == 300
+    assert row_partial["open_quantity"] == 100
+    assert row_partial["reserved_margin"] == 1500.0
+
+    # 4. Terminal open quantity is 0
+    trade_terminal = {
+        "status": "COMPLETED",
+        "original_quantity": 100,
+        "quantity_remaining": 0,
+        "quantity": 100,
+        "entry_price": 50.0,
+        "exit_price": 55.0,
+        "margin_remaining": 0.0,
+        "paper_pnl": 500.0,
+        "symbol": "TCS",
+    }
+    row_terminal = paper_api_row(trade_terminal, market_map)
+    assert row_terminal["planned_quantity"] == 100
+    assert row_terminal["bought_quantity"] == 100
+    assert row_terminal["open_quantity"] == 0
+    assert row_terminal["reserved_margin"] == 0.0
+    assert row_terminal["current_price"] == 55.0
+    assert row_terminal["exit_price"] == 55.0
+    assert row_terminal["current_price_source"] == "recorded_exit"
+
+    # 5. Missing quote returns null without breaking the response
+    row_missing = paper_api_row(trade_waiting, {})
+    assert row_missing["current_price"] is None
+    assert row_missing["current_price_source"] is None
+
+    # 6. Quote for symbol A cannot populate symbol B
+    market_map_cross = {
+        ("NSE", "A"): {
+            "exchange": "NSE",
+            "canonical_symbol": "A",
+            "current_price": 10.0,
+        }
+    }
+    trade_b = {
+        "status": "WAITING_FOR_ENTRY",
+        "symbol": "B",
+    }
+    row_b = paper_api_row(trade_b, market_map_cross)
+    assert row_b["current_price"] is None
+
+    # 7. Per-row reserved-margin sum matches dashboard reserved margin
+    from services.capital_accounting import trade_open_margin_used
+    trades = [trade_waiting, trade_active, trade_partial, trade_terminal]
+    api_rows = [paper_api_row(t) for t in trades]
+    open_trades_db = [t for t in trades if t["status"] in {"ACTIVE", "T1_PARTIAL", "T2_PARTIAL"}]
+    expected_sum = sum(trade_open_margin_used(t) for t in open_trades_db)
+    actual_sum = sum(r["reserved_margin"] for r in api_rows)
+    assert actual_sum == expected_sum

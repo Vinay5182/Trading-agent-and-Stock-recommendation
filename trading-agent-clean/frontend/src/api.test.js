@@ -33,6 +33,12 @@ import {
   canStartTradingViewOperation,
 } from "./api.js";
 import { aiDataCollectionChecklist, aiOutcomeSkippedRows, aiSnapshotDisplayRows } from "./aiDataset.js";
+import {
+  CONFIRMATION_TIME_UNAVAILABLE,
+  confirmationTimestampLabel,
+  confirmationTimestampValue,
+  formatIstTimestamp,
+} from "./timestampUtils.js";
 
 test("frontend source does not expose manual paper update endpoints", () => {
   const source = readFileSync(new URL("./api.js", import.meta.url), "utf8");
@@ -1249,4 +1255,66 @@ test("Swing and Momentum confirmation App logic checks canStartTradingViewOperat
 
   // 10. Attachment failure (in catch blocks) also triggers refresh to not leave UI permanently disabled
   assert.ok(appSource.includes("Failed to refresh status after batch failure"));
+});
+
+test("Frontend renders quantities, null prices, and zero waiting P&L correctly", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  // Verify shares formatting logic contains waiting, active/partial, and completed/stopped formats
+  assert.ok(appSource.includes("planned_quantity"));
+  assert.ok(appSource.includes("bought_quantity"));
+  assert.ok(appSource.includes("open_quantity"));
+  assert.ok(appSource.includes("0 bought /"));
+  assert.ok(appSource.includes("bought /"));
+  assert.ok(appSource.includes("open"));
+
+  // Verify reserved margin is displayed
+  assert.ok(appSource.includes("Reserved Margin"));
+  assert.ok(appSource.includes("reserved_margin"));
+
+  // Verify current price vs exit price styling/labels are present
+  assert.ok(appSource.includes("Exit:"));
+  assert.ok(appSource.includes("Current:"));
+  assert.ok(appSource.includes("priceCell"));
+});
+
+test("confirmation timestamp helpers format UTC into IST", () => {
+  assert.equal(
+    formatIstTimestamp("2026-07-01T13:10:55.376000Z"),
+    "01 Jul 2026, 06:40 PM IST",
+  );
+});
+
+test("confirmation timestamp helpers never fall back to created_at or source candle time", () => {
+  const legacy = {
+    created_at: "2026-06-11T15:53:58.632000",
+    updated_at: "2026-07-01T13:10:55.376000Z",
+    source_candle_at: "2026-07-01T10:15:00Z",
+    calculation_timestamp: "2026-07-01T13:00:00.000000Z",
+  };
+
+  assert.equal(confirmationTimestampValue(legacy, "swing"), null);
+  assert.equal(confirmationTimestampLabel(legacy, "swing"), CONFIRMATION_TIME_UNAVAILABLE);
+  assert.equal(confirmationTimestampValue(legacy, "momentum"), null);
+  assert.equal(confirmationTimestampLabel(legacy, "momentum"), CONFIRMATION_TIME_UNAVAILABLE);
+});
+
+test("confirmation timestamp helpers keep Swing and Momentum fields independent", () => {
+  const row = {
+    confirmed_at: "2026-07-01T13:09:00.000000Z",
+    swing_confirmed_at: "2026-07-01T13:10:55.376000Z",
+    momentum_confirmed_at: "2026-07-01T13:12:00.000000Z",
+  };
+
+  assert.equal(confirmationTimestampValue(row, "swing"), row.swing_confirmed_at);
+  assert.equal(confirmationTimestampValue(row, "momentum"), row.momentum_confirmed_at);
+});
+
+test("Saved TV cards display explicit confirmation labels without created_at fallback", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  assert.ok(appSource.includes("Confirmed: {confirmationTimestampLabel(row, mode)}"));
+  assert.equal(appSource.includes("Confirmed: {val(row?.created_at"), false);
+  assert.equal(appSource.includes("row?.created_at || row?.confirmed_at"), false);
+  assert.equal(appSource.includes("row?.source_candle_at || row?.confirmed_at"), false);
 });

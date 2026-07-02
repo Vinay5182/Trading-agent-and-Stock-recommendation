@@ -56,11 +56,13 @@ def _candle_time_seconds(value) -> float | None:
     if isinstance(value, (int, float)):
         return value / 1000 if value > 10_000_000_000 else value
     if isinstance(value, str):
-        try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            return None
+        from services.timestamps import parse_strict_utc
+        dt, info = parse_strict_utc(value)
+        if dt:
+            return dt.timestamp()
+        return None
     return None
+
 
 
 def _candle_time_gap(previous: dict | None, last: dict | None) -> float | None:
@@ -877,6 +879,35 @@ def enforce_tv_confirmation_safety(row: dict, strategy: str, timeframes: list[st
     return apply_trade_quality(safe_row, strategy)
 
 
+def latest_source_candle_at(row: dict) -> object:
+    candidates = []
+    for debug in (row.get("timeframe_debug") or {}).values():
+        if not isinstance(debug, dict):
+            continue
+        value = debug.get("last_candle_time") or debug.get("second_last_candle_time") or debug.get("first_last_candle_time")
+        seconds = _candle_time_seconds(value)
+        if seconds is not None:
+            candidates.append(seconds)
+    for analysis in (row.get("timeframe_analysis") or {}).values():
+        if not isinstance(analysis, dict):
+            continue
+        value = analysis.get("last_candle_time") or analysis.get("source_candle_at")
+        seconds = _candle_time_seconds(value)
+        if seconds is not None:
+            candidates.append(seconds)
+
+    if not candidates:
+        raw_val = row.get("source_candle_at")
+        if raw_val:
+            from services.timestamps import parse_strict_utc
+            dt, info = parse_strict_utc(raw_val)
+            if dt:
+                return info.get("canonical")
+        return None
+
+    return datetime.fromtimestamp(max(candidates), timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
 def _price_zone_text(*values) -> str | None:
     numbers = []
     for value in values:
@@ -1091,6 +1122,76 @@ def _paper_setup_extended(strategy: str, analyses: dict, risk_context: dict | No
     return False
 
 
+def validate_v2_plan_schema(plan_res: dict) -> str | None:
+    import math
+
+    # 1. Validate target_logic
+    target_logic = plan_res.get("target_logic")
+    if target_logic is None:
+        return "PLAN_SCHEMA_MISSING_TARGET_LOGIC"
+    if not isinstance(target_logic, str) or not target_logic.strip():
+        return "PLAN_SCHEMA_INVALID_TARGET_LOGIC"
+
+    # 2. Check presence of all required numeric fields
+    required_numeric_fields = [
+        "entry_price",
+        "final_stop_loss",
+        "t1_target_final",
+        "t2_target_final",
+        "t3_target_final",
+        "risk_per_share",
+        "t1_final_rr",
+        "t2_final_rr",
+        "t3_final_rr",
+    ]
+    for field in required_numeric_fields:
+        if field not in plan_res or plan_res.get(field) is None:
+            return f"PLAN_SCHEMA_MISSING_{field.upper()}"
+
+    # Helper to check if value is a finite number
+    def is_finite_num(v) -> bool:
+        if not isinstance(v, (int, float)):
+            return False
+        return math.isfinite(v)
+
+    # 3. Check that all numeric values are finite numbers
+    for field in required_numeric_fields:
+        val = plan_res.get(field)
+        if not is_finite_num(val):
+            return f"PLAN_SCHEMA_NOT_FINITE_{field.upper()}"
+
+    # Unpack numeric values
+    entry_price = float(plan_res["entry_price"])
+    final_stop_loss = float(plan_res["final_stop_loss"])
+    t1 = float(plan_res["t1_target_final"])
+    t2 = float(plan_res["t2_target_final"])
+    t3 = float(plan_res["t3_target_final"])
+    risk_per_share = float(plan_res["risk_per_share"])
+    t1_rr = float(plan_res["t1_final_rr"])
+    t2_rr = float(plan_res["t2_final_rr"])
+    t3_rr = float(plan_res["t3_final_rr"])
+
+    # 4. Check numeric relationships and positivity
+    if entry_price <= 0:
+        return "PLAN_SCHEMA_INVALID_ENTRY_PRICE"
+    if final_stop_loss <= 0:
+        return "PLAN_SCHEMA_INVALID_STOP_LOSS"
+    if risk_per_share <= 0:
+        return "PLAN_SCHEMA_INVALID_RISK"
+    if final_stop_loss >= entry_price:
+        return "PLAN_SCHEMA_STOP_LOSS_ABOVE_ENTRY"
+    if t1 <= entry_price:
+        return "PLAN_SCHEMA_T1_BELOW_ENTRY"
+    if t2 <= t1:
+        return "PLAN_SCHEMA_T2_BELOW_T1"
+    if t3 <= t2:
+        return "PLAN_SCHEMA_T3_BELOW_T2"
+    if t1_rr <= 0 or t2_rr <= 0 or t3_rr <= 0:
+        return "PLAN_SCHEMA_INVALID_RR"
+
+    return None
+
+
 def build_price_action_paper_plan(
     strategy: str,
     tv_status: str,
@@ -1189,6 +1290,22 @@ def build_price_action_paper_plan(
         empty_plan = _empty_paper_trade_plan(plan_reason)
         empty_plan.update(plan_res)
         return empty_plan
+
+    # Schema validation for V2 results
+    block_code = validate_v2_plan_schema(plan_res)
+    if block_code:
+        import logging
+        logger = logging.getLogger("uvicorn.error")
+        logger.error("V2 trade plan schema validation failed with code: %s", block_code)
+        empty_plan = _empty_paper_trade_plan(block_code)
+        empty_plan.update(plan_res)
+        empty_plan["activation_allowed"] = False
+        empty_plan["block_code"] = block_code
+        empty_plan["block_message"] = f"V2 plan schema validation failed: {block_code}."
+        empty_plan["tv_status"] = "TECHNICAL_FAILED"
+        empty_plan["reason"] = block_code
+        return empty_plan
+
 
     entry_text = "momentum confirmation candle" if strategy == "momentum" else "price-action confirmation candle"
     stop_text = support_label or "latest swing low/support"

@@ -120,7 +120,7 @@ def test_yfinance_history_normalizes_price_timestamp_and_partial_rows():
     assert row["current_price"] == 105
     assert row["previous_close"] == 100
     assert row["open_price"] is None
-    assert row["provider_timestamp"] == "2026-06-27T10:00:00+00:00"
+    assert row["provider_timestamp"] == "2026-06-27T10:00:00.000000Z"
 
 
 def test_nse_extract_quote_normalizes_exchange_timestamp_and_prices():
@@ -141,7 +141,9 @@ def test_nse_extract_quote_normalizes_exchange_timestamp_and_prices():
     assert row["current_price"] == 100.5
     assert row["previous_close"] is None
     assert row["traded_volume"] is None
-    assert row["provider_timestamp"] == "2026-06-27T10:00:00+00:00"
+    assert row["provider_timestamp"] == "2026-06-27T10:00:00.000000Z"
+    assert row["provider_timezone"] == "Asia/Kolkata"
+    assert row["provider_timestamp_source"] == "NSE.lastUpdateTime"
 
 
 def test_scan_provider_path_uses_shared_nse_client(monkeypatch):

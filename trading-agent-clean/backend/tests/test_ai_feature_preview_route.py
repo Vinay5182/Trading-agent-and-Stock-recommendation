@@ -503,6 +503,229 @@ def test_ai_feature_preview_rejects_unknown_strategy_without_db_access(monkeypat
     assert response.json()["message"] == "strategy_type must be swing or momentum"
 
 
+def test_ai_canonical_preview_is_read_only_and_excludes_incomplete_legacy_rows(monkeypatch) -> None:
+    db = FakeDB()
+    monkeypatch.setattr(ai_routes, "get_database", lambda: db)
+    client = trusted_client()
+
+    response = client.get(
+        "/api/ai/features/canonical-preview?strategy_type=momentum&limit=10&timeframe=1D"
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["paper_only"] is True
+    assert payload["read_only"] is True
+    assert payload["preview_only"] is True
+    assert payload["mongo_writes_enabled"] is False
+    assert payload["schema_version"] == "canonical_training_row_v1"
+    assert payload["schema"]["identity"] == [
+        "strategy_type",
+        "exchange",
+        "canonical_symbol",
+        "timeframe",
+        "identity_key",
+        "source_candle_at",
+    ]
+    assert "entry_time" in payload["schema"]["decision_metadata"]
+    assert payload["returned_count"] == 1
+    assert payload["eligible_count"] == 0
+    assert payload["excluded_count"] == 1
+
+    row = payload["rows"][0]
+    assert row["schema_version"] == "canonical_training_row_v1"
+    assert row["training_row_id"] is None
+    assert row["identity"]["strategy_type"] == "MOMENTUM"
+    assert row["identity"]["exchange"] == "NSE"
+    assert row["identity"]["canonical_symbol"] == "TEST"
+    assert row["identity"]["timeframe"] == "1D"
+    assert row["identity"]["identity_key"] == "trade-closed"
+    assert row["decision_metadata"]["feature_as_of"] is not None
+    assert row["decision_metadata"]["source_candle_at"] is None
+    assert row["features"]["rule_score"] == 82
+    assert row["features"]["momentum_score"] == 76
+    assert row["plan_context"]["entry_price"] == 126
+    assert row["audit"]["legacy_record"] is True
+    assert row["audit"]["training_eligible"] is False
+    assert row["audit"]["exclusion_reason"] == "SOURCE_CANDLE_AT_MISSING"
+    assert "source_candle_at:SOURCE_CANDLE_AT_MISSING" in row["audit"]["timestamp_warnings"]
+    assert "SCORE_VERSION_MISSING" in row["audit"]["validation_errors"]
+    assert "CALCULATION_VERSION_MISSING" in row["audit"]["validation_errors"]
+    assert row["split"]["split_assignment"] == "UNASSIGNED"
+
+    assert len(db.scored_candidates.find_calls) == 1
+    assert len(db.market_data.find_one_calls) == 1
+    assert len(db.paper_signals.find_one_calls) == 1
+    assert len(db.paper_trades.find_one_calls) == 1
+    assert_no_paper_trade_writes(db)
+
+
+def test_ai_canonical_preview_is_deterministic_across_two_read_only_calls(monkeypatch) -> None:
+    db = FakeDB()
+    db.scored_candidates.rows[0]["score_version"] = "score_v2_strict_numeric"
+    db.paper_signals.rows[0]["calculation_version"] = 2
+    db.paper_signals.rows[0]["source_candle_at"] = "2026-01-01T09:15:00Z"
+    db.paper_trades.rows[0]["status"] = "WAITING_FOR_ENTRY"
+    monkeypatch.setattr(ai_routes, "get_database", lambda: db)
+    client = trusted_client()
+    endpoint = "/api/ai/features/canonical-preview?strategy_type=momentum&limit=10&timeframe=1D"
+
+    first = client.get(endpoint)
+    db.paper_trades.rows[0]["status"] = "ACTIVE"
+    db.paper_trades.rows[0]["entry_time"] = "2026-01-01T09:30:00Z"
+    db.paper_trades.rows[0]["exit_time"] = "2026-01-05T15:30:00Z"
+    db.paper_trades.rows[0]["paper_pnl"] = 9999
+    second = client.get(endpoint)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_row = first.json()["rows"][0]
+    second_row = second.json()["rows"][0]
+    assert first_row["training_row_id"] is not None
+    assert first_row["training_row_id"] == second_row["training_row_id"]
+    assert first_row["identity"] == second_row["identity"]
+    assert first_row["audit"]["identity_valid"] is True
+    assert second_row["audit"]["identity_valid"] is True
+    assert first_row["audit"]["training_eligible"] is True
+    assert second_row["audit"]["training_eligible"] is True
+    assert first_row["decision_metadata"]["entry_time"] is None
+    assert second_row["decision_metadata"]["entry_time"] == "2026-01-01T09:30:00.000000Z"
+    assert_no_paper_trade_writes(db)
+
+
+class FakeTimestampAuditDB:
+    def __init__(self) -> None:
+        self.ai_feature_snapshots = ReadOnlyCollection(
+            [
+                {
+                    "schema_version": "canonical_training_row_v1",
+                    "strategy_type": "momentum",
+                    "exchange": "NSE",
+                    "canonical_symbol": "TEST",
+                    "timeframe": "1D",
+                    "setup_id": "setup-a",
+                    "source_candle_at": "2999-01-01T00:00:00Z",
+                    "feature_as_of": "2999-01-01T00:01:00Z",
+                    "maximum_source_timestamp": "2999-01-01T00:02:00Z",
+                    "score_version": "score_v2_strict_numeric",
+                    "calculation_version": 2,
+                },
+                {
+                    "schema_version": "canonical_training_row_v1",
+                    "strategy_type": "momentum",
+                    "exchange": "NSE",
+                    "canonical_symbol": "TEST",
+                    "timeframe": "1D",
+                    "setup_id": "setup-b",
+                    "source_candle_at": "2026-01-01T14:45:00+05:30",
+                    "feature_as_of": "2026-01-01T09:16:00Z",
+                    "score_version": "score_v2_strict_numeric",
+                    "calculation_version": 2,
+                },
+                {
+                    "schema_version": "canonical_training_row_v1",
+                    "strategy_type": "momentum",
+                    "exchange": "NSE",
+                    "canonical_symbol": "TEST",
+                    "timeframe": "1D",
+                    "setup_id": "setup-c",
+                    "source_candle_at": "2026-01-01T09:15:00",
+                    "feature_as_of": "not-a-timestamp",
+                    "score_version": "score_v2_strict_numeric",
+                    "calculation_version": 2,
+                },
+                {
+                    "schema_version": "canonical_training_row_v1",
+                    "strategy_type": "momentum",
+                    "exchange": "NSE",
+                    "canonical_symbol": "TEST",
+                    "timeframe": "1D",
+                    "setup_id": "setup-d",
+                    "source_candle_at": "2026-01-01T09:15:00Z",
+                    "feature_as_of": "2026-01-01T09:16:00Z",
+                    "generated_at": "2999-01-01T00:00:00Z",
+                    "score_version": "score_v2_strict_numeric",
+                    "calculation_version": 2,
+                },
+            ]
+        )
+        self.paper_signals = ReadOnlyCollection(
+            [
+                {
+                    "created_at": "2026-01-01T09:10:00Z",
+                    "source_candle_at": "2026-01-01T09:15:00Z",
+                }
+            ]
+        )
+
+
+def test_ai_timestamp_audit_is_read_only_and_reports_timestamp_anomalies(monkeypatch) -> None:
+    db = FakeTimestampAuditDB()
+    monkeypatch.setattr(ai_routes, "get_database", lambda: db)
+    client = trusted_client()
+
+    response = client.get("/api/ai/features/timestamp-audit?limit=10")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["read_only"] is True
+    assert payload["preview_only"] is True
+    assert payload["mongo_writes_enabled"] is False
+    assert payload["sample_limit"] == 10
+    assert payload["canonical_timestamp_format"] == "YYYY-MM-DDTHH:MM:SS.ffffffZ"
+    assert payload["collections"]["ai_feature_snapshots"]["rows_seen"] == 4
+    assert payload["documents_scanned"] == 5
+    assert payload["timestamp_fields_examined"] > payload["documents_scanned"]
+    assert payload["timestamp_values_present"] < payload["timestamp_fields_examined"]
+    assert payload["field_occurrence_count_by_quality"]["NON_UTC_AWARE"] >= 1
+    assert payload["field_occurrence_count_by_quality"]["LEGACY_TIMEZONE_UNKNOWN"] >= 1
+    assert payload["field_occurrence_count_by_quality"]["MALFORMED"] >= 1
+    assert payload["affected_document_count_by_quality"]["LEGACY_TIMEZONE_UNKNOWN"] == 1
+    assert payload["affected_document_count_by_quality"]["MALFORMED"] == 1
+    assert payload["created_at_confirmation_fallback"]["total_candidates"] == 1
+    assert payload["created_at_confirmation_fallback"]["created_at_used_as_confirmed_at"] is False
+    assert (
+        payload["rows_excluded_by_timestamp_reason"]["TIMESTAMP_IN_FUTURE_SOURCE_CANDLE"]
+        == 1
+    )
+    assert (
+        payload["rows_excluded_by_timestamp_reason"]["TIMESTAMP_TIMEZONE_UNKNOWN_SOURCE_CANDLE"]
+        == 1
+    )
+    assert payload["timestamp_warning_rows_by_reason"]["TIMESTAMP_IN_FUTURE_SOURCE_CANDLE"] == 1
+    assert payload["timestamp_warning_rows_by_reason"]["TIMESTAMP_TIMEZONE_UNKNOWN_SOURCE_CANDLE"] == 1
+    assert payload["future_timestamp_summary"]["field_occurrence_count"] == 4
+    assert payload["future_timestamp_summary"]["blocking_field_occurrence_count"] == 3
+    assert payload["future_timestamp_summary"]["warning_only_field_occurrence_count"] == 1
+    assert payload["future_timestamp_summary"]["by_field"]["generated_at"] == 1
+    assert len(payload["future_timestamps"]) == 4
+    assert all("future_delta_seconds" in item for item in payload["future_timestamps"])
+    assert {
+        item["exclusion_or_non_blocking_reason"]
+        for item in payload["future_timestamps"]
+    } >= {"TIMESTAMP_IN_FUTURE_SOURCE_CANDLE", "WARNING_ONLY_AUDIT_METADATA"}
+    assert payload["event_order_summary"]["event_order_invalid_rows"] == 1
+    assert payload["event_order_summary"]["event_order_not_evaluable_rows"] == 1
+    assert (
+        payload["event_order_summary"]["rules"]["source_candle_at <= feature_as_of"]["not_evaluable_count"]
+        == 1
+    )
+    assert (
+        payload["event_order_summary"]["rules"]["feature_source_timestamp <= feature_as_of"]["failed_count"]
+        == 1
+    )
+    assert payload["equivalent_instants_with_inconsistent_formatting"]
+
+    assert db.ai_feature_snapshots.update_calls == []
+    assert db.ai_feature_snapshots.insert_calls == []
+    assert db.ai_feature_snapshots.delete_calls == []
+    assert db.ai_feature_snapshots.create_index_calls == []
+    assert db.paper_signals.update_calls == []
+    assert db.paper_signals.insert_calls == []
+    assert db.paper_signals.delete_calls == []
+    assert db.paper_signals.create_index_calls == []
+
+
 def test_ai_feature_save_defaults_to_dry_run_and_writes_nothing(monkeypatch) -> None:
     db = FakeSaveDB()
     monkeypatch.setattr(ai_routes, "get_database", lambda: db)

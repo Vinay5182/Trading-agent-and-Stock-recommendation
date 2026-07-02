@@ -9,6 +9,7 @@ from urllib.parse import quote
 import requests
 
 from data_provider import (
+    IST,
     clean_number,
     is_provider_rate_limited,
     normalize_non_negative_number,
@@ -132,7 +133,13 @@ def extract_quote(row: dict[str, Any]) -> dict[str, Any]:
         "traded_value": normalize_non_negative_number(row.get("totalTradedValue")),
         "change_percent": clean_number(row.get("pChange")),
         "thirty_day_change_percent": clean_number(row.get("perChange30d")),
-        "provider_timestamp": normalize_provider_timestamp(row.get("lastUpdateTime")),
+        "provider_timestamp": normalize_provider_timestamp(
+            row.get("lastUpdateTime"),
+            naive_timezone=IST,
+            source_name="NSE.lastUpdateTime",
+        ),
+        "provider_timezone": "Asia/Kolkata",
+        "provider_timestamp_source": "NSE.lastUpdateTime",
         "company_name": meta.get("companyName"),
         "industry": meta.get("industry"),
         "isin": meta.get("isin"),

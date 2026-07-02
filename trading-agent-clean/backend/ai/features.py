@@ -1,7 +1,13 @@
 import hashlib
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any, Mapping
+
+from services.timestamps import (
+    canonical_utc_iso,
+    parse_legacy_timestamp_for_ordering,
+    utc_now_iso as canonical_utc_now_iso,
+)
 
 
 CLOSED_TRADE_STATUSES = {
@@ -75,7 +81,7 @@ VOLUME_BREAKDOWN_KEYS = {
 
 
 def utc_now_iso() -> str:
-    return datetime.now(UTC).isoformat()
+    return canonical_utc_now_iso()
 
 
 def _doc(document: Mapping[str, Any] | None) -> Mapping[str, Any]:
@@ -261,16 +267,7 @@ def ai_feature_snapshot_identity(snapshot: Mapping[str, Any]) -> str:
 
 
 def _parse_timestamp(value: Any) -> datetime | None:
-    if isinstance(value, datetime):
-        parsed = value
-    elif value not in (None, ""):
-        try:
-            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        except ValueError:
-            return None
-    else:
-        return None
-    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+    return parse_legacy_timestamp_for_ordering(value)
 
 
 def get_doc_timestamp(doc: Mapping[str, Any]) -> datetime | None:
@@ -407,6 +404,43 @@ def build_ai_feature_snapshot(
             scored_candidate.get("timeframe"),
             market_data.get("timeframe"),
         ),
+        "setup_id": _first_value(
+            paper_trade.get("setup_id"),
+            paper_signal.get("setup_id"),
+            tv_confirmation.get("setup_id"),
+            scored_candidate.get("setup_id"),
+        ),
+        "canonical_setup_id": _first_value(
+            paper_trade.get("canonical_setup_id"),
+            paper_signal.get("canonical_setup_id"),
+            tv_confirmation.get("canonical_setup_id"),
+            scored_candidate.get("canonical_setup_id"),
+        ),
+        "source_confirmation_id": _first_value(
+            paper_trade.get("source_confirmation_id"),
+            paper_signal.get("source_confirmation_id"),
+            tv_confirmation.get("source_confirmation_id"),
+            _document_id(tv_confirmation),
+        ),
+        "source_confirmation_created_at": _first_value(
+            paper_trade.get("source_confirmation_created_at"),
+            paper_signal.get("source_confirmation_created_at"),
+            tv_confirmation.get("created_at"),
+        ),
+        "source_candle_at": _first_value(
+            tv_confirmation.get("source_candle_at"),
+            paper_signal.get("source_candle_at"),
+            scored_candidate.get("source_candle_at"),
+            paper_trade.get("source_candle_at"),
+        ),
+        "entry_time": _first_value(paper_trade.get("entry_time"), paper_trade.get("entry_triggered_at")),
+        "score_version": _first_value(scored_candidate.get("score_version"), market_data.get("score_version")),
+        "calculation_version": _first_value(
+            paper_trade.get("calculation_version"),
+            paper_signal.get("calculation_version"),
+            tv_confirmation.get("calculation_version"),
+            scored_candidate.get("calculation_version"),
+        ),
         "snapshot_time": as_of_str,
         "data_source_ids": _source_ids(scored_candidate, market_data, tv_confirmation, paper_signal, paper_trade),
         "rule_score": _first_number(
@@ -463,7 +497,7 @@ def build_ai_feature_snapshot(
     horizon = get_prediction_horizon(strategy_type, snapshot["timeframe"])
     snapshot.update({
         "feature_as_of": as_of_str,
-        "maximum_source_timestamp": max_source_ts.isoformat(),
+        "maximum_source_timestamp": canonical_utc_iso(max_source_ts),
         "label_timestamp": None,
         "prediction_horizon": horizon,
         "source_identity": {

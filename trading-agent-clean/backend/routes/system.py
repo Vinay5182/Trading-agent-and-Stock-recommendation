@@ -29,8 +29,21 @@ def _git_commit() -> str:
 
 import secrets
 
+def get_internal_runtime_info() -> dict:
+    """Return raw, unredacted runtime information for internal use."""
+    return {
+        "project_root": str(PROJECT_ROOT),
+        "backend_pid": os.getpid(),
+        "git_commit": _git_commit(),
+        "started_at": STARTED_AT,
+        "automation_disabled": bool(settings.SMOKE_READ_ONLY_MODE),
+        "smoke_read_only_mode": bool(settings.SMOKE_READ_ONLY_MODE),
+    }
+
+
 @router.get("/runtime-info")
 async def get_runtime_info(request: Request = None) -> dict:
+    info = get_internal_runtime_info()
     is_local = False
 
     # 1. Check env flag
@@ -62,11 +75,8 @@ async def get_runtime_info(request: Request = None) -> dict:
     elif not configured_token and request is None:
         is_local = True
 
-    return {
-        "project_root": str(PROJECT_ROOT) if is_local else "REDACTED",
-        "backend_pid": os.getpid() if is_local else -1,
-        "git_commit": _git_commit(),
-        "started_at": STARTED_AT,
-        "automation_disabled": bool(settings.SMOKE_READ_ONLY_MODE),
-        "smoke_read_only_mode": bool(settings.SMOKE_READ_ONLY_MODE),
-    }
+    if not is_local:
+        info["project_root"] = "REDACTED"
+        info["backend_pid"] = -1
+
+    return info

@@ -19,7 +19,8 @@ def test_openapi_exposes_system_runtime_info() -> None:
 
 
 def test_runtime_info_identifies_current_project_and_process() -> None:
-    result = asyncio.run(system.get_runtime_info())
+    # Test the internal contract (helper must return actual system values)
+    result = system.get_internal_runtime_info()
 
     assert Path(result["project_root"]).resolve() == Path(__file__).resolve().parents[2]
     assert result["backend_pid"] == os.getpid()
@@ -28,6 +29,26 @@ def test_runtime_info_identifies_current_project_and_process() -> None:
     datetime.fromisoformat(result["started_at"])
     assert result["automation_disabled"] is False
     assert result["smoke_read_only_mode"] is False
+
+
+def test_public_api_runtime_info_redacts_sensitive_paths() -> None:
+    # Test the public API boundary contract
+    from fastapi.testclient import TestClient
+    client = TestClient(app)
+    response = client.get("/api/system/runtime-info")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["project_root"] == "REDACTED"
+    assert data["backend_pid"] == -1
+
+    # Ensure sensitive paths are absolutely not exposed in the serialized response
+    text_response = response.text
+    for sensitive_keyword in ("C:\\Users\\Asus", "Asus", "OneDrive", "trading-agent-clean"):
+        assert sensitive_keyword not in text_response, (
+            f"Leakage detected! Public response contains sensitive substring {sensitive_keyword!r}"
+        )
+
 
 
 def test_runtime_info_reports_smoke_automation_disabled() -> None:

@@ -82,6 +82,8 @@ class Settings:
     PAPER_UPDATE_SCHEDULER_MAX_WRITES: int = field(default_factory=lambda: env_int("PAPER_UPDATE_SCHEDULER_MAX_WRITES", 1, minimum=0, maximum=200))
     PAPER_MARKET_SNAPSHOT_RETENTION_DAYS: int = field(default_factory=lambda: env_int("PAPER_MARKET_SNAPSHOT_RETENTION_DAYS", 14, minimum=1, maximum=3650))
     SMOKE_READ_ONLY_MODE: bool = field(default_factory=lambda: env_bool("SMOKE_READ_ONLY_MODE", False))
+    MARKET_DATA_STALENESS_THRESHOLD_SECONDS: int = field(default_factory=lambda: env_int("MARKET_DATA_STALENESS_THRESHOLD_SECONDS", 86400, minimum=1))
+
 
     STARTING_VIRTUAL_BALANCE: float = 250000.0
     LEVERAGE: float = 2.5

@@ -22,6 +22,7 @@ from ai.training_schema import (
     build_canonical_training_row,
     canonical_schema_definition,
 )
+from ai.label_contract import AI_LABEL_CONTRACT_VERSION, build_deterministic_label
 from database import get_database
 from security.operator_intent import OPERATOR_INTENT_HEADER, require_operator_intent_value
 from services.mongo_indexes import get_collection_index_specs
@@ -724,6 +725,13 @@ def _filter_linked_snapshots(snapshots: list[dict], linked_only: bool) -> tuple[
 
 def _unlinked_snapshot_warning(linked_only: bool) -> str | None:
     return None if linked_only else UNLINKED_SNAPSHOT_WARNING
+
+
+def _append_journal_evidence(journals_by_trade_id: dict[str, list[dict]], journal: dict) -> None:
+    paper_trade_id = journal.get("paper_trade_id")
+    if paper_trade_id in (None, ""):
+        return
+    journals_by_trade_id.setdefault(str(paper_trade_id), []).append(journal)
 
 
 def _prepare_snapshot_for_save(snapshot: dict) -> dict:
@@ -1705,14 +1713,65 @@ async def preview_canonical_training_rows(
         terminal_only,
     )
     rows, skipped_unlinked_count = _filter_linked_snapshots(built_rows, linked_only)
+
+    # Bulk load paper_trades and trade_journals
+    db = get_database()
+    paper_trade_ids = {
+        str(row["paper_trade_id"])
+        for row in rows
+        if row.get("paper_trade_id")
+    }
+
+    bson_ids = []
+    string_ids = []
+    for pid in paper_trade_ids:
+        string_ids.append(str(pid))
+        if ObjectId.is_valid(str(pid)):
+            bson_ids.append(ObjectId(str(pid)))
+
+    trades_dict = {}
+    if bson_ids or string_ids:
+        try:
+            trades_cursor = db.paper_trades.find({"_id": {"$in": bson_ids + string_ids}, "paper_only": True})
+            async for t in trades_cursor:
+                trades_dict[str(t["_id"])] = t
+        except (AttributeError, TypeError):
+            pass
+
+    journals_dict: dict[str, list[dict]] = {}
+    if string_ids:
+        try:
+            journals_cursor = db.trade_journal.find({"paper_trade_id": {"$in": string_ids}})
+            async for j in journals_cursor:
+                _append_journal_evidence(journals_dict, j)
+        except (AttributeError, TypeError):
+            pass
+
     generated_at = utc_now_iso()
     canonical_rows = [
-        build_canonical_training_row(row, generated_at=generated_at)
+        build_canonical_training_row(
+            row,
+            generated_at=generated_at,
+            paper_trade=trades_dict.get(str(row.get("paper_trade_id"))),
+            trade_journal=journals_dict.get(str(row.get("paper_trade_id"))),
+        )
         for row in rows
     ]
     invalid_rows = [
         row for row in canonical_rows if not row["audit"]["training_eligible"]
     ]
+
+    win_count = sum(row["label"]["outcome_class"] == "WIN" for row in canonical_rows)
+    loss_count = sum(row["label"]["outcome_class"] == "LOSS" for row in canonical_rows)
+    breakeven_count = sum(row["label"]["outcome_class"] == "BREAKEVEN" for row in canonical_rows)
+    ambiguous_count = sum(row["label"]["outcome_class"] == "AMBIGUOUS" for row in canonical_rows)
+    no_entry_count = sum(row["label"]["outcome_class"] == "NO_ENTRY" for row in canonical_rows)
+    incomplete_count = sum(row["label"]["outcome_class"] == "INCOMPLETE" for row in canonical_rows)
+    invalid_count = sum(row["label"]["outcome_class"] == "INVALID" for row in canonical_rows)
+
+    labeled_count = sum(row["label"]["label_state"] == "LABELED" for row in canonical_rows)
+    unlabeled_count = sum(row["label"]["label_state"] == "UNLABELED" for row in canonical_rows)
+    excluded_count = sum(row["label"]["label_state"] == "EXCLUDED" for row in canonical_rows)
 
     return {
         "paper_only": True,
@@ -1721,6 +1780,7 @@ async def preview_canonical_training_rows(
         "mongo_writes_enabled": False,
         "schema_version": CANONICAL_SCHEMA_VERSION,
         "feature_contract_version": AI_FEATURE_CONTRACT_VERSION,
+        "label_contract_version": AI_LABEL_CONTRACT_VERSION,
         "ordered_model_feature_names": list(APPROVED_MODEL_FEATURES),
         "exact_model_feature_count": len(APPROVED_MODEL_FEATURES),
         "schema": canonical_schema_definition(),
@@ -1736,6 +1796,18 @@ async def preview_canonical_training_rows(
         "count": len(canonical_rows),
         "eligible_count": len(canonical_rows) - len(invalid_rows),
         "excluded_count": len(invalid_rows),
+        "aggregate_label_counts": {
+            "labeled": labeled_count,
+            "unlabeled": unlabeled_count,
+            "excluded": excluded_count,
+            "wins": win_count,
+            "losses": loss_count,
+            "breakevens": breakeven_count,
+            "ambiguous": ambiguous_count,
+            "no_entry": no_entry_count,
+            "incomplete": incomplete_count,
+            "invalid": invalid_count,
+        },
         "rows": canonical_rows,
     }
 
@@ -2060,4 +2132,199 @@ async def get_ai_features_split(
         "validation_first_time": val[0].get("snapshot_time") if val else None,
         "validation_last_time": val[-1].get("snapshot_time") if val else None,
         "test_first_time": test[0].get("snapshot_time") if test else None,
+    }
+
+
+@router.get("/features/label-audit")
+async def get_ai_features_label_audit(
+    limit: int = Query(default=100, ge=1, le=5000),
+) -> dict:
+    from ai.label_contract import (
+        AI_LABEL_CONTRACT_VERSION,
+        build_deterministic_label,
+    )
+    from bson import ObjectId
+
+    db = get_database()
+    cursor = db.ai_feature_snapshots.find({"paper_only": True}).sort("snapshot_time", -1).limit(limit)
+    snapshots = [row async for row in cursor]
+
+    paper_trade_ids = {
+        str(snapshot["paper_trade_id"])
+        for snapshot in snapshots
+        if snapshot.get("paper_trade_id")
+    }
+
+    bson_ids = []
+    string_ids = []
+    for pid in paper_trade_ids:
+        string_ids.append(str(pid))
+        if ObjectId.is_valid(str(pid)):
+            bson_ids.append(ObjectId(str(pid)))
+
+    trades_dict = {}
+    if bson_ids or string_ids:
+        trades_cursor = db.paper_trades.find({"_id": {"$in": bson_ids + string_ids}, "paper_only": True})
+        async for t in trades_cursor:
+            trades_dict[str(t["_id"])] = t
+
+    journals_dict: dict[str, list[dict]] = {}
+    if string_ids:
+        journals_cursor = db.trade_journal.find({"paper_trade_id": {"$in": string_ids}})
+        async for j in journals_cursor:
+            _append_journal_evidence(journals_dict, j)
+
+    generated_at = utc_now_iso()
+    canonical_rows = [
+        build_canonical_training_row(
+            snapshot,
+            generated_at=generated_at,
+            paper_trade=trades_dict.get(str(snapshot.get("paper_trade_id"))),
+            trade_journal=journals_dict.get(str(snapshot.get("paper_trade_id"))),
+        )
+        for snapshot in snapshots
+    ]
+
+    # Metrics
+    win_count = 0
+    loss_count = 0
+    breakeven_count = 0
+    ambiguous_count = 0
+    no_entry_count = 0
+    incomplete_count = 0
+    invalid_count = 0
+
+    labeled_count = 0
+    unlabeled_count = 0
+    excluded_count = 0
+
+    rows_with_realized_r = 0
+    rows_without_realized_r = 0
+
+    missing_entry_evidence = 0
+    missing_exit_evidence = 0
+    incomplete_partial_exits = 0
+    quantity_conservation_failures = 0
+    source_conflicts = 0
+    timestamp_failures = 0
+    duplicate_terminal_evidence = 0
+
+    label_reasons_by_stable_code = {}
+    label_source_counts = {"paper_trade": 0, "trade_journal": 0, "none": 0}
+
+    for row in canonical_rows:
+        lbl = row["label"]
+        outcome_class = lbl["outcome_class"]
+        label_state = lbl["label_state"]
+
+        if label_state == "LABELED":
+            labeled_count += 1
+        elif label_state == "UNLABELED":
+            unlabeled_count += 1
+        else:
+            excluded_count += 1
+
+        if outcome_class == "WIN":
+            win_count += 1
+        elif outcome_class == "LOSS":
+            loss_count += 1
+        elif outcome_class == "BREAKEVEN":
+            breakeven_count += 1
+        elif outcome_class == "AMBIGUOUS":
+            ambiguous_count += 1
+        elif outcome_class == "NO_ENTRY":
+            no_entry_count += 1
+        elif outcome_class == "INCOMPLETE":
+            incomplete_count += 1
+        else:
+            invalid_count += 1
+
+        if lbl["realized_r_multiple"] is not None:
+            rows_with_realized_r += 1
+        else:
+            rows_without_realized_r += 1
+
+        label_source_counts[lbl["label_source"]] = label_source_counts.get(lbl["label_source"], 0) + 1
+
+        # Errors tally
+        for err in lbl["validation_errors"]:
+            label_reasons_by_stable_code[err] = label_reasons_by_stable_code.get(err, 0) + 1
+            if "ENTRY_PRICE_MISSING" in err or "ENTRY_TIME_MISSING" in err or "INITIAL_STOP_MISSING" in err or "INITIAL_RISK_INVALID" in err:
+                missing_entry_evidence += 1
+            if "EXIT_EVIDENCE_MISSING" in err or "EXIT_PRICE_MISSING" in err or "EXIT_QUANTITY_MISSING" in err:
+                missing_exit_evidence += 1
+            if "PARTIAL_EXIT_EVIDENCE_INCOMPLETE" in err:
+                incomplete_partial_exits += 1
+            if "QUANTITY_CONSERVATION_FAILED" in err:
+                quantity_conservation_failures += 1
+            if "LABEL_SOURCE_CONFLICT" in err or "OUTCOME_STATUS_CONFLICT" in err:
+                source_conflicts += 1
+            if "DUPLICATE_TERMINAL_EVIDENCE" in err:
+                duplicate_terminal_evidence += 1
+            if "LABEL_TIMESTAMP_UNSAFE" in err or "LABEL_TIMESTAMP_MISSING" in err or "LABEL_BEFORE_FEATURE_AS_OF" in err or "LABEL_BEFORE_ENTRY" in err:
+                timestamp_failures += 1
+
+    # Leakage check: check that no label-specific field is present in model_features
+    leakage_reconciliation_issues = []
+    from ai.feature_contract import (
+        APPROVED_MODEL_FEATURES,
+        BLOCKED_LABEL_FIELDS,
+    )
+    for row in canonical_rows:
+        model_feats = row["model_features"]
+        for key in model_feats:
+            if key in BLOCKED_LABEL_FIELDS or key not in APPROVED_MODEL_FEATURES:
+                leakage_reconciliation_issues.append(key)
+
+    # Representative examples
+    sanitized_examples = []
+    for row in canonical_rows[:3]:
+        lbl = row["label"]
+        sanitized_examples.append({
+            "schema_version": row.get("schema_version"),
+            "label_contract_version": row.get("label_contract_version"),
+            "outcome_class": lbl.get("outcome_class"),
+            "label_state": lbl.get("label_state"),
+            "training_label": lbl.get("training_label"),
+            "eligible_for_training": lbl.get("eligible_for_training"),
+            "realized_r_multiple": lbl.get("realized_r_multiple"),
+            "validation_errors": lbl.get("validation_errors"),
+            "evidence_summary": lbl.get("evidence_summary"),
+        })
+
+    return {
+        "paper_only": True,
+        "read_only": True,
+        "preview_only": True,
+        "mongo_writes_enabled": False,
+        "label_contract_version": AI_LABEL_CONTRACT_VERSION,
+        "scanned_count": len(snapshots),
+        "rows_evaluated": len(snapshots),
+        "labeled_rows": labeled_count,
+        "training_eligible_labels": labeled_count,
+        "excluded_labels": excluded_count,
+        "unlabeled_incomplete_rows": unlabeled_count,
+        "wins": win_count,
+        "losses": loss_count,
+        "breakeven": breakeven_count,
+        "ambiguous": ambiguous_count,
+        "no_entry": no_entry_count,
+        "invalid": invalid_count,
+        "missing_entry_evidence": missing_entry_evidence,
+        "missing_exit_evidence": missing_exit_evidence,
+        "incomplete_partial_exits": incomplete_partial_exits,
+        "quantity_conservation_failures": quantity_conservation_failures,
+        "source_conflicts": source_conflicts,
+        "timestamp_failures": timestamp_failures,
+        "duplicate_terminal_evidence": duplicate_terminal_evidence,
+        "label_reasons_by_stable_code": label_reasons_by_stable_code,
+        "label_source_counts": label_source_counts,
+        "rows_with_realized_r": rows_with_realized_r,
+        "rows_without_realized_r": rows_without_realized_r,
+        "label_model_feature_leakage_reconciliation": {
+            "unexpected_label_keys_in_features_count": len(leakage_reconciliation_issues),
+            "unexpected_label_keys": list(set(leakage_reconciliation_issues)),
+            "reconciliation_proven": len(leakage_reconciliation_issues) == 0,
+        },
+        "sanitized_representative_examples": sanitized_examples,
     }

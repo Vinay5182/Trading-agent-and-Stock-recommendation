@@ -15,6 +15,8 @@ from ai.feature_contract import (
     BLOCKED_ACCOUNT_FIELDS,
     BLOCKED_AUDIT_FIELDS,
 )
+from ai.label_contract import AI_LABEL_CONTRACT_VERSION, build_deterministic_label
+
 from services.timestamps import (
     TIMESTAMP_LEGACY_TIMEZONE_UNKNOWN,
     TIMESTAMP_MALFORMED,
@@ -637,6 +639,8 @@ def build_canonical_training_row(
     generated_at: str | None = None,
     split_assignment: str = "UNASSIGNED",
     strict: bool = False,
+    paper_trade: Mapping[str, Any] | None = None,
+    trade_journal: Mapping[str, Any] | list[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     generated = _timestamp_text(generated_at) or utc_now_iso()
     timestamp_audit = _timestamp_audit(source_row, generated)
@@ -670,7 +674,27 @@ def build_canonical_training_row(
         }
 
     metadata_dict = _metadata(source_row, timestamp_values)
-    label_dict = _label(source_row, timestamp_values)
+
+    # Fallback to source_row fields if paper_trade is not passed
+    resolved_trade = paper_trade
+    if resolved_trade is None:
+        resolved_trade = {
+            "entry_price": source_row.get("entry_price"),
+            "stop_loss": source_row.get("stop_loss"),
+            "initial_stop_loss": source_row.get("initial_stop_loss") or source_row.get("stop_loss"),
+            "quantity": source_row.get("quantity") or source_row.get("proposed_quantity"),
+            "status": source_row.get("status") or source_row.get("outcome_status") or source_row.get("setup_status"),
+            "outcome_status": source_row.get("outcome_status"),
+            "partial_exit_1": source_row.get("partial_exit_1"),
+            "partial_exit_2": source_row.get("partial_exit_2"),
+            "partial_exit_3": source_row.get("partial_exit_3"),
+            "stop_exit": source_row.get("stop_exit"),
+            "entry_triggered_at": source_row.get("entry_time") or source_row.get("entry_triggered_at"),
+            "created_at": source_row.get("created_at"),
+            "updated_at": source_row.get("updated_at") or source_row.get("status_updated_at"),
+        }
+
+    label_dict = build_deterministic_label({"metadata": metadata_dict}, resolved_trade, trade_journal)
 
     legacy_decision_metadata = {
         k: metadata_dict.get(k)
@@ -694,11 +718,27 @@ def build_canonical_training_row(
         "split_reason": metadata_dict.get("split_reason"),
     }
     legacy_features = dict(model_features_dict)
-    legacy_labels = dict(label_dict)
+
+    # 100% backward-compatible legacy labels structure
+    legacy_labels = {
+        "result_label": label_dict.get("training_label"),
+        "outcome_status": label_dict.get("outcome_class"),
+        "label_timestamp": label_dict.get("label_timestamp"),
+        "exit_time": label_dict.get("label_timestamp"),
+        "completed_at": label_dict.get("label_timestamp"),
+        "label_t1_hit": label_dict["evidence_summary"]["exited_quantity_sum"] > 0,
+        "label_t2_hit": label_dict["evidence_summary"].get("partial_exits_count", 0) >= 2,
+        "label_t3_hit": label_dict["evidence_summary"].get("partial_exits_count", 0) >= 3,
+        "label_sl_hit": label_dict["outcome_class"] == "LOSS",
+        "label_ambiguous": label_dict["outcome_class"] == "AMBIGUOUS",
+        "label_excluded": label_dict["label_state"] == "EXCLUDED",
+        "label_exclusion_reason": ",".join(label_dict["validation_errors"]) if label_dict["validation_errors"] else None,
+    }
 
     row = {
         "schema_version": CANONICAL_SCHEMA_VERSION,
         "feature_contract_version": AI_FEATURE_CONTRACT_VERSION,
+        "label_contract_version": AI_LABEL_CONTRACT_VERSION,
         "training_row_id": None,
         "identity": identity,
         "metadata": metadata_dict,
@@ -721,6 +761,12 @@ def build_canonical_training_row(
             "timestamp_exclusion_reason": timestamp_audit["timestamp_exclusion_reason"],
             "exclusion_reason": None,
             "validation_errors": [],
+            "feature_validation_errors": [],
+            "identity_errors": [],
+            "timestamp_errors": [],
+            "label_validation_errors": list(label_dict.get("validation_errors") or []),
+            "label_warnings": list(label_dict.get("warnings") or []),
+            "label_training_eligible": label_dict.get("eligible_for_training") is True,
             "feature_provenance": feature_provenance,
         },
 
@@ -738,7 +784,44 @@ def build_canonical_training_row(
 
     errors = validation_errors(row)
     errors.extend(error for error in timestamp_audit["errors"] if error not in errors)
+    label_evidence_explicit = paper_trade is not None or trade_journal is not None
+    if label_evidence_explicit:
+        # Merge validation errors from authoritative label evidence.
+        for err in label_dict.get("validation_errors") or []:
+            if err not in ("TRADE_NOT_TERMINAL", "ENTRY_NOT_TRIGGERED"):
+                if err not in errors:
+                    errors.append(err)
+
+        if not label_dict.get("eligible_for_training"):
+            reason = label_dict.get("outcome_class")
+            if reason and reason not in ("INCOMPLETE", "NO_ENTRY"):
+                if f"LABEL_EXCLUDED_{reason}" not in errors:
+                    errors.append(f"LABEL_EXCLUDED_{reason}")
+
     row["audit"]["validation_errors"] = errors
+    row["audit"]["feature_validation_errors"] = [
+        error for error in errors if error.startswith(("FEATURE_", "REQUIRED_FEATURE_", "FEATURE_TYPE_", "FEATURE_NON_"))
+    ]
+    row["audit"]["identity_errors"] = [
+        error for error in errors if error.startswith("IDENTITY_") or error == "TRAINING_ROW_ID_MISSING"
+    ]
+    row["audit"]["timestamp_errors"] = [
+        error for error in errors
+        if error.startswith("TIMESTAMP_")
+        or error in {
+            "SOURCE_CANDLE_AT_MISSING",
+            "FEATURE_AS_OF_MISSING",
+            "GENERATED_AT_MISSING",
+            "SOURCE_CANDLE_AFTER_FEATURE_AS_OF",
+            "FEATURE_AS_OF_AFTER_CONFIRMATION",
+            "CONFIRMED_AFTER_ENTRY",
+            "ENTRY_AFTER_EXIT",
+            "EXIT_AFTER_COMPLETED",
+            "SOURCE_CANDLE_AFTER_CALCULATION_TIMESTAMP",
+            "FEATURE_SOURCE_AFTER_FEATURE_AS_OF",
+            "POST_DECISION_TIMESTAMP_USED_AS_FEATURE_SOURCE",
+        }
+    ]
     row["audit"]["identity_valid"] = "IDENTITY_STABLE_KEY_MISSING" not in errors and not any(
         error.startswith("IDENTITY_INCOMPLETE") or error == "TRAINING_ROW_ID_MISSING"
         for error in errors
@@ -783,6 +866,8 @@ def validation_errors(row: Mapping[str, Any]) -> list[str]:
         errors.append("UNKNOWN_SCHEMA_VERSION")
     if row.get("feature_contract_version") != AI_FEATURE_CONTRACT_VERSION:
         errors.append("UNKNOWN_FEATURE_CONTRACT_VERSION")
+    if row.get("label_contract_version") != AI_LABEL_CONTRACT_VERSION:
+        errors.append("UNKNOWN_LABEL_CONTRACT_VERSION")
 
     audit = row.get("audit") if isinstance(row.get("audit"), Mapping) else {}
     source_schema_version = audit.get("source_schema_version")

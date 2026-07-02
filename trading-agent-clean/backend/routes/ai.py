@@ -1693,6 +1693,7 @@ async def preview_canonical_training_rows(
     source: str = Query(default="scored_candidates"),
     terminal_only: bool = Query(default=False),
 ) -> dict:
+    from ai.feature_contract import AI_FEATURE_CONTRACT_VERSION, APPROVED_MODEL_FEATURES
     clean_source = normalize_snapshot_source(source)
     strategy, clean_timeframe = _resolve_snapshot_filters(clean_source, strategy_type, timeframe)
     built_rows = await _build_feature_snapshots(
@@ -1719,6 +1720,9 @@ async def preview_canonical_training_rows(
         "preview_only": True,
         "mongo_writes_enabled": False,
         "schema_version": CANONICAL_SCHEMA_VERSION,
+        "feature_contract_version": AI_FEATURE_CONTRACT_VERSION,
+        "ordered_model_feature_names": list(APPROVED_MODEL_FEATURES),
+        "exact_model_feature_count": len(APPROVED_MODEL_FEATURES),
         "schema": canonical_schema_definition(),
         "strategy_type": strategy,
         "timeframe": clean_timeframe,
@@ -1734,6 +1738,136 @@ async def preview_canonical_training_rows(
         "excluded_count": len(invalid_rows),
         "rows": canonical_rows,
     }
+
+
+@router.get("/features/leakage-audit")
+async def get_ai_features_leakage_audit(
+    limit: int = Query(default=100, ge=1, le=5000),
+) -> dict:
+    from ai.feature_contract import (
+        AI_FEATURE_CONTRACT_VERSION,
+        APPROVED_MODEL_FEATURES,
+        BLOCKED_IDENTIFIERS,
+        BLOCKED_LABEL_FIELDS,
+        BLOCKED_LIFECYCLE_FIELDS,
+        BLOCKED_ACCOUNT_FIELDS,
+        BLOCKED_AUDIT_FIELDS,
+    )
+
+    db = get_database()
+    cursor = db.ai_feature_snapshots.find({"paper_only": True}).sort("snapshot_time", -1).limit(limit)
+    snapshots = [row async for row in cursor]
+
+    generated_at = utc_now_iso()
+    canonical_rows = [
+        build_canonical_training_row(snapshot, generated_at=generated_at)
+        for snapshot in snapshots
+    ]
+
+    eligible_count = sum(row["audit"]["training_eligible"] for row in canonical_rows)
+    excluded_count = len(canonical_rows) - eligible_count
+
+    # Validation failures by reason
+    validation_failures_by_reason = {}
+    for row in canonical_rows:
+        for err in row["audit"]["validation_errors"]:
+            reason = err.split(":", 1)[0]
+            validation_failures_by_reason[reason] = validation_failures_by_reason.get(reason, 0) + 1
+
+    # Audit for blocked/unknown fields in snapshot documents
+    unknown_source_fields_count = 0
+    blocked_post_decision_fields_count = 0
+    blocked_label_fields_count = 0
+    blocked_account_state_fields_count = 0
+    unsafe_or_future_timestamps_count = 0
+
+    known_fields = (
+        set(APPROVED_MODEL_FEATURES) |
+        BLOCKED_IDENTIFIERS |
+        BLOCKED_LABEL_FIELDS |
+        BLOCKED_LIFECYCLE_FIELDS |
+        BLOCKED_ACCOUNT_FIELDS |
+        BLOCKED_AUDIT_FIELDS |
+        {"feature_snapshot_version", "paper_only", "source_confirmation_created_at", "calculation_version", "score_version", "prediction_horizon", "source_identity"}
+    )
+
+    for snapshot in snapshots:
+        for key, val in snapshot.items():
+            if key not in known_fields:
+                unknown_source_fields_count += 1
+            if key in BLOCKED_LIFECYCLE_FIELDS:
+                blocked_post_decision_fields_count += 1
+            if key in BLOCKED_LABEL_FIELDS:
+                blocked_label_fields_count += 1
+            if key in BLOCKED_ACCOUNT_FIELDS:
+                blocked_account_state_fields_count += 1
+
+    # Count unsafe or future source timestamps
+    for row in canonical_rows:
+        exclusion_reason = row["audit"].get("timestamp_exclusion_reason")
+        if exclusion_reason:
+            unsafe_or_future_timestamps_count += 1
+
+    # Reconcile model_features and prove no extra key entered
+    extra_keys_in_model_features = set()
+    for row in canonical_rows:
+        extra_keys = set(row["model_features"]) - set(APPROVED_MODEL_FEATURES)
+        extra_keys_in_model_features.update(extra_keys)
+
+    extra_keys_reconciliation = list(extra_keys_in_model_features)
+
+    # Sanitized representative examples
+    sanitized_examples = []
+    for row in canonical_rows[:3]:
+        sanitized_row = dict(row)
+        sanitized_examples.append({
+            "schema_version": sanitized_row.get("schema_version"),
+            "feature_contract_version": sanitized_row.get("feature_contract_version"),
+            "training_row_id": sanitized_row.get("training_row_id"),
+            "identity": {
+                "strategy_type": sanitized_row["identity"].get("strategy_type"),
+                "exchange": sanitized_row["identity"].get("exchange"),
+                "timeframe": sanitized_row["identity"].get("timeframe"),
+                "canonical_symbol": sanitized_row["identity"].get("canonical_symbol"),
+            },
+            "model_features": sanitized_row.get("model_features"),
+            "audit": {
+                "training_eligible": sanitized_row["audit"].get("training_eligible"),
+                "identity_valid": sanitized_row["audit"].get("identity_valid"),
+                "validation_errors": sanitized_row["audit"].get("validation_errors"),
+            }
+        })
+
+    return {
+        "paper_only": True,
+        "read_only": True,
+        "preview_only": True,
+        "feature_contract_version": AI_FEATURE_CONTRACT_VERSION,
+        "ordered_whitelisted_model_features": list(APPROVED_MODEL_FEATURES),
+        "blocked_categories": {
+            "identifiers": sorted(BLOCKED_IDENTIFIERS),
+            "label_fields": sorted(BLOCKED_LABEL_FIELDS),
+            "lifecycle_fields": sorted(BLOCKED_LIFECYCLE_FIELDS),
+            "account_fields": sorted(BLOCKED_ACCOUNT_FIELDS),
+            "audit_fields": sorted(BLOCKED_AUDIT_FIELDS),
+        },
+        "scanned_count": len(snapshots),
+        "eligible_count": eligible_count,
+        "excluded_count": excluded_count,
+        "validation_failures_by_reason": validation_failures_by_reason,
+        "unknown_source_fields_count": unknown_source_fields_count,
+        "blocked_post_decision_fields_count": blocked_post_decision_fields_count,
+        "blocked_label_fields_count": blocked_label_fields_count,
+        "blocked_account_state_fields_count": blocked_account_state_fields_count,
+        "unsafe_or_future_timestamps_count": unsafe_or_future_timestamps_count,
+        "extra_keys_reconciliation": {
+            "unexpected_keys_count": len(extra_keys_reconciliation),
+            "unexpected_keys": extra_keys_reconciliation,
+            "reconciliation_proven": len(extra_keys_reconciliation) == 0,
+        },
+        "sanitized_representative_examples": sanitized_examples,
+    }
+
 
 
 @router.post("/features/save")

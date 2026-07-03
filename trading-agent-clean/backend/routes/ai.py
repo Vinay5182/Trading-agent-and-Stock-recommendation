@@ -3,7 +3,7 @@ import hashlib
 from typing import Any
 
 from bson import ObjectId
-from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi import APIRouter, Body, Header, HTTPException, Query
 from pymongo.errors import DuplicateKeyError
 
 from ai.features import (
@@ -34,6 +34,13 @@ from ai.historical_ohlcv import (
 from ai.label_contract import AI_LABEL_CONTRACT_VERSION, build_deterministic_label
 from database import get_database
 from security.operator_intent import OPERATOR_INTENT_HEADER, require_operator_intent_value
+from services.historical_ohlcv_store import (
+    HISTORICAL_OHLCV_COLLECTION,
+    HISTORICAL_OHLCV_STORE_VERSION,
+    HistoricalPersistenceError,
+    build_historical_backfill_plan,
+    historical_persistence_readiness,
+)
 from services.mongo_indexes import get_collection_index_specs
 from services.timestamps import (
     FUTURE_CLOCK_SKEW_TOLERANCE_SECONDS,
@@ -518,6 +525,27 @@ def _history_http_error(exc: HistoricalOHLCVError) -> HTTPException:
     )
 
 
+def _history_persistence_http_error(exc: HistoricalPersistenceError) -> HTTPException:
+    return HTTPException(
+        status_code=400,
+        detail={
+            "error": exc.code,
+            "message": exc.message,
+            "details": exc.details,
+            "store_version": HISTORICAL_OHLCV_STORE_VERSION,
+        },
+    )
+
+
+def _history_collection(db: Any) -> Any:
+    if hasattr(db, "__getitem__"):
+        try:
+            return db[HISTORICAL_OHLCV_COLLECTION]
+        except Exception:
+            pass
+    return getattr(db, HISTORICAL_OHLCV_COLLECTION)
+
+
 async def _fetch_history_result(
     *,
     provider: str,
@@ -594,6 +622,52 @@ async def audit_historical_ohlcv(
     audit = build_history_audit_response(result)
     audit["provider_timeframe_matrix"] = supported_provider_timeframe_matrix()
     return audit
+
+
+@router.post("/history/backfill-preview")
+async def preview_historical_ohlcv_backfill(
+    payload: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+    try:
+        max_rows = int(payload.get("max_rows", payload.get("limit", 200)))
+        db = get_database()
+        return await build_historical_backfill_plan(
+            _history_collection(db),
+            database_name=str(getattr(db, "name", "")),
+            provider=str(payload.get("provider") or ""),
+            exchange=str(payload.get("exchange") or ""),
+            canonical_symbol=str(payload.get("canonical_symbol") or payload.get("symbol") or ""),
+            timeframe=str(payload.get("timeframe") or ""),
+            start=payload.get("start"),
+            end=payload.get("end"),
+            max_rows=max_rows,
+            include_incomplete=bool(payload.get("include_incomplete", False)),
+        )
+    except HistoricalOHLCVError as exc:
+        raise _history_http_error(exc) from exc
+    except HistoricalPersistenceError as exc:
+        raise _history_persistence_http_error(exc) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "HISTORICAL_BACKFILL_REQUEST_INVALID",
+                "message": "provider, exchange, symbol, timeframe, start, end, and max_rows are required.",
+                "store_version": HISTORICAL_OHLCV_STORE_VERSION,
+            },
+        ) from exc
+
+
+@router.get("/history/persistence-readiness")
+async def get_historical_ohlcv_persistence_readiness() -> dict[str, Any]:
+    try:
+        db = get_database()
+        return await historical_persistence_readiness(
+            _history_collection(db),
+            database_name=str(getattr(db, "name", "")),
+        )
+    except HistoricalPersistenceError as exc:
+        raise _history_persistence_http_error(exc) from exc
 
 
 async def _find_latest(collection, query: dict[str, Any]) -> dict | None:

@@ -1220,6 +1220,107 @@ def _empty_result(
     )
 
 
+def normalize_yfinance_dataframe(history: Any, provider_symbol: str) -> Any:
+    """
+    Normalizes a yfinance historical DataFrame to canonical flat columns:
+    Open, High, Low, Close, [Adj Close], Volume.
+
+    Supports:
+      - Flat single-symbol columns
+      - MultiIndex (field, ticker) columns
+      - MultiIndex (ticker, field) columns
+      - MultiIndex with custom level names like Price/Ticker
+    """
+    if history is None or getattr(history, "empty", True):
+        raise HistoricalOHLCVError("HISTORICAL_PROVIDER_FRAME_EMPTY", "DataFrame is empty or None")
+
+    import pandas as pd
+    if not isinstance(history, pd.DataFrame):
+        raise HistoricalOHLCVError("HISTORICAL_PROVIDER_COLUMNS_UNSUPPORTED", "Input is not a pandas DataFrame")
+
+    columns = history.columns
+    # Check if columns is MultiIndex
+    if isinstance(columns, pd.MultiIndex):
+        if columns.nlevels != 2:
+            raise HistoricalOHLCVError("HISTORICAL_PROVIDER_COLUMNS_UNSUPPORTED", f"MultiIndex columns must have exactly 2 levels (got {columns.nlevels})")
+
+        known_fields = {"Open", "High", "Low", "Close", "Volume", "Adj Close"}
+
+        # Determine levels
+        l0_values = {str(v) for v in columns.get_level_values(0)}
+        l1_values = {str(v) for v in columns.get_level_values(1)}
+
+        l0_has_fields = any(f in l0_values for f in known_fields)
+        l1_has_fields = any(f in l1_values for f in known_fields)
+
+        if l0_has_fields and not l1_has_fields:
+            field_level = 0
+            ticker_level = 1
+        elif l1_has_fields and not l0_has_fields:
+            field_level = 1
+            ticker_level = 0
+        elif l0_has_fields and l1_has_fields:
+            # Check level names for hint
+            names = columns.names
+            if names and str(names[0]).lower() in ("price", "field"):
+                field_level = 0
+                ticker_level = 1
+            elif names and str(names[1]).lower() in ("price", "field"):
+                field_level = 1
+                ticker_level = 0
+            else:
+                # Default preference
+                field_level = 0
+                ticker_level = 1
+        else:
+            raise HistoricalOHLCVError("HISTORICAL_PROVIDER_COLUMNS_UNSUPPORTED", "No known OHLCV fields found in MultiIndex columns")
+
+        # Get unique tickers in the ticker level
+        tickers = [t for t in columns.get_level_values(ticker_level).unique() if t and not pd.isna(t)]
+        if not tickers:
+            raise HistoricalOHLCVError("HISTORICAL_PROVIDER_TICKER_MISMATCH", f"No ticker values found in level {ticker_level}")
+
+        if len(tickers) > 1:
+            raise HistoricalOHLCVError("HISTORICAL_PROVIDER_MULTIPLE_TICKERS_UNEXPECTED", f"Multiple tickers found in MultiIndex columns: {tickers}")
+
+        ticker = tickers[0]
+        # Verify provider symbol match (case-insensitive)
+        if str(ticker).strip().upper() != str(provider_symbol).strip().upper():
+            raise HistoricalOHLCVError("HISTORICAL_PROVIDER_TICKER_MISMATCH", f"Ticker level mismatch: expected {provider_symbol}, got {ticker}")
+
+        # Select ticker's cross section and copy to prevent warnings
+        try:
+            temp_df = history.xs(ticker, level=ticker_level, axis=1).copy()
+        except Exception as e:
+            raise HistoricalOHLCVError("HISTORICAL_PROVIDER_COLUMNS_UNSUPPORTED", f"Failed to extract ticker cross-section: {str(e)}")
+
+    else:
+        # Flat index columns
+        temp_df = history.copy()
+
+    # Validate that the resulting DataFrame has required columns
+    required = ["Open", "High", "Low", "Close", "Volume"]
+    for req in required:
+        if req not in temp_df.columns:
+            raise HistoricalOHLCVError("HISTORICAL_PROVIDER_REQUIRED_COLUMN_MISSING", f"Required column missing: {req}")
+
+    # Check for duplicate canonical field columns
+    col_list = list(temp_df.columns)
+    if len(col_list) != len(set(col_list)):
+        raise HistoricalOHLCVError("HISTORICAL_PROVIDER_DUPLICATE_COLUMN", f"Duplicate columns detected after normalization: {col_list}")
+
+    # Deterministic columns selection and ordering
+    final_cols = ["Open", "High", "Low", "Close"]
+    if "Adj Close" in temp_df.columns:
+        final_cols.append("Adj Close")
+    final_cols.append("Volume")
+
+    # Slice the DataFrame to contain exactly and only these columns in this order
+    temp_df = temp_df[final_cols]
+
+    return temp_df
+
+
 def fetch_yfinance_historical_ohlcv(
     *,
     exchange: str,
@@ -1280,6 +1381,9 @@ def fetch_yfinance_historical_ohlcv(
             provider_errors=[sanitize_provider_error(error)],
             fetched_at=fetched_at,
         )
+
+    # Normalize the retrieved DataFrame
+    history = normalize_yfinance_dataframe(history, provider_symbol)
 
     source_timezone = _dataframe_timezone_label(history)
     if history is not None and not getattr(history, "empty", True) and source_timezone is None:

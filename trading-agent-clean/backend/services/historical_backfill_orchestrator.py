@@ -358,6 +358,8 @@ async def build_historical_multi_symbol_backfill_plan(
                             "excluded": plan["counts"]["excluded"],
                         },
                         "error_code": None,
+                        "provider_diagnostic_code": None,
+                        "exception_class": None,
                         "attempt_count": attempt,
                         "retryable": False,
                     }
@@ -371,13 +373,23 @@ async def build_historical_multi_symbol_backfill_plan(
                     # Distinguish retryable/transient vs non-retryable errors
                     is_transient = False
                     err_code = "HISTORICAL_BACKFILL_FAILED"
+                    provider_diagnostic_code = None
+                    if hasattr(exc, "details") and isinstance(exc.details, dict):
+                        provider_diagnostic_code = exc.details.get("provider_code") or exc.details.get("reason")
+
                     if isinstance(exc, HistoricalPersistenceError):
                         err_code = exc.code
                     elif isinstance(exc, HistoricalOHLCVError):
                         err_code = exc.code
 
-                    # Rate limiting error (HTTP 429) or network timeout is transient
-                    if getattr(exc, "rate_limited", False) or "timeout" in str(exc).lower():
+                    # Rate limiting error (HTTP 429), network timeout, connection reset are transient
+                    exc_str = str(exc).lower()
+                    if (
+                        getattr(exc, "rate_limited", False)
+                        or "timeout" in exc_str
+                        or "connection" in exc_str
+                        or "429" in exc_str
+                    ):
                         is_transient = True
 
                     if is_transient and attempt <= max_retries:
@@ -400,6 +412,8 @@ async def build_historical_multi_symbol_backfill_plan(
                             "excluded": 0,
                         },
                         "error_code": err_code,
+                        "provider_diagnostic_code": provider_diagnostic_code,
+                        "exception_class": exc.__class__.__name__,
                         "attempt_count": attempt,
                         "retryable": is_transient,
                     }

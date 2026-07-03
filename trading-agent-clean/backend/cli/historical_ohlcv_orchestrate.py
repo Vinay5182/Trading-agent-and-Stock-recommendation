@@ -11,6 +11,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import settings
 from services.historical_backfill_orchestrator import (
+    MULTI_SYMBOL_APPLY_ACK,
+    MULTI_SYMBOL_APPLY_APPROVAL_VALUE,
+    MULTI_SYMBOL_APPLY_CONTRACT_VERSION,
+    apply_historical_multi_symbol_backfill_plan,
     build_historical_multi_symbol_backfill_plan,
     verify_historical_multi_symbol_backfill_plan,
 )
@@ -37,9 +41,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=10)
     parser.add_argument("--plan-output")
     parser.add_argument("--plan-file")
+    parser.add_argument("--result-output")
     parser.add_argument("--manifest-hash")
+    parser.add_argument("--aggregate-manifest-hash")
+    parser.add_argument("--expected-plan-id")
     parser.add_argument("--expected-database")
-    parser.add_argument("--expected-collection", default=HISTORICAL_OHLCV_COLLECTION)
+    parser.add_argument("--expected-collection")
+    parser.add_argument("--expected-symbols", nargs="+")
+    parser.add_argument("--expected-insert-count", type=int)
+    parser.add_argument("--expected-noop-count", type=int)
+    parser.add_argument("--expected-conflict-count", type=int)
+    parser.add_argument("--expected-excluded-count", type=int)
+    parser.add_argument("--apply-contract-version")
+    parser.add_argument("--approval-value")
+    parser.add_argument("--operator-acknowledgement")
+    parser.add_argument("--approved", action="store_true")
     parser.add_argument("--apply", action="store_true", help="Triggers apply check.")
     return parser.parse_args(argv)
 
@@ -77,6 +93,45 @@ def _database_name(db: Any, fallback: str) -> str:
     return str(getattr(db, "name", fallback) or fallback)
 
 
+def _validate_apply_cli_gates(args: argparse.Namespace) -> None:
+    missing = []
+    required = (
+        "plan_file",
+        "aggregate_manifest_hash",
+        "expected_plan_id",
+        "expected_database",
+        "expected_collection",
+        "expected_symbols",
+        "expected_insert_count",
+        "expected_noop_count",
+        "expected_conflict_count",
+        "expected_excluded_count",
+        "apply_contract_version",
+        "approval_value",
+        "operator_acknowledgement",
+    )
+    for name in required:
+        value = getattr(args, name, None)
+        if value in (None, "", []):
+            missing.append(name.replace("_", "-"))
+    if not args.apply:
+        missing.append("apply")
+    if args.approved is not True:
+        missing.append("approved")
+    if missing:
+        raise HistoricalPersistenceError(
+            "MULTI_SYMBOL_APPROVAL_REQUIRED",
+            "Multi-symbol apply requires every explicit CLI approval gate before database access.",
+            {"missing": sorted(set(missing))},
+        )
+    if args.apply_contract_version != MULTI_SYMBOL_APPLY_CONTRACT_VERSION:
+        raise HistoricalPersistenceError("MULTI_SYMBOL_APPROVAL_REQUIRED", "Unsupported multi-symbol apply contract version.")
+    if args.approval_value != MULTI_SYMBOL_APPLY_APPROVAL_VALUE:
+        raise HistoricalPersistenceError("MULTI_SYMBOL_APPROVAL_REQUIRED", "Approval value does not match multi-symbol apply contract.")
+    if args.operator_acknowledgement != MULTI_SYMBOL_APPLY_ACK:
+        raise HistoricalPersistenceError("MULTI_SYMBOL_APPROVAL_REQUIRED", "Operator acknowledgement does not match multi-symbol apply contract.")
+
+
 async def _open_live_db(database_name: str) -> tuple[Any, Any]:
     from motor.motor_asyncio import AsyncIOMotorClient
     client = AsyncIOMotorClient(settings.MONGO_URI)
@@ -102,19 +157,57 @@ async def run(
     db_override: Any | None = None,
     fetcher: Any = None,
 ) -> dict[str, Any]:
-    # Phase 5B3A Apply Mode Protection: Fail closed
-    if args.mode == "apply" or args.apply:
+    if args.mode != "apply" and args.apply:
         raise HistoricalPersistenceError(
-            "MULTI_SYMBOL_APPLY_NOT_ENABLED",
-            "Multi-symbol backfill execution is disabled/not supported in Phase 5B3A."
+            "MULTI_SYMBOL_APPROVAL_REQUIRED",
+            "--apply is only valid with --mode apply.",
         )
+
+    if args.mode == "apply":
+        _validate_apply_cli_gates(args)
+        plan = _load_plan(args.plan_file)
+        client = None
+        db = db_override
+        if db is None:
+            client, db = await _open_live_db(args.expected_database)
+        try:
+            collection = _collection_for(db)
+            database_name = _database_name(db, args.expected_database)
+            approval = {
+                "apply": args.apply,
+                "approved": args.approved,
+                "apply_contract_version": args.apply_contract_version,
+                "approval_value": args.approval_value,
+                "operator_acknowledgement": args.operator_acknowledgement,
+                "aggregate_manifest_hash": args.aggregate_manifest_hash,
+                "expected_plan_id": args.expected_plan_id,
+                "expected_database": args.expected_database,
+                "expected_collection": args.expected_collection,
+                "expected_symbols": args.expected_symbols,
+                "expected_insert_count": args.expected_insert_count,
+                "expected_noop_count": args.expected_noop_count,
+                "expected_conflict_count": args.expected_conflict_count,
+                "expected_excluded_count": args.expected_excluded_count,
+            }
+            result = await apply_historical_multi_symbol_backfill_plan(
+                collection,
+                plan,
+                approval=approval,
+                database_name=database_name,
+                expected_collection=args.expected_collection,
+            )
+            _write_json(args.result_output, result)
+            return result
+        finally:
+            if client is not None:
+                client.close()
 
     if args.mode == "verify-plan":
         plan = _load_plan(args.plan_file)
         verify_historical_multi_symbol_backfill_plan(
             plan,
             expected_database=args.expected_database or plan.get("target_database"),
-            expected_collection=args.expected_collection or plan.get("target_collection"),
+            expected_collection=args.expected_collection or plan.get("target_collection") or HISTORICAL_OHLCV_COLLECTION,
         )
         return {
             "ok": True,

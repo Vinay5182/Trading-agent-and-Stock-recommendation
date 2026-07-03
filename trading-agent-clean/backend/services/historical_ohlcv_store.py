@@ -663,6 +663,7 @@ async def build_historical_backfill_plan(
     fetcher: Any = fetch_historical_ohlcv,
     now: datetime | None = None,
 ) -> dict[str, Any]:
+    clean_exchange = str(exchange or "").strip().upper()
     now_dt = _utc(now)
     start_dt, end_dt, timeframe_contract, _provider_timeframe = validate_request_range(
         start=start,
@@ -670,8 +671,26 @@ async def build_historical_backfill_plan(
         provider=provider,
         timeframe=timeframe,
         limit=max_rows,
+        exchange=clean_exchange,
     )
-    clean_exchange = str(exchange or "").strip().upper()
+    from ai.historical_ohlcv import EXCHANGE_TIMEZONES
+    from zoneinfo import ZoneInfo
+    tz_name = EXCHANGE_TIMEZONES.get(clean_exchange)
+    if timeframe_contract.canonical == "1d":
+        range_semantics = "EXCHANGE_LOCAL_TRADING_DATE_HALF_OPEN"
+        if not tz_name:
+            raise HistoricalPersistenceError(
+                "HISTORICAL_EXCHANGE_TIMEZONE_UNKNOWN",
+                f"Exchange timezone is unknown for exchange: {exchange}"
+            )
+        tz = ZoneInfo(tz_name)
+        effective_local_start_date = start_dt.astimezone(tz).date().isoformat()
+        effective_local_end_date = end_dt.astimezone(tz).date().isoformat()
+    else:
+        range_semantics = "UTC_INSTANT_HALF_OPEN"
+        effective_local_start_date = None
+        effective_local_end_date = None
+
     clean_symbol = normalize_symbol(clean_exchange, canonical_symbol)
     request = {
         "provider": str(provider or "").strip().lower(),
@@ -683,6 +702,7 @@ async def build_historical_backfill_plan(
         "include_incomplete": include_incomplete,
         "max_rows": max_rows,
     }
+
     if acquisition_result is None:
         acquisition_result = await _call_fetcher(
             fetcher,
@@ -773,6 +793,14 @@ async def build_historical_backfill_plan(
         "index_creation_enabled": False,
         "required_operator_intent_header": None,
         "request": request,
+        "range_semantics": range_semantics,
+        "exchange_timezone": tz_name,
+        "requested_start_utc": canonical_utc_iso(start_dt),
+        "requested_end_utc": canonical_utc_iso(end_dt),
+        "effective_local_start_date": effective_local_start_date,
+        "effective_local_end_date": effective_local_end_date,
+        "end_boundary_inclusive": False,
+
         "source_acquisition": {
             "schema_version": acquisition.get("schema_version"),
             "provider": acquisition.get("provider"),
@@ -832,7 +860,35 @@ def validate_historical_plan_for_apply(
 ) -> dict[str, Any]:
     if plan.get("store_version") != HISTORICAL_OHLCV_STORE_VERSION:
         raise HistoricalPersistenceError(HISTORICAL_PLAN_HASH_MISMATCH, "Unsupported historical store version.")
+    if "range_semantics" not in plan:
+        raise HistoricalPersistenceError(
+            "HISTORICAL_RANGE_SEMANTICS_MISMATCH",
+            "Plan is missing required range_semantics field."
+        )
+    if "requested_start_utc" not in plan or "requested_end_utc" not in plan:
+        raise HistoricalPersistenceError(
+            "HISTORICAL_RANGE_SEMANTICS_MISMATCH",
+            "Plan is missing requested_start_utc or requested_end_utc."
+        )
+    if "end_boundary_inclusive" not in plan:
+        raise HistoricalPersistenceError(
+            "HISTORICAL_RANGE_SEMANTICAL_MISMATCH" if False else "HISTORICAL_RANGE_SEMANTICS_MISMATCH",
+            "Plan is missing end_boundary_inclusive."
+        )
+    tf = plan.get("request", {}).get("timeframe")
+    if tf == "1d":
+        if "exchange_timezone" not in plan or not plan.get("exchange_timezone"):
+            raise HistoricalPersistenceError(
+                "HISTORICAL_RANGE_SEMANTICS_MISMATCH",
+                "Plan is missing exchange_timezone for daily timeframe."
+            )
+        if "effective_local_start_date" not in plan or "effective_local_end_date" not in plan:
+            raise HistoricalPersistenceError(
+                "HISTORICAL_RANGE_SEMANTICS_MISMATCH",
+                "Plan is missing effective_local_start_date or effective_local_end_date for daily timeframe."
+            )
     if plan.get("target_database") != expected_database:
+
         raise HistoricalPersistenceError(HISTORICAL_PLAN_HASH_MISMATCH, "Plan database does not match apply target.")
     if plan.get("target_collection") != expected_collection:
         raise HistoricalPersistenceError(HISTORICAL_PLAN_HASH_MISMATCH, "Plan collection does not match apply target.")
@@ -852,6 +908,11 @@ def validate_historical_plan_for_apply(
     if int(counts.get("excluded") or 0) > 0:
         raise HistoricalPersistenceError(HISTORICAL_EXCLUDED_INVALID, "Plan contains excluded candles.")
     documents = list(plan.get("candidate_documents") or [])
+    timeframe = plan.get("request", {}).get("timeframe")
+    exchange = plan.get("request", {}).get("exchange")
+    start = plan.get("request", {}).get("start")
+    end = plan.get("request", {}).get("end")
+    from ai.historical_ohlcv import validate_candle_scope
     seen: set[str] = set()
     for document in documents:
         candle_id = str(document.get("candle_id") or "")
@@ -862,6 +923,20 @@ def validate_historical_plan_for_apply(
             raise HistoricalPersistenceError(HISTORICAL_PLAN_INPUT_CHANGED, "Candidate document store version changed.")
         if document.get("canonical_content_fingerprint") != persisted_content_fingerprint(document):
             raise HistoricalPersistenceError(HISTORICAL_PLAN_INPUT_CHANGED, "Candidate document content fingerprint changed.")
+        scope = validate_candle_scope(
+            candle_open_at=document.get("candle_open_at"),
+            timeframe=timeframe,
+            exchange=exchange,
+            requested_start=start,
+            requested_end=end,
+        )
+        if not scope["in_scope"]:
+            raise HistoricalPersistenceError(
+                scope["reason_code"],
+                f"Candidate candle {candle_id} is out of scope: {scope['reason_code']}",
+                {"candle_id": candle_id, "reason_code": scope["reason_code"]}
+            )
+
     return safe_json_value(dict(plan))
 
 

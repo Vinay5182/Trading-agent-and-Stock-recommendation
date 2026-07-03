@@ -56,6 +56,146 @@ EXCHANGE_MISMATCH = "EXCHANGE_MISMATCH"
 CANDLE_TIMESTAMP_NOT_ALIGNED = "CANDLE_TIMESTAMP_NOT_ALIGNED"
 NON_MONOTONIC_PROVIDER_ORDER = "NON_MONOTONIC_PROVIDER_ORDER"
 
+HISTORICAL_CANDLE_BEFORE_RANGE = "HISTORICAL_CANDLE_BEFORE_RANGE"
+HISTORICAL_CANDLE_AT_OR_AFTER_END = "HISTORICAL_CANDLE_AT_OR_AFTER_END"
+HISTORICAL_EXCHANGE_TIMEZONE_UNKNOWN = "HISTORICAL_EXCHANGE_TIMEZONE_UNKNOWN"
+HISTORICAL_RANGE_SEMANTICS_MISMATCH = "HISTORICAL_RANGE_SEMANTICS_MISMATCH"
+HISTORICAL_LOCAL_DATE_DERIVATION_FAILED = "HISTORICAL_LOCAL_DATE_DERIVATION_FAILED"
+
+EXCHANGE_TIMEZONES = {
+    "NSE": "Asia/Kolkata",
+    "BSE": "Asia/Kolkata",
+}
+
+
+def validate_candle_scope(
+    *,
+    candle_open_at: str | datetime,
+    timeframe: str,
+    exchange: str,
+    requested_start: Any,
+    requested_end: Any,
+) -> dict[str, Any]:
+    if isinstance(candle_open_at, str):
+        try:
+            candle_dt = datetime.fromisoformat(candle_open_at.replace("Z", "+00:00")).astimezone(UTC)
+        except Exception:
+            return {
+                "in_scope": False,
+                "range_semantics": None,
+                "exchange_timezone": None,
+                "candle_trading_date": None,
+                "reason_code": "HISTORICAL_CANDLE_TIMESTAMP_INVALID"
+            }
+    elif isinstance(candle_open_at, datetime):
+        if candle_open_at.tzinfo is None:
+            candle_dt = candle_open_at.replace(tzinfo=UTC)
+        else:
+            candle_dt = candle_open_at.astimezone(UTC)
+    else:
+        return {
+            "in_scope": False,
+            "range_semantics": None,
+            "exchange_timezone": None,
+            "candle_trading_date": None,
+            "reason_code": "HISTORICAL_CANDLE_TIMESTAMP_INVALID"
+        }
+
+    try:
+        start_dt = parse_request_utc(requested_start, "start")
+        end_dt = parse_request_utc(requested_end, "end")
+    except Exception:
+        return {
+            "in_scope": False,
+            "range_semantics": None,
+            "exchange_timezone": None,
+            "candle_trading_date": None,
+            "reason_code": "HISTORICAL_RANGE_PARSING_FAILED"
+        }
+
+    clean_exchange = str(exchange or "").strip().upper()
+
+    if timeframe == "1d":
+        range_semantics = "EXCHANGE_LOCAL_TRADING_DATE_HALF_OPEN"
+        tz_name = EXCHANGE_TIMEZONES.get(clean_exchange)
+        if not tz_name:
+            return {
+                "in_scope": False,
+                "range_semantics": range_semantics,
+                "exchange_timezone": None,
+                "candle_trading_date": None,
+                "reason_code": "HISTORICAL_EXCHANGE_TIMEZONE_UNKNOWN"
+            }
+        try:
+            tz = ZoneInfo(tz_name)
+            candle_local = candle_dt.astimezone(tz)
+            candle_trading_date = candle_local.date().isoformat()
+            local_start_date = start_dt.astimezone(tz).date().isoformat()
+            local_end_date = end_dt.astimezone(tz).date().isoformat()
+        except Exception:
+            return {
+                "in_scope": False,
+                "range_semantics": range_semantics,
+                "exchange_timezone": tz_name,
+                "candle_trading_date": None,
+                "reason_code": "HISTORICAL_LOCAL_DATE_DERIVATION_FAILED"
+            }
+
+        if candle_trading_date < local_start_date:
+            return {
+                "in_scope": False,
+                "range_semantics": range_semantics,
+                "exchange_timezone": tz_name,
+                "candle_trading_date": candle_trading_date,
+                "reason_code": "HISTORICAL_CANDLE_BEFORE_RANGE"
+            }
+        if candle_trading_date >= local_end_date:
+            return {
+                "in_scope": False,
+                "range_semantics": range_semantics,
+                "exchange_timezone": tz_name,
+                "candle_trading_date": candle_trading_date,
+                "reason_code": "HISTORICAL_CANDLE_AT_OR_AFTER_END"
+            }
+
+        return {
+            "in_scope": True,
+            "range_semantics": range_semantics,
+            "exchange_timezone": tz_name,
+            "candle_trading_date": candle_trading_date,
+            "reason_code": None
+        }
+
+    else:
+        range_semantics = "UTC_INSTANT_HALF_OPEN"
+        tz_name = EXCHANGE_TIMEZONES.get(clean_exchange)
+
+        if candle_dt < start_dt:
+            return {
+                "in_scope": False,
+                "range_semantics": range_semantics,
+                "exchange_timezone": tz_name,
+                "candle_trading_date": candle_dt.isoformat(),
+                "reason_code": "HISTORICAL_CANDLE_BEFORE_RANGE"
+            }
+        if candle_dt >= end_dt:
+            return {
+                "in_scope": False,
+                "range_semantics": range_semantics,
+                "exchange_timezone": tz_name,
+                "candle_trading_date": candle_dt.isoformat(),
+                "reason_code": "HISTORICAL_CANDLE_AT_OR_AFTER_END"
+            }
+
+        return {
+            "in_scope": True,
+            "range_semantics": range_semantics,
+            "exchange_timezone": tz_name,
+            "candle_trading_date": candle_dt.isoformat(),
+            "reason_code": None
+        }
+
+
 REQUIRED_CANDLE_KEYS = {
     "schema_version",
     "candle_id",
@@ -251,6 +391,7 @@ def validate_request_range(
     provider: str,
     timeframe: str,
     limit: int,
+    exchange: str | None = None,
 ) -> tuple[datetime, datetime, TimeframeContract, ProviderTimeframeContract]:
     provider_contract = get_provider_contract(provider)
     timeframe_contract = get_timeframe_contract(timeframe, provider_contract.provider)
@@ -259,6 +400,20 @@ def validate_request_range(
     end_dt = parse_request_utc(end, "end")
     if end_dt <= start_dt:
         raise HistoricalOHLCVError(CANDLE_CLOSE_BEFORE_OPEN, "end must be after start")
+
+    if timeframe_contract.canonical == "1d":
+        if exchange is None:
+            raise HistoricalOHLCVError(
+                "HISTORICAL_EXCHANGE_TIMEZONE_UNKNOWN",
+                "Exchange must be specified for daily timeframe range validation."
+            )
+        clean_exchange = str(exchange).strip().upper()
+        if clean_exchange not in EXCHANGE_TIMEZONES:
+            raise HistoricalOHLCVError(
+                "HISTORICAL_EXCHANGE_TIMEZONE_UNKNOWN",
+                f"Exchange timezone is unknown for exchange: {exchange}"
+            )
+
     if end_dt - start_dt > timedelta(days=provider_timeframe.max_period_days):
         raise HistoricalOHLCVError(
             PROVIDER_INTERVAL_UNSUPPORTED,
@@ -275,6 +430,7 @@ def validate_request_range(
             {"max_rows": HISTORICAL_OHLCV_MAX_ROWS},
         )
     return start_dt, end_dt, timeframe_contract, provider_timeframe
+
 
 
 def candle_identity(exchange: str, canonical_symbol: str, timeframe: str, candle_open_at: str) -> str:
@@ -518,10 +674,27 @@ def canonicalize_provider_row(
 
     now_dt = (now or utc_now()).astimezone(UTC)
     is_closed, closed_error = _closed_state(open_dt, close_dt, now_dt, HISTORICAL_CANDLE_CLOSE_SAFETY_SECONDS)
-    quality_codes: list[str] = []
     if closed_error == CANDLE_TIMESTAMP_IN_FUTURE:
         return None, {**base_exclusion, "reason_codes": [CANDLE_TIMESTAMP_IN_FUTURE]}
+
+    scope = validate_candle_scope(
+        candle_open_at=open_dt,
+        timeframe=contract.canonical,
+        exchange=clean_exchange,
+        requested_start=requested_start,
+        requested_end=requested_end,
+    )
+    if not scope["in_scope"]:
+        if scope["reason_code"] in {"HISTORICAL_EXCHANGE_TIMEZONE_UNKNOWN", "HISTORICAL_LOCAL_DATE_DERIVATION_FAILED"}:
+            raise HistoricalOHLCVError(
+                scope["reason_code"],
+                f"Range validation failed: {scope['reason_code']}"
+            )
+        return None, {**base_exclusion, "reason_codes": [scope["reason_code"]]}
+
+    quality_codes: list[str] = []
     if closed_error == CURRENT_CANDLE_INCOMPLETE:
+
         if not include_incomplete:
             return None, {**base_exclusion, "reason_codes": [CURRENT_CANDLE_INCOMPLETE]}
         quality_codes.append(CURRENT_CANDLE_INCOMPLETE)
@@ -836,18 +1009,37 @@ def normalize_provider_rows(
     provider_errors: list[str] | None = None,
 ) -> dict[str, Any]:
     clean_provider = get_provider_contract(provider).provider
+    clean_exchange = _clean_exchange(exchange)
     start_dt, end_dt, timeframe_contract, provider_timeframe = validate_request_range(
         start=start,
         end=end,
         provider=clean_provider,
         timeframe=timeframe,
         limit=limit,
+        exchange=clean_exchange,
     )
-    clean_exchange = _clean_exchange(exchange)
+
     clean_symbol = normalize_symbol(clean_exchange, canonical_symbol)
     fetched = fetched_at or canonical_utc_iso(now or utc_now())
     requested_start = canonical_utc_iso(start_dt)
     requested_end = canonical_utc_iso(end_dt)
+
+    tz_name = EXCHANGE_TIMEZONES.get(clean_exchange)
+    if timeframe_contract.canonical == "1d":
+        range_semantics = "EXCHANGE_LOCAL_TRADING_DATE_HALF_OPEN"
+        if not tz_name:
+            raise HistoricalOHLCVError(
+                "HISTORICAL_EXCHANGE_TIMEZONE_UNKNOWN",
+                f"Exchange timezone is unknown for exchange: {exchange}"
+            )
+        tz = ZoneInfo(tz_name)
+        effective_local_start_date = start_dt.astimezone(tz).date().isoformat()
+        effective_local_end_date = end_dt.astimezone(tz).date().isoformat()
+    else:
+        range_semantics = "UTC_INSTANT_HALF_OPEN"
+        effective_local_start_date = None
+        effective_local_end_date = None
+
     interval = provider_interval or provider_timeframe.interval
     semantic = timestamp_semantic or provider_timeframe.timestamp_semantic
 
@@ -916,12 +1108,20 @@ def normalize_provider_rows(
         "canonical_symbol": clean_symbol,
         "provider_symbol": provider_symbol,
         "timeframe": timeframe_contract.canonical,
+        "range_semantics": range_semantics,
+        "exchange_timezone": tz_name,
+        "requested_start_utc": requested_start,
+        "requested_end_utc": requested_end,
+        "effective_local_start_date": effective_local_start_date,
+        "effective_local_end_date": effective_local_end_date,
+        "end_boundary_inclusive": False,
         "request": {
             "start": requested_start,
             "end": requested_end,
             "include_incomplete": include_incomplete,
             "limit": limit,
         },
+
         "provider_metadata": {
             "provider": clean_provider,
             "provider_symbol": provider_symbol,
@@ -1041,7 +1241,9 @@ def fetch_yfinance_historical_ohlcv(
         provider=provider,
         timeframe=timeframe,
         limit=limit,
+        exchange=clean_exchange,
     )
+
     fetched_at = canonical_utc_iso(now or utc_now())
     try:
         import yfinance as yf

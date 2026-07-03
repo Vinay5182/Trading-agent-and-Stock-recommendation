@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 from typing import Any
 
@@ -21,6 +22,14 @@ from ai.training_schema import (
     CANONICAL_SCHEMA_VERSION,
     build_canonical_training_row,
     canonical_schema_definition,
+)
+from ai.historical_ohlcv import (
+    HISTORICAL_OHLCV_MAX_ROWS,
+    HISTORICAL_OHLCV_SCHEMA_VERSION,
+    HistoricalOHLCVError,
+    build_history_audit_response,
+    fetch_historical_ohlcv,
+    supported_provider_timeframe_matrix,
 )
 from ai.label_contract import AI_LABEL_CONTRACT_VERSION, build_deterministic_label
 from database import get_database
@@ -495,6 +504,96 @@ def _or_query(conditions: list[dict[str, Any]]) -> dict[str, Any]:
     if not clean:
         return {}
     return clean[0] if len(clean) == 1 else {"$or": clean}
+
+
+def _history_http_error(exc: HistoricalOHLCVError) -> HTTPException:
+    return HTTPException(
+        status_code=400,
+        detail={
+            "error": exc.code,
+            "message": exc.message,
+            "details": exc.details,
+            "schema_version": HISTORICAL_OHLCV_SCHEMA_VERSION,
+        },
+    )
+
+
+async def _fetch_history_result(
+    *,
+    provider: str,
+    exchange: str,
+    symbol: str,
+    timeframe: str,
+    start: str,
+    end: str,
+    include_incomplete: bool,
+    limit: int,
+) -> dict[str, Any]:
+    try:
+        return await asyncio.to_thread(
+            fetch_historical_ohlcv,
+            provider=provider,
+            exchange=exchange,
+            canonical_symbol=symbol,
+            timeframe=timeframe,
+            start=start,
+            end=end,
+            include_incomplete=include_incomplete,
+            limit=limit,
+        )
+    except HistoricalOHLCVError as exc:
+        raise _history_http_error(exc) from exc
+
+
+@router.get("/history/preview")
+async def preview_historical_ohlcv(
+    symbol: str = Query(..., min_length=1),
+    exchange: str = Query(..., min_length=1),
+    provider: str = Query(..., min_length=1),
+    timeframe: str = Query(..., min_length=1),
+    start: str = Query(..., min_length=1),
+    end: str = Query(..., min_length=1),
+    include_incomplete: bool = Query(default=False),
+    limit: int = Query(default=200, ge=1, le=HISTORICAL_OHLCV_MAX_ROWS),
+) -> dict[str, Any]:
+    result = await _fetch_history_result(
+        provider=provider,
+        exchange=exchange,
+        symbol=symbol,
+        timeframe=timeframe,
+        start=start,
+        end=end,
+        include_incomplete=include_incomplete,
+        limit=limit,
+    )
+    result["provider_timeframe_matrix"] = supported_provider_timeframe_matrix()
+    return result
+
+
+@router.get("/history/audit")
+async def audit_historical_ohlcv(
+    symbol: str = Query(..., min_length=1),
+    exchange: str = Query(..., min_length=1),
+    provider: str = Query(..., min_length=1),
+    timeframe: str = Query(..., min_length=1),
+    start: str = Query(..., min_length=1),
+    end: str = Query(..., min_length=1),
+    include_incomplete: bool = Query(default=False),
+    limit: int = Query(default=200, ge=1, le=HISTORICAL_OHLCV_MAX_ROWS),
+) -> dict[str, Any]:
+    result = await _fetch_history_result(
+        provider=provider,
+        exchange=exchange,
+        symbol=symbol,
+        timeframe=timeframe,
+        start=start,
+        end=end,
+        include_incomplete=include_incomplete,
+        limit=limit,
+    )
+    audit = build_history_audit_response(result)
+    audit["provider_timeframe_matrix"] = supported_provider_timeframe_matrix()
+    return audit
 
 
 async def _find_latest(collection, query: dict[str, Any]) -> dict | None:

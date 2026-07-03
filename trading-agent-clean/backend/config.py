@@ -83,6 +83,8 @@ class Settings:
     PAPER_MARKET_SNAPSHOT_RETENTION_DAYS: int = field(default_factory=lambda: env_int("PAPER_MARKET_SNAPSHOT_RETENTION_DAYS", 14, minimum=1, maximum=3650))
     SMOKE_READ_ONLY_MODE: bool = field(default_factory=lambda: env_bool("SMOKE_READ_ONLY_MODE", False))
     MARKET_DATA_STALENESS_THRESHOLD_SECONDS: int = field(default_factory=lambda: env_int("MARKET_DATA_STALENESS_THRESHOLD_SECONDS", 86400, minimum=1))
+    HISTORICAL_CANDLE_CLOSE_SAFETY_SECONDS: int = field(default_factory=lambda: env_int("HISTORICAL_CANDLE_CLOSE_SAFETY_SECONDS", 60, minimum=0, maximum=3600))
+    HISTORICAL_OHLCV_MAX_ROWS: int = field(default_factory=lambda: env_int("HISTORICAL_OHLCV_MAX_ROWS", 5000, minimum=1, maximum=50000))
 
 
     STARTING_VIRTUAL_BALANCE: float = 250000.0

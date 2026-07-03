@@ -59,6 +59,8 @@ ORCHESTRATION_CONTRACT_VERSION = "phase5b3a-v1"
 ORCHESTRATION_PLAN_TTL_SECONDS = 30 * 60
 
 SAFE_SYMBOL_RE = re.compile(r"^[A-Z0-9\-\&\_\.]+$")
+WINDOWS_PATH_RE = re.compile(r"[A-Za-z]:\\[^\s\"']+")
+POSIX_PATH_RE = re.compile(r"(?<![\w:])/(?:[^/\s\"']+/)+[^/\s\"']+")
 
 
 def validate_state_transition(from_state: str, to_state: str) -> None:
@@ -77,6 +79,36 @@ def validate_state_transition(from_state: str, to_state: str) -> None:
 def _stable_hash(payload: Any) -> str:
     serialized = safe_json_dumps(payload)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _snake_exception_name(exc: Exception) -> str:
+    name = exc.__class__.__name__
+    name = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", name)
+    return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name).upper()
+
+
+def _sanitize_exception_message(exc: Exception) -> str | None:
+    message = str(exc).strip()
+    if not message:
+        return None
+    message = WINDOWS_PATH_RE.sub("<path>", message)
+    message = POSIX_PATH_RE.sub("<path>", message)
+    return message[:240]
+
+
+def _safe_failure_diagnostic(exc: Exception, *, stage: str) -> dict[str, Any]:
+    if isinstance(exc, HistoricalOHLCVError):
+        location_code = exc.code
+    elif isinstance(exc, HistoricalPersistenceError):
+        location_code = exc.code
+    else:
+        location_code = f"HISTORICAL_ORCHESTRATOR_UNEXPECTED_{_snake_exception_name(exc)}"
+    return {
+        "stage": stage,
+        "location_code": location_code,
+        "exception_class": exc.__class__.__name__,
+        "message": _sanitize_exception_message(exc),
+    }
 
 
 def compute_candidate_artifact_hash(candidates: list[dict[str, Any]]) -> str:
@@ -309,6 +341,7 @@ async def build_historical_multi_symbol_backfill_plan(
     rate_limit_delay = request["rate_limit_policy"]["min_delay_seconds"]
     concurrency_limit = max(1, max_concurrency)
     semaphore = asyncio.Semaphore(concurrency_limit)
+    effective_fetcher = fetcher or fetch_historical_ohlcv
 
     async def process_symbol(canonical: str) -> dict[str, Any]:
         nonlocal has_failures
@@ -334,7 +367,7 @@ async def build_historical_multi_symbol_backfill_plan(
                         end=request["requested_end_utc"],
                         max_rows=max_rows_per_symbol,
                         include_incomplete=include_incomplete,
-                        fetcher=fetcher,
+                        fetcher=effective_fetcher,
                         now=now_dt,
                     )
 
@@ -360,6 +393,7 @@ async def build_historical_multi_symbol_backfill_plan(
                         "error_code": None,
                         "provider_diagnostic_code": None,
                         "exception_class": None,
+                        "safe_diagnostic": None,
                         "attempt_count": attempt,
                         "retryable": False,
                     }
@@ -414,6 +448,7 @@ async def build_historical_multi_symbol_backfill_plan(
                         "error_code": err_code,
                         "provider_diagnostic_code": provider_diagnostic_code,
                         "exception_class": exc.__class__.__name__,
+                        "safe_diagnostic": _safe_failure_diagnostic(exc, stage="single_symbol_plan_preview"),
                         "attempt_count": attempt,
                         "retryable": is_transient,
                     }

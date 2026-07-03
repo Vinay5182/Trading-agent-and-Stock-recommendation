@@ -61,6 +61,11 @@ HISTORICAL_CANDLE_AT_OR_AFTER_END = "HISTORICAL_CANDLE_AT_OR_AFTER_END"
 HISTORICAL_EXCHANGE_TIMEZONE_UNKNOWN = "HISTORICAL_EXCHANGE_TIMEZONE_UNKNOWN"
 HISTORICAL_RANGE_SEMANTICS_MISMATCH = "HISTORICAL_RANGE_SEMANTICS_MISMATCH"
 HISTORICAL_LOCAL_DATE_DERIVATION_FAILED = "HISTORICAL_LOCAL_DATE_DERIVATION_FAILED"
+HISTORICAL_PROVIDER_DOWNLOAD_EMPTY = "HISTORICAL_PROVIDER_DOWNLOAD_EMPTY"
+HISTORICAL_PROVIDER_NORMALIZATION_EMPTY = "HISTORICAL_PROVIDER_NORMALIZATION_EMPTY"
+HISTORICAL_PROVIDER_ALL_ROWS_INVALID = "HISTORICAL_PROVIDER_ALL_ROWS_INVALID"
+HISTORICAL_PROVIDER_ALL_ROWS_OUT_OF_SCOPE = "HISTORICAL_PROVIDER_ALL_ROWS_OUT_OF_SCOPE"
+HISTORICAL_PROVIDER_NO_CLOSED_CANDLES = "HISTORICAL_PROVIDER_NO_CLOSED_CANDLES"
 
 EXCHANGE_TIMEZONES = {
     "NSE": "Asia/Kolkata",
@@ -283,7 +288,7 @@ SUPPORTED_TIMEFRAMES: dict[str, TimeframeContract] = {
 PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
     "yfinance": ProviderContract(
         provider="yfinance",
-        acquisition_method="yf.Ticker.history(auto_adjust=False)",
+        acquisition_method="yf.download(auto_adjust=False)",
         supported_exchanges=("NSE", "BSE"),
         symbol_suffix_by_exchange={"NSE": ".NS", "BSE": ".BO"},
         adjusted_prices=False,
@@ -1162,6 +1167,79 @@ def _dataframe_timezone_label(history: Any) -> str | None:
         return None
 
 
+def _yfinance_provider_boundaries(
+    start_dt: datetime,
+    end_dt: datetime,
+    *,
+    timeframe: str,
+    exchange: str,
+) -> tuple[Any, Any]:
+    if normalize_timeframe(timeframe) != "1d":
+        return start_dt, end_dt
+    tz_name = EXCHANGE_TIMEZONES.get(_clean_exchange(exchange))
+    if not tz_name:
+        return start_dt, end_dt
+    tz = ZoneInfo(tz_name)
+    return start_dt.astimezone(tz).date().isoformat(), end_dt.astimezone(tz).date().isoformat()
+
+
+def _effective_yfinance_source_timezone(history: Any, *, exchange: str, timeframe: str) -> tuple[str | None, list[str]]:
+    source_timezone = _dataframe_timezone_label(history)
+    if source_timezone is not None:
+        return source_timezone, []
+    if history is None or getattr(history, "empty", True):
+        return source_timezone, []
+    if normalize_timeframe(timeframe) == "1d":
+        tz_name = EXCHANGE_TIMEZONES.get(_clean_exchange(exchange))
+        if tz_name:
+            return tz_name, []
+    return source_timezone, [PROVIDER_TIMEZONE_UNKNOWN]
+
+
+def _excluded_reason_counts(result: Mapping[str, Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in result.get("excluded_rows") or []:
+        for code in row.get("reason_codes") or []:
+            counts[str(code)] = counts.get(str(code), 0) + 1
+    return counts
+
+
+def _all_excluded_rows_are(result: Mapping[str, Any], allowed_codes: set[str]) -> bool:
+    rows = result.get("excluded_rows") or []
+    if not rows:
+        return False
+    for row in rows:
+        codes = {str(code) for code in (row.get("reason_codes") or [])}
+        if not codes or not codes <= allowed_codes:
+            return False
+    return True
+
+
+def _raise_for_empty_yfinance_result(result: Mapping[str, Any]) -> None:
+    counts = result.get("counts") or {}
+    rows_received = int(counts.get("rows_received") or 0)
+    canonical_count = int(counts.get("canonical_candle_count") or 0)
+    if rows_received <= 0 or canonical_count > 0:
+        return
+
+    reason_counts = _excluded_reason_counts(result)
+    range_codes = {HISTORICAL_CANDLE_BEFORE_RANGE, HISTORICAL_CANDLE_AT_OR_AFTER_END}
+    if _all_excluded_rows_are(result, {CURRENT_CANDLE_INCOMPLETE}):
+        code = HISTORICAL_PROVIDER_NO_CLOSED_CANDLES
+        reason = CURRENT_CANDLE_INCOMPLETE
+    elif _all_excluded_rows_are(result, range_codes):
+        code = HISTORICAL_PROVIDER_ALL_ROWS_OUT_OF_SCOPE
+        reason = max(range_codes, key=lambda item: reason_counts.get(item, 0))
+    else:
+        code = HISTORICAL_PROVIDER_ALL_ROWS_INVALID
+        reason = max(reason_counts, key=reason_counts.get) if reason_counts else None
+    raise HistoricalOHLCVError(
+        code,
+        f"yfinance returned {rows_received} rows but no canonical candles survived validation.",
+        {"provider_code": code, "reason": reason},
+    )
+
+
 def _yfinance_rows(history: Any, *, exchange: str, canonical_symbol: str, source_timezone: str | None) -> list[dict[str, Any]]:
     if history is None or getattr(history, "empty", True):
         return []
@@ -1220,6 +1298,32 @@ def _empty_result(
     )
 
 
+def _pandas_label_missing(pd: Any, value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        missing = pd.isna(value)
+    except Exception:
+        return False
+    if isinstance(missing, bool):
+        return missing
+    try:
+        return bool(missing.all())
+    except Exception:
+        return False
+
+
+def _unique_non_missing_labels(pd: Any, values: Any) -> list[Any]:
+    labels = []
+    for value in values.unique():
+        if _pandas_label_missing(pd, value):
+            continue
+        if not str(value).strip():
+            continue
+        labels.append(value)
+    return labels
+
+
 def normalize_yfinance_dataframe(history: Any, provider_symbol: str) -> Any:
     """
     Normalizes a yfinance historical DataFrame to canonical flat columns:
@@ -1275,8 +1379,8 @@ def normalize_yfinance_dataframe(history: Any, provider_symbol: str) -> Any:
         else:
             raise HistoricalOHLCVError("HISTORICAL_PROVIDER_COLUMNS_UNSUPPORTED", "No known OHLCV fields found in MultiIndex columns")
 
-        # Get unique tickers in the ticker level
-        tickers = [t for t in columns.get_level_values(ticker_level).unique() if t and not pd.isna(t)]
+        # Get unique tickers in the ticker level without pandas truth-value coercion.
+        tickers = _unique_non_missing_labels(pd, columns.get_level_values(ticker_level))
         if not tickers:
             raise HistoricalOHLCVError("HISTORICAL_PROVIDER_TICKER_MISMATCH", f"No ticker values found in level {ticker_level}")
 
@@ -1293,10 +1397,12 @@ def normalize_yfinance_dataframe(history: Any, provider_symbol: str) -> Any:
             temp_df = history.xs(ticker, level=ticker_level, axis=1).copy()
         except Exception as e:
             raise HistoricalOHLCVError("HISTORICAL_PROVIDER_COLUMNS_UNSUPPORTED", f"Failed to extract ticker cross-section: {str(e)}")
+        temp_df.columns = [str(col).strip() for col in temp_df.columns]
 
     else:
         # Flat index columns
         temp_df = history.copy()
+        temp_df.columns = [str(col).strip() for col in temp_df.columns]
 
     # Validate that the resulting DataFrame has required columns
     required = ["Open", "High", "Low", "Close", "Volume"]
@@ -1350,19 +1456,27 @@ def fetch_yfinance_historical_ohlcv(
         import yfinance as yf
 
         _configure_yfinance_cache(yf)
-        ticker = yf.Ticker(provider_symbol)
+        provider_start, provider_end = _yfinance_provider_boundaries(
+            start_dt,
+            end_dt,
+            timeframe=timeframe_contract.canonical,
+            exchange=clean_exchange,
+        )
 
         def read_history():
             kwargs = {
-                "start": start_dt,
-                "end": end_dt,
+                "tickers": provider_symbol,
+                "start": provider_start,
+                "end": provider_end,
                 "interval": provider_timeframe.interval,
                 "auto_adjust": False,
+                "progress": False,
+                "threads": False,
             }
             try:
-                return ticker.history(**kwargs, timeout=PROVIDER_TIMEOUT_SECONDS)
+                return yf.download(**kwargs, timeout=PROVIDER_TIMEOUT_SECONDS)
             except TypeError:
-                return ticker.history(**kwargs)
+                return yf.download(**kwargs)
 
         history = run_provider_call("YFINANCE", "HISTORICAL_OHLCV", read_history)
     except Exception as exc:
@@ -1382,16 +1496,29 @@ def fetch_yfinance_historical_ohlcv(
             fetched_at=fetched_at,
         )
 
+    if history is None or getattr(history, "empty", True):
+        raise HistoricalOHLCVError(
+            HISTORICAL_PROVIDER_DOWNLOAD_EMPTY,
+            "yfinance returned an empty historical DataFrame.",
+            {"provider_code": HISTORICAL_PROVIDER_DOWNLOAD_EMPTY},
+        )
+
     # Normalize the retrieved DataFrame
     history = normalize_yfinance_dataframe(history, provider_symbol)
+    if history is None or getattr(history, "empty", True):
+        raise HistoricalOHLCVError(
+            HISTORICAL_PROVIDER_NORMALIZATION_EMPTY,
+            "yfinance historical DataFrame became empty after normalization.",
+            {"provider_code": HISTORICAL_PROVIDER_NORMALIZATION_EMPTY},
+        )
 
-    source_timezone = _dataframe_timezone_label(history)
-    if history is not None and not getattr(history, "empty", True) and source_timezone is None:
-        provider_warnings = [PROVIDER_TIMEZONE_UNKNOWN]
-    else:
-        provider_warnings = []
+    source_timezone, provider_warnings = _effective_yfinance_source_timezone(
+        history,
+        exchange=clean_exchange,
+        timeframe=timeframe_contract.canonical,
+    )
     rows = _yfinance_rows(history, exchange=clean_exchange, canonical_symbol=clean_symbol, source_timezone=source_timezone)
-    return normalize_provider_rows(
+    result = normalize_provider_rows(
         rows,
         provider=provider,
         exchange=clean_exchange,
@@ -1408,6 +1535,8 @@ def fetch_yfinance_historical_ohlcv(
         now=now,
         provider_warnings=provider_warnings,
     )
+    _raise_for_empty_yfinance_result(result)
+    return result
 
 
 def fetch_historical_ohlcv(

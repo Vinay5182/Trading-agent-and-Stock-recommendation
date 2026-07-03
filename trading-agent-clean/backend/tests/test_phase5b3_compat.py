@@ -4,13 +4,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
 import pandas as pd
+from types import SimpleNamespace
 from datetime import datetime, UTC
 from ai.historical_ohlcv import (
     normalize_yfinance_dataframe,
     HistoricalOHLCVError,
     fetch_historical_ohlcv,
+    fetch_yfinance_historical_ohlcv,
     candle_identity,
     provider_row_fingerprint,
+    HISTORICAL_PROVIDER_ALL_ROWS_INVALID,
+    HISTORICAL_PROVIDER_ALL_ROWS_OUT_OF_SCOPE,
+    HISTORICAL_PROVIDER_DOWNLOAD_EMPTY,
+    HISTORICAL_PROVIDER_NO_CLOSED_CANDLES,
 )
 from services.historical_backfill_orchestrator import (
     build_historical_multi_symbol_backfill_plan,
@@ -79,6 +85,63 @@ def make_multi_ticker_field_df(symbol="RELIANCE.NS", adj_close=True, level_names
     tuples = [(symbol, col) for col in cols]
     df.columns = pd.MultiIndex.from_tuples(tuples, names=level_names)
     return df
+
+
+def make_yfinance_download_multiindex_frame(
+    symbol="RELIANCE.NS",
+    *,
+    start="2026-05-25",
+    periods=3,
+    tz=None,
+    open_values=None,
+    high_values=None,
+    low_values=None,
+    close_values=None,
+    volume_values=None,
+):
+    idx = pd.date_range(start=start, periods=periods, freq="D", tz=tz)
+    open_values = open_values if open_values is not None else [100.0 + i for i in range(periods)]
+    high_values = high_values if high_values is not None else [105.0 + i for i in range(periods)]
+    low_values = low_values if low_values is not None else [95.0 + i for i in range(periods)]
+    close_values = close_values if close_values is not None else [102.0 + i for i in range(periods)]
+    volume_values = volume_values if volume_values is not None else [1000 + (100 * i) for i in range(periods)]
+    data = {
+        ("Open", symbol): open_values,
+        ("High", symbol): high_values,
+        ("Low", symbol): low_values,
+        ("Close", symbol): close_values,
+        ("Adj Close", symbol): close_values,
+        ("Volume", symbol): volume_values,
+    }
+    frame = pd.DataFrame(data, index=idx)
+    frame.columns = pd.MultiIndex.from_tuples(frame.columns, names=["Price", "Ticker"])
+    return frame
+
+
+def install_fake_yfinance(monkeypatch, frame_factory):
+    calls = []
+
+    def fake_download(**kwargs):
+        calls.append(dict(kwargs))
+        return frame_factory(kwargs["tickers"])
+
+    fake_yfinance = SimpleNamespace(
+        download=fake_download,
+        set_tz_cache_location=lambda path: None,
+        cache=SimpleNamespace(set_cache_location=lambda path: None),
+    )
+    monkeypatch.setitem(sys.modules, "yfinance", fake_yfinance)
+    return calls
+
+
+class MockDb:
+    name = "test_db"
+
+    def __init__(self, collection):
+        self.collection = collection
+
+    def __getitem__(self, name):
+        return self.collection
 
 
 # 1. Flat single-symbol DataFrame normalization
@@ -309,6 +372,234 @@ async def test_orchestrator_fake_multiindex_success():
     assert plan["symbols"]["RELIANCE"]["counts"]["provider_candles"] == 1
 
 
+@pytest.mark.anyio
+async def test_orchestrator_default_fetcher_uses_download_multiindex_path(monkeypatch):
+    col = MockCollection()
+    calls = install_fake_yfinance(monkeypatch, lambda symbol: make_yfinance_download_multiindex_frame(symbol))
+
+    plan = await build_historical_multi_symbol_backfill_plan(
+        col,
+        database_name="test_db",
+        provider="yfinance",
+        exchange="NSE",
+        symbols=["RELIANCE"],
+        timeframe="1d",
+        start="2026-05-25T00:00:00Z",
+        end="2026-07-02T00:00:00Z",
+        max_rows_per_symbol=30,
+        max_total_candidate_rows=30,
+        fetcher=None,
+        now=datetime(2026, 7, 3, 10, 0, tzinfo=UTC),
+        sleep_fn=instant_sleep,
+    )
+
+    symbol_plan = plan["symbols"]["RELIANCE"]
+    assert calls and calls[0]["tickers"] == "RELIANCE.NS"
+    assert calls[0]["start"] == "2026-05-25"
+    assert calls[0]["end"] == "2026-07-02"
+    assert isinstance(calls[0]["start"], str)
+    assert isinstance(calls[0]["end"], str)
+    assert calls[0]["interval"] == "1d"
+    assert calls[0]["auto_adjust"] is False
+    assert calls[0]["progress"] is False
+    assert calls[0]["threads"] is False
+    assert calls[0]["timeout"] == 8
+    assert plan["state"] == "PREVIEW_READY"
+    assert symbol_plan["status"] == "PREVIEW_READY"
+    assert symbol_plan["counts"]["provider_candles"] > 0
+    assert symbol_plan["candidate_artifact_hash"]
+    assert symbol_plan["manifest_hash"]
+    assert symbol_plan["provider_diagnostic_code"] is None
+    assert symbol_plan["exception_class"] is None
+    assert symbol_plan["safe_diagnostic"] is None
+    assert plan["frozen_candidates"]["RELIANCE"]
+    first = plan["frozen_candidates"]["RELIANCE"][0]
+    assert first["candle_open_at"] == "2026-05-24T18:30:00.000000Z"
+    assert first["provenance"]["source_timezone"] == "Asia/Kolkata"
+    assert first["provenance"]["requested_start"] == "2026-05-25T00:00:00.000000Z"
+    assert first["provenance"]["requested_end"] == "2026-07-02T00:00:00.000000Z"
+
+
+@pytest.mark.anyio
+async def test_cli_preview_fetcher_none_uses_default_provider_fetcher(monkeypatch):
+    from cli import historical_ohlcv_orchestrate
+
+    col = MockCollection()
+    calls = install_fake_yfinance(monkeypatch, lambda symbol: make_yfinance_download_multiindex_frame(symbol))
+    args = historical_ohlcv_orchestrate.parse_args([
+        "--mode", "preview",
+        "--database-name", "test_db",
+        "--provider", "yfinance",
+        "--exchange", "NSE",
+        "--symbols", "RELIANCE",
+        "--timeframe", "1d",
+        "--start", "2026-05-25T00:00:00.000000Z",
+        "--end", "2026-07-02T00:00:00.000000Z",
+        "--max-rows-per-symbol", "30",
+        "--max-total-rows", "30",
+    ])
+
+    plan = await historical_ohlcv_orchestrate.run(args, db_override=MockDb(col))
+
+    assert calls and calls[0]["tickers"] == "RELIANCE.NS"
+    assert plan["state"] == "PREVIEW_READY"
+    assert plan["symbols"]["RELIANCE"]["status"] == "PREVIEW_READY"
+    assert plan["symbols"]["RELIANCE"]["counts"]["provider_candles"] == 3
+
+
+def test_fetch_yfinance_download_naive_daily_dates_become_canonical_candles(monkeypatch):
+    calls = install_fake_yfinance(monkeypatch, lambda symbol: make_yfinance_download_multiindex_frame(symbol))
+
+    result = fetch_yfinance_historical_ohlcv(
+        exchange="NSE",
+        canonical_symbol="RELIANCE",
+        timeframe="1d",
+        start="2026-05-25T00:00:00.000000Z",
+        end="2026-07-02T00:00:00.000000Z",
+        include_incomplete=False,
+        limit=30,
+        now=datetime(2026, 7, 3, 10, 0, tzinfo=UTC),
+    )
+
+    assert calls[0]["start"] == "2026-05-25"
+    assert calls[0]["end"] == "2026-07-02"
+    assert result["requested_start_utc"] == "2026-05-25T00:00:00.000000Z"
+    assert result["requested_end_utc"] == "2026-07-02T00:00:00.000000Z"
+    assert result["effective_local_start_date"] == "2026-05-25"
+    assert result["effective_local_end_date"] == "2026-07-02"
+    assert result["counts"]["rows_received"] == 3
+    assert result["counts"]["canonical_candle_count"] == 3
+    assert result["counts"]["timezone_unsafe_timestamps"] == 0
+    assert result["warnings"] == []
+    assert result["candles"][0]["candle_open_at"] == "2026-05-24T18:30:00.000000Z"
+    assert result["candles"][0]["provenance"]["source_timezone"] == "Asia/Kolkata"
+
+
+@pytest.mark.anyio
+async def test_reliance_tcs_infy_fake_provider_paths_preview_ready(monkeypatch):
+    col = MockCollection()
+    calls = install_fake_yfinance(monkeypatch, lambda symbol: make_yfinance_download_multiindex_frame(symbol))
+
+    plan = await build_historical_multi_symbol_backfill_plan(
+        col,
+        database_name="test_db",
+        provider="yfinance",
+        exchange="NSE",
+        symbols=["RELIANCE", "TCS", "INFY"],
+        timeframe="1d",
+        start="2026-05-25T00:00:00.000000Z",
+        end="2026-07-02T00:00:00.000000Z",
+        max_rows_per_symbol=30,
+        max_total_candidate_rows=90,
+        now=datetime(2026, 7, 3, 10, 0, tzinfo=UTC),
+        sleep_fn=instant_sleep,
+    )
+
+    assert [call["tickers"] for call in calls] == ["INFY.NS", "RELIANCE.NS", "TCS.NS"]
+    assert plan["state"] == "PREVIEW_READY"
+    for symbol in ["INFY", "RELIANCE", "TCS"]:
+        symbol_plan = plan["symbols"][symbol]
+        assert symbol_plan["status"] == "PREVIEW_READY"
+        assert symbol_plan["counts"]["provider_candles"] == 3
+        assert symbol_plan["candidate_artifact_hash"]
+        assert symbol_plan["manifest_hash"]
+
+
+def test_yfinance_download_empty_raises_download_empty(monkeypatch):
+    calls = install_fake_yfinance(
+        monkeypatch,
+        lambda symbol: make_yfinance_download_multiindex_frame(symbol, periods=0),
+    )
+
+    with pytest.raises(HistoricalOHLCVError) as exc:
+        fetch_yfinance_historical_ohlcv(
+            exchange="NSE",
+            canonical_symbol="RELIANCE",
+            timeframe="1d",
+            start="2026-05-25T00:00:00.000000Z",
+            end="2026-07-02T00:00:00.000000Z",
+            include_incomplete=False,
+            limit=30,
+            now=datetime(2026, 7, 3, 10, 0, tzinfo=UTC),
+        )
+
+    assert calls
+    assert exc.value.code == HISTORICAL_PROVIDER_DOWNLOAD_EMPTY
+
+
+def test_yfinance_nonempty_invalid_rows_do_not_report_download_empty(monkeypatch):
+    install_fake_yfinance(
+        monkeypatch,
+        lambda symbol: make_yfinance_download_multiindex_frame(
+            symbol,
+            periods=1,
+            open_values=[-1.0],
+            high_values=[105.0],
+            low_values=[95.0],
+            close_values=[102.0],
+            volume_values=[1000],
+        ),
+    )
+
+    with pytest.raises(HistoricalOHLCVError) as exc:
+        fetch_yfinance_historical_ohlcv(
+            exchange="NSE",
+            canonical_symbol="RELIANCE",
+            timeframe="1d",
+            start="2026-05-25T00:00:00.000000Z",
+            end="2026-07-02T00:00:00.000000Z",
+            include_incomplete=False,
+            limit=30,
+            now=datetime(2026, 7, 3, 10, 0, tzinfo=UTC),
+        )
+
+    assert exc.value.code == HISTORICAL_PROVIDER_ALL_ROWS_INVALID
+    assert exc.value.code != HISTORICAL_PROVIDER_DOWNLOAD_EMPTY
+
+
+def test_yfinance_nonempty_out_of_scope_rows_report_scope_code(monkeypatch):
+    install_fake_yfinance(
+        monkeypatch,
+        lambda symbol: make_yfinance_download_multiindex_frame(symbol, start="2026-05-24", periods=1),
+    )
+
+    with pytest.raises(HistoricalOHLCVError) as exc:
+        fetch_yfinance_historical_ohlcv(
+            exchange="NSE",
+            canonical_symbol="RELIANCE",
+            timeframe="1d",
+            start="2026-05-25T00:00:00.000000Z",
+            end="2026-07-02T00:00:00.000000Z",
+            include_incomplete=False,
+            limit=30,
+            now=datetime(2026, 7, 3, 10, 0, tzinfo=UTC),
+        )
+
+    assert exc.value.code == HISTORICAL_PROVIDER_ALL_ROWS_OUT_OF_SCOPE
+
+
+def test_yfinance_no_closed_candles_is_distinct_from_provider_empty(monkeypatch):
+    install_fake_yfinance(
+        monkeypatch,
+        lambda symbol: make_yfinance_download_multiindex_frame(symbol, start="2026-07-02", periods=1),
+    )
+
+    with pytest.raises(HistoricalOHLCVError) as exc:
+        fetch_yfinance_historical_ohlcv(
+            exchange="NSE",
+            canonical_symbol="RELIANCE",
+            timeframe="1d",
+            start="2026-07-02T00:00:00.000000Z",
+            end="2026-07-03T00:00:00.000000Z",
+            include_incomplete=False,
+            limit=30,
+            now=datetime(2026, 7, 2, 1, 0, tzinfo=UTC),
+        )
+
+    assert exc.value.code == HISTORICAL_PROVIDER_NO_CLOSED_CANDLES
+    assert exc.value.code != HISTORICAL_PROVIDER_DOWNLOAD_EMPTY
+
+
 # 19. Provider schema error is non-retryable
 @pytest.mark.anyio
 async def test_provider_schema_error_non_retryable():
@@ -333,8 +624,45 @@ async def test_provider_schema_error_non_retryable():
     sym_plan = plan["symbols"]["RELIANCE"]
     assert sym_plan["status"] == "FAILED"
     assert sym_plan["error_code"] == "HISTORICAL_PROVIDER_REQUIRED_COLUMN_MISSING"
+    assert sym_plan["exception_class"] == "HistoricalOHLCVError"
+    assert sym_plan["provider_diagnostic_code"] is None
     assert sym_plan["retryable"] is False
     assert sym_plan["attempt_count"] == 1
+    assert sym_plan["safe_diagnostic"]["stage"] == "single_symbol_plan_preview"
+    assert sym_plan["safe_diagnostic"]["location_code"] == "HISTORICAL_PROVIDER_REQUIRED_COLUMN_MISSING"
+
+
+@pytest.mark.anyio
+async def test_unexpected_type_error_records_safe_diagnostic():
+    col = MockCollection()
+
+    async def fetcher(**kwargs):
+        raise TypeError("bad value from C:\\Users\\Asus\\secret\\provider.py")
+
+    plan = await build_historical_multi_symbol_backfill_plan(
+        col,
+        database_name="test_db",
+        provider="yfinance",
+        exchange="NSE",
+        symbols=["RELIANCE"],
+        timeframe="1d",
+        start="2026-05-25T00:00:00Z",
+        end="2026-07-02T00:00:00Z",
+        fetcher=fetcher,
+        sleep_fn=instant_sleep,
+    )
+
+    sym_plan = plan["symbols"]["RELIANCE"]
+    diagnostic = sym_plan["safe_diagnostic"]
+    assert plan["state"] == "FAILED"
+    assert sym_plan["status"] == "FAILED"
+    assert sym_plan["error_code"] == "HISTORICAL_BACKFILL_FAILED"
+    assert sym_plan["exception_class"] == "TypeError"
+    assert sym_plan["retryable"] is False
+    assert diagnostic["stage"] == "single_symbol_plan_preview"
+    assert diagnostic["location_code"] == "HISTORICAL_ORCHESTRATOR_UNEXPECTED_TYPE_ERROR"
+    assert "<path>" in diagnostic["message"]
+    assert "C:\\Users" not in diagnostic["message"]
 
 
 # 20. Network timeout remains retryable

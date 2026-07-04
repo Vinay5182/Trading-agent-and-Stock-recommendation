@@ -31,6 +31,7 @@ from ai.historical_ohlcv import (
     fetch_historical_ohlcv,
     supported_provider_timeframe_matrix,
 )
+from ai.historical_training_bridge import build_historical_training_preview_from_collection
 from ai.label_contract import AI_LABEL_CONTRACT_VERSION, build_deterministic_label
 from database import get_database
 from security.operator_intent import OPERATOR_INTENT_HEADER, require_operator_intent_value
@@ -1987,6 +1988,29 @@ async def preview_canonical_training_rows(
         },
         "rows": canonical_rows,
     }
+
+
+@router.get("/features/historical-training-preview")
+async def preview_historical_training_rows(
+    lookback: int = Query(default=30, ge=2, le=250),
+    horizon: int = Query(default=20, ge=1, le=250),
+    strategies: str = Query(default="momentum,swing"),
+    limit: int | None = Query(default=None, ge=1, le=5000),
+    provider: str | None = Query(default="yfinance"),
+    exchange: str | None = Query(default="NSE"),
+    timeframe: str | None = Query(default="1d"),
+) -> dict:
+    db = get_database()
+    return await build_historical_training_preview_from_collection(
+        db.historical_ohlcv,
+        provider=provider,
+        exchange=exchange,
+        timeframe=timeframe,
+        lookback=lookback,
+        horizon=horizon,
+        strategies=strategies,
+        limit=limit,
+    )
 
 
 @router.get("/features/leakage-audit")

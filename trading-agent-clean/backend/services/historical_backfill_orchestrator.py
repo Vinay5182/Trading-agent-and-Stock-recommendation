@@ -921,7 +921,11 @@ def _new_symbol_apply_result(expected_inserts: int) -> dict[str, Any]:
     }
 
 
-def _classify_frozen_action(action: Mapping[str, Any], existing: Mapping[str, Any] | None) -> dict[str, Any]:
+def _classify_frozen_action(
+    action: Mapping[str, Any],
+    existing: Mapping[str, Any] | None,
+    candidate_document: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     candle_id = str(action.get("candle_id") or "")
     content_fingerprint = str(action.get("canonical_content_fingerprint") or "")
     if not candle_id or not content_fingerprint:
@@ -930,6 +934,19 @@ def _classify_frozen_action(action: Mapping[str, Any], existing: Mapping[str, An
         return {"action": "exclude", "code": str(action.get("code") or HISTORICAL_EXCLUDED_INVALID), "candle_id": candle_id}
     if str(action.get("action") or "") == "conflict":
         return {"action": "conflict", "code": str(action.get("code") or HISTORICAL_CONFLICT_CONTENT), "candle_id": candle_id}
+
+    if candidate_document is not None and existing is not None:
+        from services.historical_ohlcv_store import classify_persistence_action
+        res = classify_persistence_action(candidate_document, existing_document=existing)
+        return {
+            "action": res.get("action"),
+            "code": res.get("code"),
+            "candle_id": candle_id,
+            "canonical_content_fingerprint": content_fingerprint,
+            "existing_content_fingerprint": res.get("existing_content_fingerprint") or persisted_content_fingerprint(existing),
+            "reason_codes": res.get("reason_codes", []),
+        }
+
     if existing is None:
         return {
             "action": "insert",
@@ -948,6 +965,15 @@ def _classify_frozen_action(action: Mapping[str, Any], existing: Mapping[str, An
             "code": HISTORICAL_NOOP_IDENTICAL,
             "candle_id": candle_id,
             "canonical_content_fingerprint": content_fingerprint,
+        }
+    if action.get("action") == "noop" and action.get("existing_content_fingerprint") == existing_fingerprint:
+        return {
+            "action": "noop",
+            "code": HISTORICAL_NOOP_IDENTICAL,
+            "candle_id": candle_id,
+            "canonical_content_fingerprint": content_fingerprint,
+            "existing_content_fingerprint": existing_fingerprint,
+            "reason_codes": action.get("reason_codes", []),
         }
     return {
         "action": "conflict",
@@ -1156,7 +1182,9 @@ async def validate_historical_multi_symbol_apply_plan(
     }
     for sym in request_symbols:
         for action in frozen_actions.get(sym) or []:
-            classified = _classify_frozen_action(action, existing.get(str(action.get("candle_id") or "")))
+            candle_id = str(action.get("candle_id") or "")
+            candidate_doc = candidate_by_id.get(candle_id)
+            classified = _classify_frozen_action(action, existing.get(candle_id), candidate_document=candidate_doc)
             candle_id = str(classified.get("candle_id") or "")
             live_classification_by_id[candle_id] = classified
             action_name = str(classified.get("action") or "")

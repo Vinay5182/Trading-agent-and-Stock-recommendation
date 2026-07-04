@@ -597,3 +597,145 @@ def test_cli_apply_with_isolated_fake_db(tmp_path, monkeypatch):
     assert result["state"] == APPLIED
     assert result_file.exists()
     assert len(collection.update_calls) == 2
+
+
+def test_apply_tolerates_tiny_adjusted_close_drift():
+    # Setup candles
+    candles = symbol_candles(days=1)
+    
+    # We create an existing document for RELIANCE with a tiny drift in adjusted_close (diff = 0.005)
+    reliance_candle = candles["RELIANCE"][0]
+    existing_reliance = make_existing_document(reliance_candle)
+    existing_reliance["adjusted_close"] += 0.005
+    
+    # TCS has no existing doc (will insert), INFY has identical existing doc (will noop)
+    existing_infy = make_existing_document(candles["INFY"][0])
+    
+    collection = FakeHistoricalCollection([existing_reliance, existing_infy])
+    
+    async def fetcher(**kwargs):
+        return {"candles": candles[kwargs["canonical_symbol"]], "schema_version": "phase5a-v1"}
+        
+    plan = run(
+        build_historical_multi_symbol_backfill_plan(
+            collection,
+            database_name=FAKE_DB_NAME,
+            provider="yfinance",
+            exchange="NSE",
+            symbols=["TCS", "RELIANCE", "INFY"],
+            timeframe="1d",
+            start=START,
+            end=END,
+            max_rows_per_symbol=1,
+            max_total_candidate_rows=90,
+            fetcher=fetcher,
+            now=NOW,
+            sleep_fn=instant_sleep,
+        )
+    )
+    
+    # Verify preview counts: 1 insert (TCS), 2 noops (RELIANCE due to tolerated drift, INFY identical), 0 conflicts
+    assert plan["counts"]["planned_inserts"] == 1
+    assert plan["counts"]["identical_noops"] == 2
+    assert plan["counts"]["conflicts"] == 0
+    
+    # Verify apply succeeds
+    res = apply_plan(collection, plan)
+    assert res["state"] == APPLIED
+    assert res["aggregate"]["expected_inserts"] == 1
+    assert res["aggregate"]["no_op"] == 2
+    assert res["aggregate"]["conflicts"] == 0
+    
+    # Verify only TCS was inserted
+    assert len(collection.update_calls) == 1
+    assert collection.update_calls[0][0]["candle_id"] == candles["TCS"][0]["candle_id"]
+
+
+def test_apply_real_ohlcv_difference_blocks_apply():
+    # Setup candles
+    candles = symbol_candles(days=1)
+    
+    # Pre-check database index readiness, initially no documents exist (all are inserts)
+    collection = FakeHistoricalCollection([])
+    
+    async def fetcher(**kwargs):
+        return {"candles": candles[kwargs["canonical_symbol"]], "schema_version": "phase5a-v1"}
+        
+    plan = run(
+        build_historical_multi_symbol_backfill_plan(
+            collection,
+            database_name=FAKE_DB_NAME,
+            provider="yfinance",
+            exchange="NSE",
+            symbols=["TCS", "RELIANCE", "INFY"],
+            timeframe="1d",
+            start=START,
+            end=END,
+            max_rows_per_symbol=1,
+            max_total_candidate_rows=90,
+            fetcher=fetcher,
+            now=NOW,
+            sleep_fn=instant_sleep,
+        )
+    )
+    assert plan["counts"]["planned_inserts"] == 3
+    assert plan["counts"]["conflicts"] == 0
+    
+    # Write a conflicting document to the database before applying (e.g. RELIANCE close is different)
+    conflict_candle = copy.deepcopy(candles["RELIANCE"][0])
+    conflict_candle["close"] += 50.0  # Real difference in close price
+    conflict_reliance = make_existing_document(conflict_candle)
+    
+    collection.rows.append(conflict_reliance)
+    
+    # Attempting to apply the plan should fail due to conflict and perform NO writes
+    with pytest.raises(HistoricalPersistenceError) as exc_info:
+        apply_plan(collection, plan)
+        
+    assert exc_info.value.code == MULTI_SYMBOL_CONFLICT_PRESENT
+    
+    # Verify that no updates/writes were performed (update_calls remains empty for the inserts)
+    assert len(collection.update_calls) == 0
+    assert len(collection.rows) == 1
+
+
+def test_apply_large_adjusted_close_drift_blocks_apply():
+    # Setup candles
+    candles = symbol_candles(days=1)
+    collection = FakeHistoricalCollection([])
+    
+    async def fetcher(**kwargs):
+        return {"candles": candles[kwargs["canonical_symbol"]], "schema_version": "phase5a-v1"}
+        
+    plan = run(
+        build_historical_multi_symbol_backfill_plan(
+            collection,
+            database_name=FAKE_DB_NAME,
+            provider="yfinance",
+            exchange="NSE",
+            symbols=["TCS"],
+            timeframe="1d",
+            start=START,
+            end=END,
+            max_rows_per_symbol=1,
+            max_total_candidate_rows=90,
+            fetcher=fetcher,
+            now=NOW,
+            sleep_fn=instant_sleep,
+        )
+    )
+    
+    # Write a drifted document with large drift (diff = 0.02 > 0.01) before applying
+    conflict_candle = copy.deepcopy(candles["TCS"][0])
+    conflict_candle["adjusted_close"] += 0.02
+    conflict_tcs = make_existing_document(conflict_candle)
+    
+    collection.rows.append(conflict_tcs)
+    
+    # Apply should fail because drift exceeds tolerance
+    with pytest.raises(HistoricalPersistenceError) as exc_info:
+        apply_plan(collection, plan)
+        
+    assert exc_info.value.code == MULTI_SYMBOL_CONFLICT_PRESENT
+    assert len(collection.update_calls) == 0
+

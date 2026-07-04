@@ -366,12 +366,37 @@ def classify_persistence_action(
             "code": HISTORICAL_NOOP_IDENTICAL,
             "existing_content_fingerprint": existing_fingerprint,
         }
+
+    # Microscopic adjusted_close drift validation check
+    try:
+        existing_payload = historical_content_payload(existing_document)
+        candidate_payload = historical_content_payload(candle)
+        existing_adj = existing_payload.get("adjusted_close")
+        candidate_adj = candidate_payload.get("adjusted_close")
+        
+        # Strip adjusted_close for a strict comparison of all other fields
+        existing_other = {k: v for k, v in existing_payload.items() if k != "adjusted_close"}
+        candidate_other = {k: v for k, v in candidate_payload.items() if k != "adjusted_close"}
+
+        if existing_other == candidate_other and existing_adj is not None and candidate_adj is not None:
+            if abs(float(existing_adj) - float(candidate_adj)) <= 0.01:
+                return {
+                    **base,
+                    "action": "noop",
+                    "code": HISTORICAL_NOOP_IDENTICAL,
+                    "existing_content_fingerprint": existing_fingerprint,
+                    "reason_codes": sorted(set(reason_codes + ["ADJUSTED_CLOSE_DRIFT_TOLERATED"])),
+                }
+    except Exception:
+        pass
+
     return {
         **base,
         "action": "conflict",
         "code": HISTORICAL_CONFLICT_CONTENT,
         "existing_content_fingerprint": existing_fingerprint,
     }
+
 
 
 async def _maybe_await(value: Any) -> Any:

@@ -347,7 +347,25 @@ def _status_for_source(row: Mapping[str, Any], *, event_source: str, strategy_ty
     return None
 
 
-def _score_fields(row: Mapping[str, Any]) -> dict[str, Any]:
+
+
+
+def _breakdown_sum(breakdown: Mapping[str, Any], keys: tuple[str, ...]) -> float | int | None:
+    values = []
+    for key in keys:
+        val = breakdown.get(key)
+        if val is not None and val != "":
+            try:
+                values.append(float(val))
+            except (TypeError, ValueError):
+                pass
+    if not values:
+        return None
+    total = sum(values)
+    return int(total) if float(total).is_integer() else total
+
+
+def _score_fields(row: Mapping[str, Any], strategy_type: str | None = None) -> dict[str, Any]:
     fields = (
         "score",
         "nse_score",
@@ -362,6 +380,39 @@ def _score_fields(row: Mapping[str, Any]) -> dict[str, Any]:
     )
     scores = {field: row.get(field) for field in fields if row.get(field) not in (None, "")}
     breakdown = row.get("score_breakdown")
+    
+    # Try to derive trend_score and volume_score from breakdown
+    if isinstance(breakdown, Mapping) and strategy_type:
+        strat = strategy_type.lower()
+        sub_breakdown = breakdown.get(strat)
+        if not isinstance(sub_breakdown, Mapping):
+            # Fallback to key checks
+            sub_breakdown = {}
+            for key in ("swing", "momentum"):
+                if isinstance(breakdown.get(key), Mapping):
+                    sub_breakdown = breakdown[key]
+                    break
+            if not sub_breakdown:
+                sub_breakdown = breakdown
+                
+        trend_keys = {
+            "swing": ("price_strength", "near_day_high", "thirty_day_momentum", "above_open", "above_previous_close"),
+            "momentum": ("price_strength", "near_high", "thirty_day_momentum", "clean_price_behavior"),
+        }.get(strat, ())
+        
+        volume_keys = {
+            "swing": ("traded_value", "relative_volume"),
+            "momentum": ("liquidity",),
+        }.get(strat, ())
+        
+        trend_score = _breakdown_sum(sub_breakdown, trend_keys)
+        volume_score = _breakdown_sum(sub_breakdown, volume_keys)
+        
+        if trend_score is not None:
+            scores["trend_score"] = trend_score
+        if volume_score is not None:
+            scores["volume_score"] = volume_score
+
     if isinstance(breakdown, Mapping):
         scores["score_breakdown"] = safe_json_value(dict(breakdown))
     return scores
@@ -458,7 +509,7 @@ def _event_from_row(
         "source_status": row.get("tv_status") or row.get("status") or row.get(f"{strategy_type}_status"),
         "rejection_reason": _reason(row, strategy_type),
         "status_reason": row.get("status_reason") or row.get("reason"),
-        "score_fields": _score_fields(row),
+        "score_fields": _score_fields(row, strategy_type),
         "entry": plan["entry"],
         "stop_loss": plan["stop_loss"],
         "target_1": plan["target_1"],

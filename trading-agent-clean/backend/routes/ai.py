@@ -46,6 +46,7 @@ from services.historical_backfill_orchestrator import (
     build_historical_multi_symbol_backfill_plan,
     verify_historical_multi_symbol_backfill_plan,
 )
+from services.decision_outcome_dataset import build_decision_outcome_preview_from_db
 from services.mongo_indexes import get_collection_index_specs
 from services.timestamps import (
     FUTURE_CLOCK_SKEW_TOLERANCE_SECONDS,
@@ -2010,6 +2011,29 @@ async def preview_historical_training_rows(
         horizon=horizon,
         strategies=strategies,
         limit=limit,
+    )
+
+
+@router.get("/decision-outcome-preview")
+async def preview_decision_outcome_dataset(
+    limit: int = Query(default=500, ge=1, le=5000),
+    history_limit: int | None = Query(default=None, ge=1, le=20000),
+    examples_per_bucket: int = Query(default=5, ge=1, le=25),
+    strategy_type: str | None = Query(default=None),
+    symbol: str | None = Query(default=None),
+    timeframe: str | None = Query(default=None),
+) -> dict:
+    clean_strategy = (strategy_type or "").strip().lower() or None
+    if clean_strategy and clean_strategy not in {"momentum", "swing", "other"}:
+        raise HTTPException(status_code=400, detail="strategy_type must be momentum, swing, or other")
+    return await build_decision_outcome_preview_from_db(
+        get_database(),
+        limit=limit,
+        history_limit=history_limit,
+        examples_per_bucket=examples_per_bucket,
+        strategy_type=clean_strategy,
+        symbol=symbol,
+        timeframe=timeframe,
     )
 
 

@@ -338,10 +338,10 @@ class TradingViewClient:
                     self._request_text(f"/json/activate/{tab_id}")
                 return tab
         chart_url = quote("https://www.tradingview.com/chart/", safe="")
-        self.diagnostics["json_new_method_used"] = "GET"
+        self.diagnostics["json_new_method_used"] = "PUT"
         self.diagnostics["open_url"] = "https://www.tradingview.com/chart/"
         try:
-            return self._request_json(f"/json/new?{chart_url}")
+            return self._request_json(f"/json/new?{chart_url}", method="PUT")
         except HTTPError as exc:
             self.diagnostics["http_error_stage"] = "open_chart_tab_failed_reused_existing_tab"
             self.diagnostics["navigation_note"] = f"/json/new returned HTTP {exc.code}; reused existing tab when available"

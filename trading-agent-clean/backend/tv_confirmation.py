@@ -2,7 +2,13 @@ import time
 from datetime import datetime, timezone
 
 from config import settings
-from tv_client import TradingViewClient, validate_timeframe, TradingViewTabNotAttachedError, TradingViewTabDisconnectedError
+from tv_client import (
+    TradingViewClient,
+    normalize_timeframe,
+    validate_timeframe,
+    TradingViewTabNotAttachedError,
+    TradingViewTabDisconnectedError,
+)
 
 
 def _to_float(value) -> float | None:
@@ -121,12 +127,16 @@ def _session_gap_detected(timeframe: str, gaps: list[float]) -> bool:
 
 
 def _is_expected_week_day_overlap(timeframe: str, previous_timeframe: str | None, debug: dict, previous: dict | None) -> bool:
+    normalized_timeframe = normalize_timeframe(timeframe)
+    normalized_previous_timeframe = normalize_timeframe(previous_timeframe)
+    normalized_resolution = normalize_timeframe(debug.get("resolution_after"))
+    normalized_previous_resolution = normalize_timeframe((previous or {}).get("resolution_after"))
     return (
-        previous_timeframe == "1W"
-        and timeframe == "1D"
-        and debug.get("resolution_after") == "D"
+        normalized_previous_timeframe == "1W"
+        and normalized_timeframe == "1D"
+        and normalized_resolution == "1D"
         and previous
-        and previous.get("resolution_after") == "W"
+        and normalized_previous_resolution == "1W"
         and debug.get("gap_validation_passed") is True
         and previous.get("gap_validation_passed") is True
     )

@@ -90,6 +90,7 @@ class Settings:
     STARTING_VIRTUAL_BALANCE: float = 250000.0
     LEVERAGE: float = 2.5
     MINIMUM_ENTRY_MARGIN: float = 5000.0
+    PAPER_ALLOW_SMALL_RISK_SIZED_POSITIONS: bool = field(default_factory=lambda: env_bool("PAPER_ALLOW_SMALL_RISK_SIZED_POSITIONS", True))
     PORTFOLIO_MARGIN_LIMIT_PERCENT: float = 80.0
     PORTFOLIO_RISK_LIMIT_PERCENT: float = 5.0
 

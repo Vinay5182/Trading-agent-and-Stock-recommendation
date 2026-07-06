@@ -171,6 +171,7 @@ def _paper_docs_from_saved_row(row: dict, source_signal_type: str, source_collec
         available_margin=250000.0,
         open_margin=0.0,
         combined_open_risk=0.0,
+        paper_mode=True,
     )
 
     proposed_qty = sizing.get("final_quantity", 0) if sizing.get("ok") else 0

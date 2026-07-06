@@ -287,6 +287,10 @@ test("Paper Trades is live without manual load or update buttons", () => {
   assert.ok(source.includes("PAPER_TABLE_COLUMNS"));
   assert.ok(source.includes("PAPER_TRADE_FILTERS"));
   assert.ok(source.includes("PAPER_WAITING_STATUSES"));
+  assert.ok(source.includes("PAPER_EXPIRED_STATUSES"));
+  assert.ok(source.includes("Expired / Not Triggered"));
+  assert.ok(source.includes("expired_not_triggered"));
+  assert.equal(source.includes("\"CLOSED\", \"TARGET_HIT\""), false);
   assert.ok(paperTradesSource.includes("paperSearch"));
   assert.ok(paperTradesSource.includes("strategyFilter"));
   assert.ok(source.includes("Waiting for Entry"));

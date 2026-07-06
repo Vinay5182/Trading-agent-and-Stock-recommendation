@@ -11,6 +11,8 @@ def calculate_proposed_sizing(
     available_margin: float,
     open_margin: float,
     combined_open_risk: float,
+    *,
+    paper_mode: bool = False,
 ) -> dict:
     """
     Pure position sizing calculator that enforces:
@@ -61,8 +63,11 @@ def calculate_proposed_sizing(
     final_quantity = min(quantity_by_risk, quantity_by_grade_margin, quantity_by_available_margin)
 
     # Minimum entry-margin requirement
-    quantity_for_minimum_margin = ceil((settings.MINIMUM_ENTRY_MARGIN * settings.LEVERAGE) / entry_price)
-    minimum_allowed_quantity = max(4, quantity_for_minimum_margin)
+    if paper_mode and getattr(settings, "PAPER_ALLOW_SMALL_RISK_SIZED_POSITIONS", False):
+        minimum_allowed_quantity = 1
+    else:
+        quantity_for_minimum_margin = ceil((settings.MINIMUM_ENTRY_MARGIN * settings.LEVERAGE) / entry_price)
+        minimum_allowed_quantity = max(4, quantity_for_minimum_margin)
 
     if final_quantity < minimum_allowed_quantity:
         if quantity_by_risk < minimum_allowed_quantity:

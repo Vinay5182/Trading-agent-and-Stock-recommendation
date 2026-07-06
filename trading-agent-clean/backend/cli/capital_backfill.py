@@ -165,6 +165,7 @@ async def build_field_level_preview(db, *, limit: int | None = None) -> dict:
                     available_margin=settings.STARTING_VIRTUAL_BALANCE,
                     open_margin=0.0,
                     combined_open_risk=0.0,
+                    paper_mode=True,
                 )
                 if sizing["ok"]:
                     proposed_qty = sizing["final_quantity"]

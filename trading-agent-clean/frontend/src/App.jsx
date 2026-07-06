@@ -1851,15 +1851,16 @@ const PAPER_TABLE_COLUMNS = [
 const PAPER_TRADE_FILTERS = [
   { key: "waiting", label: "Waiting for Entry", groups: new Set(["waiting"]) },
   { key: "active", label: "Active Trades", groups: new Set(["active"]) },
-  { key: "completed", label: "Completed / Stopped", groups: new Set(["completed", "stopped", "ambiguous"]) },
+  { key: "completed", label: "Completed / Stopped", groups: new Set(["completed", "stopped", "ambiguous", "expired"]) },
   { key: "all", label: "All Trades", groups: null },
 ];
 const PAPER_WAITING_STATUSES = new Set(["PLANNED", "NOT_TRIGGERED", "WAITING", "WAITING_FOR_ENTRY"]);
 const PAPER_PARTIAL_STATUSES = new Set(["T1_PARTIAL", "T2_PARTIAL"]);
 const PAPER_ACTIVE_STATUSES = new Set(["ACTIVE"]);
-const PAPER_COMPLETED_STATUSES = new Set(["T3_HIT", "TARGET_3_HIT", "COMPLETED", "CLOSED", "TARGET_HIT", "TARGET_1_HIT_FINAL", "TARGET_2_HIT", "T1_HIT", "T2_HIT", "WON_T1", "WON_T2", "WON_T3"]);
+const PAPER_COMPLETED_STATUSES = new Set(["T3_HIT", "TARGET_3_HIT", "COMPLETED", "TARGET_HIT", "TARGET_1_HIT", "TARGET_1_HIT_FINAL", "TARGET_2_HIT", "T1_HIT", "T2_HIT", "WON_T1", "WON_T2", "WON_T3"]);
 const PAPER_STOPPED_STATUSES = new Set(["SL_HIT", "STOPPED", "STOP_HIT", "STOPPED_AFTER_T1", "LOST_SL"]);
 const PAPER_AMBIGUOUS_STATUSES = new Set(["AMBIGUOUS"]);
+const PAPER_EXPIRED_STATUSES = new Set(["EXPIRED", "NOT_TRIGGERED"]);
 
 function paperTradeIdentity(trade, fallback = 0) {
   return trade?.paper_trade_id || trade?.trade_id || trade?.setup_id || trade?._id || `${trade?.symbol || "trade"}-${fallback}`;
@@ -1900,6 +1901,7 @@ function hasAnyPaperStatus(statuses, candidates) {
 }
 function paperDisplayStatus(trade) {
   const statuses = paperStatusSet(trade);
+  if (hasAnyPaperStatus(statuses, PAPER_EXPIRED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_ACTIVE_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_PARTIAL_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_COMPLETED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_STOPPED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_AMBIGUOUS_STATUSES)) return "Expired / Not Triggered";
   if (hasAnyPaperStatus(statuses, PAPER_WAITING_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_ACTIVE_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_PARTIAL_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_COMPLETED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_STOPPED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_AMBIGUOUS_STATUSES)) return "Waiting for Entry";
   if (hasAnyPaperStatus(statuses, PAPER_PARTIAL_STATUSES)) return "Partial";
   if (hasAnyPaperStatus(statuses, PAPER_COMPLETED_STATUSES)) return "Completed";
@@ -1911,6 +1913,7 @@ function paperDisplayStatus(trade) {
 function paperStatusToneFromLabel(status) {
   const label = String(status || "").toLowerCase();
   if (label.includes("stopped") || label.includes("sl")) return "red";
+  if (label.includes("expired") || label.includes("not triggered")) return "gray";
   if (label.includes("waiting") || label.includes("partial") || label.includes("ambiguous")) return "yellow";
   if (label.includes("active") || label.includes("completed")) return "green";
   return "gray";
@@ -1942,7 +1945,11 @@ function paperCellValue(row, column) {
   if (column.key === "target_1") return row?.target_1 ?? row?.t1;
   if (column.key === "target_2") return row?.target_2 ?? row?.t2;
   if (column.key === "target_3") return row?.target_3 ?? row?.t3;
-  if (column.key === "pnl") return row?.paper_pnl ?? row?.pnl;
+  if (column.key === "pnl") {
+    const statuses = paperStatusSet(row);
+    if (hasAnyPaperStatus(statuses, PAPER_EXPIRED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_COMPLETED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_STOPPED_STATUSES)) return row?.pnl_display ?? null;
+    return row?.pnl_display ?? row?.paper_pnl ?? row?.pnl;
+  }
   if (column.key === "setup_time") return row?.setup_time ?? row?.created_at ?? row?.source_confirmation_created_at;
   if (column.key === "shares") return row;
   if (column.key === "reserved_margin") return row?.reserved_margin;
@@ -1969,7 +1976,9 @@ function PaperTradeTable({ rows, loading, emptyMessage }) {
         const warning = row?.quantity_integrity_warning;
         let text = "Unavailable";
         if (!warning && row?.bought_quantity !== null && row?.bought_quantity !== undefined) {
-          if (PAPER_WAITING_STATUSES.has(normStatus)) {
+          if (PAPER_EXPIRED_STATUSES.has(normStatus)) {
+            text = "0 bought / 0 open";
+          } else if (PAPER_WAITING_STATUSES.has(normStatus)) {
             text = `0 bought / ${row.planned_quantity} planned`;
           } else if (PAPER_ACTIVE_STATUSES.has(normStatus) || PAPER_PARTIAL_STATUSES.has(normStatus)) {
             text = `${row.bought_quantity} bought / ${row.open_quantity} open`;
@@ -2014,7 +2023,8 @@ function PaperTrades({ openTrades, history, summary, liveStatus }) {
   const completedTrades = withPaperGroup(arr(history, ["completed"]), "completed");
   const stoppedTrades = withPaperGroup(arr(history, ["sl_hit"]), "stopped");
   const ambiguousTrades = withPaperGroup(arr(history, ["ambiguous"]), "ambiguous");
-  const allRows = dedupePaperTrades([...waitingTrades, ...activeTrades, ...completedTrades, ...stoppedTrades, ...ambiguousTrades]);
+  const expiredTrades = withPaperGroup(arr(history, ["expired_not_triggered"]), "expired");
+  const allRows = dedupePaperTrades([...waitingTrades, ...activeTrades, ...completedTrades, ...stoppedTrades, ...ambiguousTrades, ...expiredTrades]);
   const selectedFilter = PAPER_TRADE_FILTERS.find((filter) => filter.key === activeTradeFilter) || PAPER_TRADE_FILTERS[0];
   const tabRows = selectedFilter.groups ? allRows.filter((trade) => selectedFilter.groups.has(trade.paper_group)) : allRows;
   const filteredRows = tabRows.filter((trade) => paperTradeMatchesFilters(trade, paperSearch, strategyFilter));
@@ -2025,6 +2035,7 @@ function PaperTrades({ openTrades, history, summary, liveStatus }) {
   const targetHitCount = summary?.target_hit_count ?? completedTrades.length;
   const slHitCount = summary?.sl_hit_count ?? history?.sl_hit_count ?? stoppedTrades.length;
   const ambiguousCount = summary?.ambiguous_count ?? history?.ambiguous_count ?? ambiguousTrades.length;
+  const expiredCount = summary?.expired_not_triggered_count ?? history?.expired_not_triggered_count ?? expiredTrades.length;
   return <div className="pageStack">
     {liveStatus?.error && <div className="errorPanel paperInlineState">{liveStatus.error}</div>}
     <div className="statsGrid compact">
@@ -2033,6 +2044,7 @@ function PaperTrades({ openTrades, history, summary, liveStatus }) {
       <StatCard label="Target Hit" value={targetHitCount} />
       <StatCard label="SL Hit" value={slHitCount} tone="red" />
       <StatCard label="Ambiguous" value={ambiguousCount} tone="yellow" />
+      <StatCard label="Expired / Not Triggered" value={expiredCount} tone="gray" />
     </div>
     <div className="paperTradeToolbar">
       <input value={paperSearch} onChange={(event) => setPaperSearch(event.target.value)} placeholder="Search by symbol" />

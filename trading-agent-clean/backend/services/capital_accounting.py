@@ -182,6 +182,7 @@ async def try_activate_trade_with_capital(db, trade_id, current_state_version, n
                 available_margin=available_margin,
                 open_margin=open_margin,
                 combined_open_risk=combined_open_risk,
+                paper_mode=True,
             )
             if sizing["ok"]:
                 final_q = sizing["final_quantity"]

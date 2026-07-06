@@ -69,6 +69,7 @@ def log_lifecycle_system_error_sync(plan: dict, code: str, msg: str):
 logger = logging.getLogger("uvicorn.error")
 WAITING_FOR_ENTRY_STATUS = "WAITING_FOR_ENTRY"
 WAITING_STATUSES = {"NOT_TRIGGERED", "PLANNED", "WAITING", WAITING_FOR_ENTRY_STATUS}
+CANCELED_STATUSES = {"EXPIRED", "NOT_TRIGGERED"}
 T1_PARTIAL_STATUS = "T1_PARTIAL"
 T2_PARTIAL_STATUS = "T2_PARTIAL"
 PARTIAL_STATUSES = {s for s in GENUINE_OPEN_STATUSES if s != "ACTIVE"}
@@ -110,7 +111,7 @@ OPEN_STATUSES = sorted(ACTIVE_STATUSES)
 NON_TERMINAL_STATUSES = sorted(WAITING_STATUSES | ACTIVE_STATUSES)
 CLOSED_STATUSES = sorted(TERMINAL_STATUSES)
 SL_HIT_STATUSES = {"SL_HIT", "STOP_HIT", "STOPPED", "STOPPED_AFTER_T1", "LOST_SL"}
-TARGET_COMPLETED_STATUSES = TERMINAL_STATUSES - SL_HIT_STATUSES - {"AMBIGUOUS"}
+TARGET_COMPLETED_STATUSES = TERMINAL_STATUSES - SL_HIT_STATUSES - {"AMBIGUOUS", "EXPIRED", "NOT_TRIGGERED"}
 PAPER_UPDATE_LOCK_NAME = "paper_trade_outcome_update"
 PAPER_UPDATE_LOCK_TTL_SECONDS = 15 * 60
 PAPER_UPDATE_APPROVAL_TTL_SECONDS = 3 * 60
@@ -734,6 +735,11 @@ def is_completed_target_trade(trade: dict) -> bool:
     return bool(statuses & TARGET_COMPLETED_STATUSES) and not bool(statuses & (SL_HIT_STATUSES | {"AMBIGUOUS"}))
 
 
+def is_canceled_or_expired_trade(trade: dict) -> bool:
+    statuses = trade_statuses(trade)
+    return bool(statuses & CANCELED_STATUSES) and not bool(statuses & (ACTIVE_STATUSES | TARGET_COMPLETED_STATUSES | SL_HIT_STATUSES | {"AMBIGUOUS"}))
+
+
 def parse_datetime_value(value) -> datetime | None:
     if not value:
         return None
@@ -794,11 +800,13 @@ def intraday_rows_after_setup(row: dict, setup_time: datetime | None) -> list[di
 
 
 def ui_status_for_trade(trade: dict) -> str:
+    if is_canceled_or_expired_trade(trade):
+        return "Expired / Not Triggered"
     statuses = trade_statuses(trade)
     if statuses & WAITING_STATUSES or trade.get("entry_triggered") is False:
         if not statuses & (ACTIVE_STATUSES | TERMINAL_STATUSES):
             return "Waiting for Entry"
-    if statuses & {T1_PARTIAL_STATUS, T2_PARTIAL_STATUS, "TARGET_1_HIT", "TARGET_2_HIT"}:
+    if statuses & {T1_PARTIAL_STATUS, T2_PARTIAL_STATUS}:
         return "Partial"
     if statuses & SL_HIT_STATUSES:
         return "Stopped"
@@ -924,6 +932,7 @@ def select_pnl(trade: dict, force_zero: bool = False) -> float:
 
 def paper_api_row(trade: dict, market_map: dict | None = None) -> dict:
     status = normalize_status(trade.get("status"))
+    canceled_or_expired = is_canceled_or_expired_trade(trade)
 
     # 1. Planned quantity (null when unresolved)
     planned_q = None
@@ -937,7 +946,7 @@ def paper_api_row(trade: dict, market_map: dict | None = None) -> dict:
     planned_quantity = int(planned_q) if planned_q is not None else None
 
     # 2. Bought & Open quantity & Reserved Margin & P&L
-    if status == "WAITING_FOR_ENTRY":
+    if status == "WAITING_FOR_ENTRY" or canceled_or_expired:
         bought_quantity = 0
         open_quantity = 0
         reserved_margin = 0.0
@@ -967,9 +976,9 @@ def paper_api_row(trade: dict, market_map: dict | None = None) -> dict:
         pnl = select_pnl(trade)
 
     integrity_warnings = []
-    if planned_quantity is None:
+    if planned_quantity is None and not canceled_or_expired:
         integrity_warnings.append("UNRESOLVED_PLANNED_QUANTITY")
-    if status != "WAITING_FOR_ENTRY" and bought_quantity is None:
+    if status != "WAITING_FOR_ENTRY" and not canceled_or_expired and bought_quantity is None:
         integrity_warnings.append("UNRESOLVED_BOUGHT_QUANTITY")
     integrity_warning = integrity_warnings[0] if integrity_warnings else None
 
@@ -980,7 +989,12 @@ def paper_api_row(trade: dict, market_map: dict | None = None) -> dict:
     price_source = None
     price_warning = None
 
-    if status in {"WAITING_FOR_ENTRY", "ACTIVE", "T1_PARTIAL", "T2_PARTIAL"}:
+    if canceled_or_expired:
+        current_price = None
+        exit_price = None
+        price_updated_at = trade.get("status_updated_at") or trade.get("updated_at")
+        price_source = "not_triggered_or_expired"
+    elif status in {"WAITING_FOR_ENTRY", "ACTIVE", "T1_PARTIAL", "T2_PARTIAL"}:
         if market_map:
             price_val, updated_at, source, price_warn = resolve_fresh_quote(trade, market_map)
             current_price = price_val
@@ -1019,6 +1033,8 @@ def paper_api_row(trade: dict, market_map: dict | None = None) -> dict:
 
         "paper_pnl": paper_pnl,
         "pnl": pnl,
+        "pnl_display": None if canceled_or_expired else paper_pnl,
+        "pnl_note": "Expired / not triggered; no realized P&L" if canceled_or_expired else None,
 
         "setup_time": setup_time_value(trade),
         "entry_triggered_at": trade.get("entry_triggered_at"),
@@ -1155,20 +1171,33 @@ def exit_allocations_for_trade(plan: dict) -> dict:
         t2_dict = existing["t2"]
         t3_dict = existing["t3"]
         if isinstance(t1_dict, dict) and isinstance(t2_dict, dict) and isinstance(t3_dict, dict):
-            t1_q = number_or_none(t1_dict.get("quantity"))
-            t2_q = number_or_none(t2_dict.get("quantity"))
-            t3_q = number_or_none(t3_dict.get("quantity"))
-            total_q = number_or_none(existing.get("total_quantity")) or total_trade_quantity(plan)
-            if all(q is not None and q > 0 for q in (t1_q, t2_q, t3_q)):
-                if int(t1_q + t2_q + t3_q) == int(total_q):
-                    t1_p = number_or_none(t1_dict.get("percent")) or 33.0
-                    t2_p = number_or_none(t2_dict.get("percent")) or 33.0
-                    t3_p = number_or_none(t3_dict.get("percent")) or 34.0
-                    reason = existing.get("allocation_reason") or "V2_NESTED_ALLOCATION"
-                    return make_alloc_dict(t1_q, t1_p, t2_q, t2_p, t3_q, t3_p, total_q, reason, existing.get("allocation_version", 2))
+            total_q = number_or_none(existing.get("total_quantity"))
+            current_q = int(total_trade_quantity(plan))
+            t1_p = number_or_none(t1_dict.get("percent")) or 33.0
+            t2_p = number_or_none(t2_dict.get("percent")) or 33.0
+            t3_p = number_or_none(t3_dict.get("percent")) or 34.0
+            
+            # If the quantity of the plan has changed, recalculate the quantities
+            if total_q is not None and current_q > 0 and int(total_q) != current_q:
+                t1_q = max(1, floor(current_q * (t1_p / 100.0)))
+                t2_q = max(1, floor(current_q * (t2_p / 100.0)))
+                t3_q = current_q - t1_q - t2_q
+                if t1_q > 0 and t2_q > 0 and t3_q > 0:
+                    reason = existing.get("allocation_reason") or "RECALCULATED_ON_QUANTITY_CHANGE"
+                    return make_alloc_dict(t1_q, t1_p, t2_q, t2_p, t3_q, t3_p, current_q, reason, existing.get("allocation_version", 2))
                 else:
-                    if is_v2:
-                        return {"valid": False, "reason": "V2_EXIT_ALLOCATIONS_INVALID"}
+                    return {"valid": False, "reason": "V2_EXIT_ALLOCATIONS_INVALID"}
+            else:
+                t1_q = number_or_none(t1_dict.get("quantity"))
+                t2_q = number_or_none(t2_dict.get("quantity"))
+                t3_q = number_or_none(t3_dict.get("quantity"))
+                total_q = total_q or current_q
+                if all(q is not None and q > 0 for q in (t1_q, t2_q, t3_q)):
+                    if int(t1_q + t2_q + t3_q) == int(total_q):
+                        return make_alloc_dict(t1_q, t1_p, t2_q, t2_p, t3_q, t3_p, total_q, existing.get("allocation_reason") or "V2_NESTED_ALLOCATION", existing.get("allocation_version", 2))
+                    else:
+                        if is_v2:
+                            return {"valid": False, "reason": "V2_EXIT_ALLOCATIONS_INVALID"}
 
     # Legacy flat exit_allocations dictionary (for V1 existing records)
     if isinstance(existing, dict) and not ("t1" in existing or "t2" in existing or "t3" in existing):
@@ -2090,6 +2119,7 @@ def _update_plan_status_raw(
                 available_margin=available_margin,
                 open_margin=open_margin,
                 combined_open_risk=combined_open_risk,
+                paper_mode=True,
             )
             if sizing["ok"]:
                 final_q = sizing["final_quantity"]
@@ -3557,15 +3587,18 @@ async def get_paper_trade_history(limit: int = Query(default=100, ge=1, le=500))
     completed = [paper_api_row(trade, market_map) for trade in trades if is_completed_target_trade(trade)][:limit]
     sl_hit = [paper_api_row(trade, market_map) for trade in trades if is_sl_hit_trade(trade)][:limit]
     ambiguous = [paper_api_row(trade, market_map) for trade in trades if is_ambiguous_paper_trade(trade)][:limit]
+    expired_not_triggered = [paper_api_row(trade, market_map) for trade in trades if is_canceled_or_expired_trade(trade)][:limit]
     return {
         "paper_only": True,
-        "count": len(completed) + len(sl_hit) + len(ambiguous),
+        "count": len(completed) + len(sl_hit) + len(ambiguous) + len(expired_not_triggered),
         "completed_count": len(completed),
         "sl_hit_count": len(sl_hit),
         "ambiguous_count": len(ambiguous),
+        "expired_not_triggered_count": len(expired_not_triggered),
         "completed": completed,
         "sl_hit": sl_hit,
         "ambiguous": ambiguous,
+        "expired_not_triggered": expired_not_triggered,
     }
 
 
@@ -3607,8 +3640,6 @@ async def get_paper_summary() -> dict:
     total_pnl = sum(analytics_pnl_value(trade) or 0 for trade in pnl_trades)
     winning = [trade for trade in eligible_closed if (analytics_pnl_value(trade) or 0) > 0]
     losing = [trade for trade in eligible_closed if (analytics_pnl_value(trade) or 0) < 0]
-    target_hit_statuses = {"TARGET_HIT", "TARGET_1_HIT", "TARGET_1_HIT_FINAL", "TARGET_2_HIT", "TARGET_3_HIT", "T1_HIT", "T2_HIT", "T3_HIT", "WON_T1", "WON_T2", "WON_T3"}
-    sl_hit_statuses = {"SL_HIT", "LOST_SL", "STOP_HIT", "STOPPED", "STOPPED_AFTER_T1"}
     return {
         "total_trades": len(trades),
         "waiting_trades": len(waiting),
@@ -3628,9 +3659,10 @@ async def get_paper_summary() -> dict:
         "winning_trades": len(winning),
         "losing_trades": len(losing),
         "win_rate_percent": (len(winning) / len(eligible_closed) * 100) if eligible_closed else 0,
-        "target_hit_count": sum(1 for trade in trades if trade_statuses(trade) & target_hit_statuses),
-        "sl_hit_count": sum(1 for trade in trades if trade_statuses(trade) & sl_hit_statuses),
+        "target_hit_count": sum(1 for trade in trades if is_completed_target_trade(trade)),
+        "sl_hit_count": sum(1 for trade in trades if is_sl_hit_trade(trade)),
         "ambiguous_count": sum(1 for trade in trades if "AMBIGUOUS" in trade_statuses(trade)),
+        "expired_not_triggered_count": sum(1 for trade in trades if is_canceled_or_expired_trade(trade)),
         "symbols": sorted({trade.get("symbol") for trade in trades if trade.get("symbol")}),
     }
 

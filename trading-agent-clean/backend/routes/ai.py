@@ -455,9 +455,10 @@ def _is_document_safe_at(document: dict | None, cutoff: Any) -> bool:
         return False
     cutoff_time = _parse_timestamp(cutoff)
     document_time = _parse_timestamp(
-        document.get("updated_at")
+        document.get("created_at")
+        or document.get("source_candle_at")
+        or document.get("updated_at")
         or document.get("modified_at")
-        or document.get("created_at")
     )
     return cutoff_time is not None and document_time is not None and document_time <= cutoff_time
 
@@ -746,6 +747,37 @@ async def _find_paper_trade(db, candidate: dict, strategy_type: str, timeframe: 
         ),
     }
     return await _find_latest(getattr(db, "paper_trades", None), query)
+async def _find_tv_confirmation(db, paper_trade: dict, strategy_type: str | None, timeframe: str | None) -> dict | None:
+    tv_conf_id = paper_trade.get("source_confirmation_id")
+    if tv_conf_id:
+        from bson import ObjectId
+        query_ids = [tv_conf_id]
+        if ObjectId.is_valid(str(tv_conf_id)):
+            query_ids.insert(0, ObjectId(str(tv_conf_id)))
+        for col_name in ("swing_tv_confirmations", "momentum_tv_confirmations"):
+            for q_id in query_ids:
+                col = getattr(db, col_name, None)
+                if col is not None:
+                    tv_conf = await col.find_one({"_id": q_id})
+                    if tv_conf:
+                        return tv_conf
+
+    strategy = strategy_type or _strategy_type_from_document(paper_trade)
+    if not strategy:
+        return None
+    col_name = "swing_tv_confirmations" if strategy == "swing" else "momentum_tv_confirmations"
+
+    values = _symbol_values(paper_trade)
+    query = {
+        **_or_query(
+            [
+                {"tradingview_symbol": values["tradingview_symbol"]},
+                {"symbol": values["tradingview_symbol"]},
+                {"symbol": values["canonical"]},
+            ]
+        )
+    }
+    return await _find_latest(getattr(db, col_name, None), query)
 
 
 async def _build_candidate_feature_snapshots(db, strategy: str, limit: int, timeframe: str) -> list[dict]:
@@ -759,10 +791,27 @@ async def _build_candidate_feature_snapshots(db, strategy: str, limit: int, time
         market_data = await _find_market_data(db, scored_candidate)
         paper_signal = await _find_paper_signal(db, scored_candidate, strategy, timeframe)
         paper_trade = await _find_paper_trade(db, scored_candidate, strategy, timeframe)
+        tv_confirmation = None
+        if paper_trade:
+            tv_confirmation = await _find_tv_confirmation(db, paper_trade, strategy, timeframe)
+        else:
+            col_name = "swing_tv_confirmations" if strategy == "swing" else "momentum_tv_confirmations"
+            values = _symbol_values(candidate)
+            query = {
+                **_or_query(
+                    [
+                        {"tradingview_symbol": values["tradingview_symbol"]},
+                        {"symbol": values["tradingview_symbol"]},
+                        {"symbol": values["canonical"]},
+                    ]
+                )
+            }
+            tv_confirmation = await _find_latest(getattr(db, col_name, None), query)
+
         snapshot = build_ai_feature_snapshot(
             scored_candidate,
             market_data,
-            None,
+            tv_confirmation,
             paper_signal,
             paper_trade,
             snapshot_time=snapshot_time,
@@ -795,10 +844,11 @@ async def _build_paper_trade_feature_snapshots(db, strategy: str, limit: int, ti
         lookup_document = scored_candidate if candidate else paper_trade
         market_data = await _find_market_data(db, lookup_document)
         paper_signal = await _find_paper_signal(db, lookup_document, strategy, timeframe)
+        tv_confirmation = await _find_tv_confirmation(db, paper_trade, strategy, timeframe)
         snapshot = build_ai_feature_snapshot(
             scored_candidate,
             market_data,
-            None,
+            tv_confirmation,
             paper_signal,
             paper_trade,
             snapshot_time=snapshot_time,
@@ -850,7 +900,9 @@ async def _build_paper_trade_backfill_snapshots(
             if trade_strategy and trade_timeframe
             else None
         )
+        tv_confirmation = await _find_tv_confirmation(db, paper_trade, trade_strategy, trade_timeframe)
         safe_signal = paper_signal if _is_document_safe_at(paper_signal, trade_created_at) else None
+        safe_tv_conf = tv_confirmation if _is_document_safe_at(tv_confirmation, trade_created_at) else None
         full_safe = (
             _is_document_safe_at(candidate, trade_created_at)
             and _is_document_safe_at(market_data, trade_created_at)
@@ -862,7 +914,7 @@ async def _build_paper_trade_backfill_snapshots(
         snapshot = build_ai_feature_snapshot(
             scored_candidate,
             safe_market_data,
-            None,
+            safe_tv_conf,
             safe_signal,
             paper_trade,
             snapshot_time=str(snapshot_time),

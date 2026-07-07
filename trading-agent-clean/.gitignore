@@ -12,3 +12,12 @@ backend/scratch/*.json
 frontend/test_output.txt
 frontend/test_output_utf8.txt
 frontend/test_run.log
+
+# AI / ML Model Binaries
+*.pkl
+*.onnx
+*.h5
+*.joblib
+*.pt
+*.pth
+*.safetensors

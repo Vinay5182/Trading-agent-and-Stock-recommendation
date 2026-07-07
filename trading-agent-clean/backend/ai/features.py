@@ -307,6 +307,64 @@ def chronological_split(
     return train, val, test
 
 
+def _extract_risk_score(
+    strategy_type: str | None,
+    scored_candidate: Mapping[str, Any],
+    tv_confirmation: Mapping[str, Any],
+    paper_signal: Mapping[str, Any],
+    paper_trade: Mapping[str, Any],
+) -> float | int | None:
+    val = _first_number(
+        scored_candidate.get("risk_score"),
+        tv_confirmation.get("risk_score"),
+        paper_signal.get("risk_score"),
+        paper_trade.get("risk_score"),
+    )
+    if val is not None:
+        return val
+
+    if strategy_type == "momentum":
+        trap_score = _first_number(
+            tv_confirmation.get("momentum_trap_score"),
+            scored_candidate.get("momentum_trap_score"),
+            paper_signal.get("momentum_trap_score"),
+        )
+        if trap_score is not None:
+            return trap_score
+            
+    elif strategy_type == "swing":
+        fake_risk = _first_value(
+            tv_confirmation.get("fake_breakout_risk"),
+            scored_candidate.get("fake_breakout_risk"),
+            paper_signal.get("fake_breakout_risk"),
+        )
+        retail_risk = _first_value(
+            tv_confirmation.get("retail_trap_risk"),
+            scored_candidate.get("retail_trap_risk"),
+            paper_signal.get("retail_trap_risk"),
+        )
+        if fake_risk is not None or retail_risk is not None:
+            f_r = str(fake_risk).upper() if fake_risk else "LOW"
+            r_r = str(retail_risk).upper() if retail_risk else "LOW"
+            trap_safety = 5 if f_r == "LOW" and r_r == "LOW" else 3 if "HIGH" not in {f_r, r_r} else 0
+            return 5 - trap_safety
+
+    risk_sum = _doc(_first_value(
+        tv_confirmation.get("risk_summary"),
+        scored_candidate.get("risk_summary"),
+        paper_signal.get("risk_summary"),
+    ))
+    if risk_sum:
+        f_r = str(risk_sum.get("fake_breakout_risk") or "LOW").upper()
+        o_r = str(risk_sum.get("overextended_risk") or "LOW").upper()
+        r_r = str(risk_sum.get("retail_trap_risk") or "LOW").upper()
+        pts = {"HIGH": 3, "MEDIUM": 1.5, "LOW": 0}
+        total_pts = pts.get(f_r, 0) + pts.get(o_r, 0) + pts.get(r_r, 0)
+        return total_pts
+
+    return None
+
+
 def build_ai_feature_snapshot(
     scored_candidate: Mapping[str, Any],
     market_data: Mapping[str, Any] | None = None,
@@ -316,6 +374,7 @@ def build_ai_feature_snapshot(
     *,
     snapshot_time: str | None = None,
     timeframe: str | None = None,
+    strict_linking: bool = False,
 ) -> dict[str, Any]:
     market_data = _doc(market_data)
     tv_confirmation = _doc(tv_confirmation)
@@ -379,6 +438,30 @@ def build_ai_feature_snapshot(
         paper_signal.get("volume_score"),
         _breakdown_sum(breakdown, VOLUME_BREAKDOWN_KEYS.get(strategy_type or "", ())),
     )
+    rule_score_val = _first_number(
+        scored_candidate.get("rule_score"),
+        scored_candidate.get("score"),
+        scored_candidate.get("nse_score"),
+        paper_signal.get("score"),
+    )
+
+    if rule_score_val is None or trend_score is None:
+        import logging
+        logger = logging.getLogger("ai.features")
+        symbol = _first_value(
+            scored_candidate.get("canonical_symbol"),
+            market_data.get("canonical_symbol"),
+            scored_candidate.get("symbol"),
+            market_data.get("symbol"),
+            symbol_from_tv,
+        )
+        msg = (
+            f"SAFETY WARNING: Feature extraction linking failure for symbol {symbol}. "
+            f"rule_score={rule_score_val}, trend_score={trend_score}. Silent nulls in ML dataset are prohibited."
+        )
+        logger.warning(msg)
+        if strict_linking:
+            raise ValueError(msg)
 
     setup_status = _setup_status(strategy_type, scored_candidate, tv_confirmation, paper_signal, paper_trade)
     if setup_status in CLOSED_TRADE_STATUSES:
@@ -443,12 +526,7 @@ def build_ai_feature_snapshot(
         ),
         "snapshot_time": as_of_str,
         "data_source_ids": _source_ids(scored_candidate, market_data, tv_confirmation, paper_signal, paper_trade),
-        "rule_score": _first_number(
-            scored_candidate.get("rule_score"),
-            scored_candidate.get("score"),
-            scored_candidate.get("nse_score"),
-            paper_signal.get("score"),
-        ),
+        "rule_score": rule_score_val,
         "trend_score": trend_score,
         "momentum_score": _first_number(
             scored_candidate.get("momentum_score"),
@@ -456,11 +534,12 @@ def build_ai_feature_snapshot(
             tv_confirmation.get("momentum_score"),
         ),
         "volume_score": volume_score,
-        "risk_score": _first_number(
-            scored_candidate.get("risk_score"),
-            tv_confirmation.get("risk_score"),
-            paper_signal.get("risk_score"),
-            paper_trade.get("risk_score"),
+        "risk_score": _extract_risk_score(
+            strategy_type,
+            scored_candidate,
+            tv_confirmation,
+            paper_signal,
+            paper_trade,
         ),
         "setup_status": setup_status,
         "entry_price": _first_number(

@@ -1,9 +1,12 @@
 import asyncio
+import csv
 import hashlib
+import io
 from typing import Any
 
 from bson import ObjectId
 from fastapi import APIRouter, Body, Header, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pymongo.errors import DuplicateKeyError
 
 from ai.features import (
@@ -2715,3 +2718,125 @@ async def get_historical_orchestration_status(
         "status": "State is PREVIEW_READY. Multi-symbol apply is not enabled.",
         "store_version": HISTORICAL_OHLCV_STORE_VERSION,
     }
+
+
+# ---------------------------------------------------------------------------
+# AI-DATA-5: Read-only CSV export of labelled ai_feature_snapshots
+# ---------------------------------------------------------------------------
+
+_EXPORT_CSV_FIELDNAMES = (
+    "paper_trade_id",
+    "snapshot_time",
+    "outcome_label",
+    "rule_score",
+    "trend_score",
+    "momentum_score",
+    "volume_score",
+    "risk_score",
+    "confidence_score",
+    "quality_score",
+    "momentum_trap_score",
+    "daily_ema20",
+    "daily_ema50",
+    "rsi14",
+    "atr14",
+)
+
+
+@router.get("/features/export-training-csv")
+async def export_training_csv() -> StreamingResponse:
+    """Stream all labelled ai_feature_snapshots as a flat CSV file.
+
+    Query constraint:
+        outcome_label  != 'UNKNOWN'
+        outcome_label  is explicitly defined (not null/missing)
+
+    Each document is mapped through build_canonical_training_row to produce
+    canonical, flat feature columns.  The response is returned as
+    text/csv with a Content-Disposition attachment header.
+
+    This endpoint is strictly READ-ONLY — no Mongo writes are performed.
+    """
+    db = get_database()
+    collection = db["ai_feature_snapshots"]
+
+    query_filter = {
+        "outcome_label": {
+            "$exists": True,
+            "$nin": [None, "", "UNKNOWN"],
+        }
+    }
+
+    # Fetch documents (read-only cursor)
+    raw_docs = list(collection.find(query_filter))
+
+    # Build in-memory CSV
+    output = io.StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=list(_EXPORT_CSV_FIELDNAMES),
+        extrasaction="ignore",
+        lineterminator="\r\n",
+    )
+    writer.writeheader()
+
+    for doc in raw_docs:
+        # Map _id to string to avoid BSON serialisation issues
+        if "_id" in doc:
+            doc = dict(doc)
+            doc["_id"] = str(doc["_id"])
+
+        try:
+            canonical = build_canonical_training_row(doc)
+        except Exception:
+            # If mapping fails for a document, emit a degraded row with
+            # identifying keys so the record is still surfaced in the export.
+            row: dict[str, Any] = {
+                "paper_trade_id": str(doc.get("paper_trade_id", "")),
+                "snapshot_time": str(doc.get("snapshot_time", "")),
+                "outcome_label": str(doc.get("outcome_label", "")),
+            }
+            for field in _EXPORT_CSV_FIELDNAMES:
+                row.setdefault(field, "")
+            writer.writerow(row)
+            continue
+
+        # Extract flat columns from the canonical row structure
+        identity = canonical.get("identity") or {}
+        features = canonical.get("model_features") or {}
+
+        # paper_trade_id from identity (preferred) or raw doc
+        paper_trade_id = identity.get("paper_trade_id") or str(doc.get("paper_trade_id", ""))
+
+        # snapshot_time from raw doc (display/audit field; not a model feature)
+        snapshot_time = str(doc.get("snapshot_time", ""))
+
+        # outcome_label from raw doc — this is the label we filtered on
+        outcome_label = str(doc.get("outcome_label", ""))
+
+        row = {
+            "paper_trade_id": paper_trade_id or "",
+            "snapshot_time": snapshot_time,
+            "outcome_label": outcome_label,
+        }
+
+        for field in _EXPORT_CSV_FIELDNAMES:
+            if field in ("paper_trade_id", "snapshot_time", "outcome_label"):
+                continue
+            raw_val = features.get(field)
+            if raw_val is None:
+                row[field] = "NaN"
+            else:
+                row[field] = str(raw_val)
+
+        writer.writerow(row)
+
+    csv_bytes = output.getvalue().encode("utf-8")
+
+    return StreamingResponse(
+        iter([csv_bytes]),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": 'attachment; filename="trading_agent_gathered_dataset.csv"'
+        },
+    )

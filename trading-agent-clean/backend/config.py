@@ -50,6 +50,17 @@ def env_str(name: str, default: str, *, required: bool = False) -> str:
     return value
 
 
+def validate_hhmm(value: str, *, field: str) -> None:
+    try:
+        hour_text, minute_text = str(value).split(":", 1)
+        hour = int(hour_text)
+        minute = int(minute_text)
+    except Exception as exc:
+        raise ConfigValidationError("CONFIG_INVALID_TIME", f"{field} must use HH:MM format.", {"field": field}) from exc
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ConfigValidationError("CONFIG_INVALID_TIME", f"{field} must be a valid 24-hour time.", {"field": field})
+
+
 @dataclass(frozen=True)
 class Settings:
     BACKEND_HOST: str = field(default_factory=lambda: env_str("BACKEND_HOST", "127.0.0.1"))
@@ -81,10 +92,18 @@ class Settings:
     PAPER_UPDATE_SCHEDULER_MAX_TRADES: int = field(default_factory=lambda: env_int("PAPER_UPDATE_SCHEDULER_MAX_TRADES", 6, minimum=1, maximum=200))
     PAPER_UPDATE_SCHEDULER_MAX_WRITES: int = field(default_factory=lambda: env_int("PAPER_UPDATE_SCHEDULER_MAX_WRITES", 1, minimum=0, maximum=200))
     PAPER_MARKET_SNAPSHOT_RETENTION_DAYS: int = field(default_factory=lambda: env_int("PAPER_MARKET_SNAPSHOT_RETENTION_DAYS", 14, minimum=1, maximum=3650))
+    PAPER_AI_HARD_GATE_ENABLED: bool = field(default_factory=lambda: env_bool("PAPER_AI_HARD_GATE_ENABLED", False))
     SMOKE_READ_ONLY_MODE: bool = field(default_factory=lambda: env_bool("SMOKE_READ_ONLY_MODE", False))
     MARKET_DATA_STALENESS_THRESHOLD_SECONDS: int = field(default_factory=lambda: env_int("MARKET_DATA_STALENESS_THRESHOLD_SECONDS", 86400, minimum=1))
     HISTORICAL_CANDLE_CLOSE_SAFETY_SECONDS: int = field(default_factory=lambda: env_int("HISTORICAL_CANDLE_CLOSE_SAFETY_SECONDS", 60, minimum=0, maximum=3600))
     HISTORICAL_OHLCV_MAX_ROWS: int = field(default_factory=lambda: env_int("HISTORICAL_OHLCV_MAX_ROWS", 5000, minimum=1, maximum=50000))
+    DAILY_OHLCV_SCHEDULER_ENABLED: bool = field(default_factory=lambda: env_bool("DAILY_OHLCV_SCHEDULER_ENABLED", False))
+    DAILY_OHLCV_SCHEDULER_DRY_RUN_ONLY: bool = field(default_factory=lambda: env_bool("DAILY_OHLCV_SCHEDULER_DRY_RUN_ONLY", True))
+    DAILY_OHLCV_SCHEDULER_ALLOW_REAL_WRITES: bool = field(default_factory=lambda: env_bool("DAILY_OHLCV_SCHEDULER_ALLOW_REAL_WRITES", False))
+    DAILY_OHLCV_SCHEDULER_TIME_IST: str = field(default_factory=lambda: env_str("DAILY_OHLCV_SCHEDULER_TIME_IST", "17:00"))
+    DAILY_OHLCV_SCHEDULER_UNIVERSE: str = field(default_factory=lambda: env_str("DAILY_OHLCV_SCHEDULER_UNIVERSE", "BROAD_MARKET_750"))
+    DAILY_OHLCV_SCHEDULER_PROVIDER: str = field(default_factory=lambda: env_str("DAILY_OHLCV_SCHEDULER_PROVIDER", "yfinance"))
+    DAILY_OHLCV_SCHEDULER_MAX_SYMBOLS: int = field(default_factory=lambda: env_int("DAILY_OHLCV_SCHEDULER_MAX_SYMBOLS", 0, minimum=0, maximum=5000))
 
 
     STARTING_VIRTUAL_BALANCE: float = 250000.0
@@ -138,6 +157,17 @@ def validate_settings(value: Settings) -> dict:
             "CONFIG_UNSAFE_SCHEDULER",
             "Real scheduler mode requires PAPER_UPDATE_SCHEDULER_ALLOW_REAL_WRITES=true.",
             {"field": "PAPER_UPDATE_SCHEDULER_ALLOW_REAL_WRITES"},
+        )
+    validate_hhmm(value.DAILY_OHLCV_SCHEDULER_TIME_IST, field="DAILY_OHLCV_SCHEDULER_TIME_IST")
+    if (
+        value.DAILY_OHLCV_SCHEDULER_ENABLED
+        and not value.DAILY_OHLCV_SCHEDULER_DRY_RUN_ONLY
+        and not value.DAILY_OHLCV_SCHEDULER_ALLOW_REAL_WRITES
+    ):
+        raise ConfigValidationError(
+            "CONFIG_UNSAFE_DAILY_OHLCV_SCHEDULER",
+            "Persistent daily OHLCV scheduler mode requires DAILY_OHLCV_SCHEDULER_ALLOW_REAL_WRITES=true.",
+            {"field": "DAILY_OHLCV_SCHEDULER_ALLOW_REAL_WRITES"},
         )
     return {"ok": True, "automation_disabled": False, "smoke_read_only_mode": False}
 

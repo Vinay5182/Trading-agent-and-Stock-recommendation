@@ -65,6 +65,9 @@ from services.timestamps import (
     utc_now,
 )
 
+from ml.train import run_model_training
+from ml.predict import predict_outcome
+
 
 router = APIRouter()
 
@@ -457,13 +460,21 @@ def _is_document_safe_at(document: dict | None, cutoff: Any) -> bool:
     if not document:
         return False
     cutoff_time = _parse_timestamp(cutoff)
-    document_time = _parse_timestamp(
-        document.get("created_at")
-        or document.get("source_candle_at")
+    if cutoff_time is None:
+        return False
+
+    created_at = _parse_timestamp(document.get("created_at"))
+    if created_at is not None:
+        return created_at <= cutoff_time
+
+    event_time = _parse_timestamp(
+        document.get("source_candle_at")
+        or document.get("calculation_timestamp")
+        or document.get("confirmed_at")
         or document.get("updated_at")
         or document.get("modified_at")
     )
-    return cutoff_time is not None and document_time is not None and document_time <= cutoff_time
+    return event_time is not None and event_time <= cutoff_time
 
 
 def _resolve_snapshot_filters(
@@ -581,6 +592,22 @@ async def _fetch_history_result(
         )
     except HistoricalOHLCVError as exc:
         raise _history_http_error(exc) from exc
+
+
+@router.get("/historical-candidates/preview")
+async def preview_historical_candidates(
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
+    symbol_limit: int = Query(50),
+) -> dict[str, Any]:
+    from ai.historical_candidate_generator import dry_run_historical_candidate_generation
+    db = get_database()
+    return await dry_run_historical_candidate_generation(
+        db,
+        date_from=date_from,
+        date_to=date_to,
+        symbol_limit=symbol_limit,
+    )
 
 
 @router.get("/history/preview")
@@ -811,15 +838,19 @@ async def _build_candidate_feature_snapshots(db, strategy: str, limit: int, time
             }
             tv_confirmation = await _find_latest(getattr(db, col_name, None), query)
 
-        snapshot = build_ai_feature_snapshot(
-            scored_candidate,
-            market_data,
-            tv_confirmation,
-            paper_signal,
-            paper_trade,
-            snapshot_time=snapshot_time,
-            timeframe=timeframe,
-        )
+        try:
+            snapshot = build_ai_feature_snapshot(
+                scored_candidate,
+                market_data,
+                tv_confirmation,
+                paper_signal,
+                paper_trade,
+                snapshot_time=snapshot_time,
+                timeframe=timeframe,
+                strict_linking=True,
+            )
+        except ValueError:
+            continue
         snapshot.update(
             {
                 "source_mode": "scored_candidates",
@@ -848,15 +879,19 @@ async def _build_paper_trade_feature_snapshots(db, strategy: str, limit: int, ti
         market_data = await _find_market_data(db, lookup_document)
         paper_signal = await _find_paper_signal(db, lookup_document, strategy, timeframe)
         tv_confirmation = await _find_tv_confirmation(db, paper_trade, strategy, timeframe)
-        snapshot = build_ai_feature_snapshot(
-            scored_candidate,
-            market_data,
-            tv_confirmation,
-            paper_signal,
-            paper_trade,
-            snapshot_time=snapshot_time,
-            timeframe=timeframe,
-        )
+        try:
+            snapshot = build_ai_feature_snapshot(
+                scored_candidate,
+                market_data,
+                tv_confirmation,
+                paper_signal,
+                paper_trade,
+                snapshot_time=snapshot_time,
+                timeframe=timeframe,
+                strict_linking=True,
+            )
+        except ValueError:
+            continue
         snapshot.update(
             {
                 "source_mode": "paper_trades",
@@ -914,15 +949,19 @@ async def _build_paper_trade_backfill_snapshots(
         safe_market_data = market_data if full_safe else None
         scored_candidate = {**(safe_candidate or {}), **({"strategy_type": trade_strategy} if trade_strategy else {})}
         snapshot_time = trade_created_at or (safe_signal or {}).get("created_at") or utc_now_iso()
-        snapshot = build_ai_feature_snapshot(
-            scored_candidate,
-            safe_market_data,
-            safe_tv_conf,
-            safe_signal,
-            paper_trade,
-            snapshot_time=str(snapshot_time),
-            timeframe=trade_timeframe,
-        )
+        try:
+            snapshot = build_ai_feature_snapshot(
+                scored_candidate,
+                safe_market_data,
+                safe_tv_conf,
+                safe_signal,
+                paper_trade,
+                snapshot_time=str(snapshot_time),
+                timeframe=trade_timeframe,
+                strict_linking=True,
+            )
+        except ValueError:
+            continue
         snapshot.update(
             {
                 "source_mode": "paper_trades_backfill",
@@ -2840,3 +2879,141 @@ async def export_training_csv() -> StreamingResponse:
             "Content-Disposition": 'attachment; filename="trading_agent_gathered_dataset.csv"'
         },
     )
+
+
+@router.post("/features/train")
+async def trigger_model_training() -> dict[str, Any]:
+    try:
+        metrics = await run_model_training()
+        return metrics
+    except Exception as e:
+        import logging
+        logging.error("Failed to run model training: %s", e)
+        raise HTTPException(status_code=500, detail="Model training failed")
+
+
+@router.post("/features/predict")
+async def trigger_model_prediction(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    try:
+        result = predict_outcome(payload)
+        return result
+    except FileNotFoundError as e:
+        import logging
+        logging.error("Model not found: %s", e)
+        raise HTTPException(status_code=404, detail="Model artifacts not found")
+    except Exception as e:
+        import logging
+        logging.error("Failed to run model prediction: %s", e)
+        raise HTTPException(status_code=500, detail="Model prediction failed")
+
+
+# ==============================================================================
+# Phase 6: Read-Only Dataset APIs
+# ==============================================================================
+
+@router.get("/daily-dataset/summary")
+async def api_get_daily_dataset_summary() -> dict[str, Any]:
+    from services.daily_dataset import get_daily_dataset_summary
+    db = get_database()
+    return await get_daily_dataset_summary(db)
+
+@router.get("/daily-dataset/rows")
+async def api_get_daily_dataset_rows(
+    trade_date_from: str | None = Query(None),
+    trade_date_to: str | None = Query(None),
+    symbol: str | None = Query(None),
+    strategy_type: str | None = Query(None),
+    action: str | None = Query(None),
+    label_state: str | None = Query(None),
+    label_category: str | None = Query(None),
+    current_stage: str | None = Query(None),
+    limit: int = Query(50, le=500),
+    skip: int = Query(0, ge=0),
+) -> list[dict[str, Any]]:
+    from services.daily_dataset import get_daily_dataset_rows
+    db = get_database()
+    filters = {
+        "trade_date_from": trade_date_from,
+        "trade_date_to": trade_date_to,
+        "symbol": symbol,
+        "strategy_type": strategy_type,
+        "action": action,
+        "label_state": label_state,
+        "label_category": label_category,
+        "current_stage": current_stage,
+    }
+    # Remove None values
+    filters = {k: v for k, v in filters.items() if v is not None}
+    return await get_daily_dataset_rows(db, filters, limit, skip)
+
+@router.get("/daily-dataset/export-readiness")
+async def api_get_daily_dataset_export_readiness() -> dict[str, Any]:
+    from services.daily_dataset import get_daily_dataset_export_readiness
+    db = get_database()
+    return await get_daily_dataset_export_readiness(db)
+
+@router.get("/daily-dataset/build-runs")
+async def api_get_daily_dataset_build_runs(limit: int = Query(10, le=100)) -> dict[str, Any]:
+    from services.daily_dataset import get_daily_dataset_build_runs
+    db = get_database()
+    return await get_daily_dataset_build_runs(db, limit=limit)
+
+@router.get("/daily-dataset/export-preview")
+async def api_get_daily_dataset_export_preview(limit: int = Query(50, le=500)) -> list[dict[str, Any]]:
+    from services.daily_dataset import get_daily_dataset_export_preview
+    db = get_database()
+    return await get_daily_dataset_export_preview(db, limit=limit)
+
+
+@router.get("/daily-collection/status")
+async def api_get_daily_collection_status() -> dict[str, Any]:
+    from ai.daily_ohlcv_collector import get_daily_collection_status
+
+    db = get_database()
+    return await get_daily_collection_status(db)
+
+
+@router.get("/data-collection/status")
+async def get_data_collection_status():
+    """
+    Read-only status endpoint for the data collection pipeline.
+    """
+    db = get_database()
+
+    hist_ohlcv_count = await db["historical_ohlcv"].count_documents({})
+    hsc_count = await db["historical_scored_candidates"].count_documents({})
+    ds_count = await db["daily_trade_dataset"].count_documents({})
+    ls_count = await db["scored_candidates"].count_documents({})
+
+    first = await db["historical_ohlcv"].find({}).sort("candle_open_at", 1).limit(1).to_list(1)
+    last = await db["historical_ohlcv"].find({}).sort("candle_open_at", -1).limit(1).to_list(1)
+
+    dup_hsc = await db["historical_scored_candidates"].aggregate([{"$group": {"_id": "$historical_candidate_id", "count": {"$sum": 1}}}, {"$match": {"count": {"$gt": 1}}}]).to_list(None)
+    dup_ds = await db["daily_trade_dataset"].aggregate([{"$group": {"_id": "$identity.dataset_id", "count": {"$sum": 1}}}, {"$match": {"count": {"$gt": 1}}}]).to_list(None)
+
+    latest_run = await db["dataset_build_runs"].find({"run_type": "DATA_COLLECTION_ONLY"}).sort("created_at", -1).limit(1).to_list(1)
+
+    pending_labels = await db["daily_trade_dataset"].count_documents({"ml_label.label_state": "PENDING"})
+
+    # Exclude _id to ensure JSON serializability
+    latest_run_doc = latest_run[0] if latest_run else None
+    if latest_run_doc and "_id" in latest_run_doc:
+        latest_run_doc["_id"] = str(latest_run_doc["_id"])
+
+    return {
+        "historical_ohlcv_count": hist_ohlcv_count,
+        "historical_scored_candidates_count": hsc_count,
+        "daily_trade_dataset_count": ds_count,
+        "live_scored_candidates_count": ls_count,
+        "date_coverage": {
+            "from": first[0]["candle_open_at"] if first else None,
+            "to": last[0]["candle_open_at"] if last else None
+        },
+        "duplicate_counts": {
+            "historical_scored_candidates": len(dup_hsc),
+            "daily_trade_dataset": len(dup_ds)
+        },
+        "label_pending_count": pending_labels,
+        "export_ready_count": 0,
+        "latest_collection_run": latest_run_doc
+    }

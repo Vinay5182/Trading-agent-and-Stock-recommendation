@@ -173,6 +173,57 @@ PAPER_UPDATE_APPROVED_FIELDS = {
     "margin_released_total",
     "capital_rejection_reason",
 }
+
+
+def should_update_daily_dataset_outcome_from_paper_trade(trade: dict) -> bool:
+    statuses = trade_statuses(trade)
+    if statuses & TERMINAL_STATUSES:
+        return True
+    if trade.get("journal_pending") or trade.get("journal_status") == "PENDING":
+        return True
+    if trade.get("journal_status") == "JOURNALED" or trade.get("journal_paper_trade_id") or trade.get("trade_journal_id"):
+        return True
+    return False
+
+
+async def best_effort_update_daily_dataset_from_paper_trade(
+    db,
+    trade: dict,
+    *,
+    audit_time: str | None = None,
+    link_source: str = "paper_route",
+) -> dict:
+    try:
+        from services.daily_dataset import (
+            update_daily_dataset_from_paper_trade,
+            update_daily_dataset_outcome_from_paper_trade,
+        )
+
+        result = await update_daily_dataset_from_paper_trade(
+            db,
+            trade,
+            audit_time=audit_time,
+            link_source=link_source,
+        )
+        if should_update_daily_dataset_outcome_from_paper_trade(trade):
+            result["outcome_update"] = await update_daily_dataset_outcome_from_paper_trade(
+                db,
+                trade,
+                audit_time=audit_time,
+                link_source=f"{link_source}_outcome",
+            )
+        return result
+    except Exception as exc:  # pragma: no cover - defensive production guard
+        logger.warning("daily_trade_dataset paper side effect failed: %s", exc, exc_info=True)
+        return {
+            "processed_count": 1,
+            "updated_count": 0,
+            "unmatched_count": 0,
+            "skipped_count": 0,
+            "error_count": 1,
+            "status_counts": {},
+            "validation_errors": [{"paper_trade_id": trade.get("_id"), "errors": [f"{type(exc).__name__}: {exc}"]}],
+        }
 PAPER_UPDATE_PROGRESS = {
     "running": False,
     "mode": "idle",
@@ -1854,6 +1905,80 @@ def fetch_tradingview_candles_sync(symbol: str, timeframe: str, *, min_candles: 
     return {"candles": candles, "diagnostics": getattr(client, "diagnostics", {})}
 
 
+def apply_paper_plan_ai_gate_if_ready(plan: dict, signal: dict) -> None:
+    hard_gate_enabled = bool(getattr(settings, "PAPER_AI_HARD_GATE_ENABLED", False))
+    plan["ai_gate_mode"] = "HARD" if hard_gate_enabled else "ADVISORY"
+    try:
+        from ml import predict as ml_predict
+
+        if getattr(ml_predict, "_loaded_meta", None) is None:
+            ml_predict.load_latest_model()
+        meta = getattr(ml_predict, "_loaded_meta", None) or {}
+        feature_names = [str(name) for name in meta.get("features") or [] if name]
+    except Exception as exc:
+        plan["ai_gate_decision"] = "SKIPPED"
+        plan["ai_gate_reason"] = f"Model unavailable: {type(exc).__name__}"
+        logger.info("Paper plan AI gate skipped: model unavailable (%s)", type(exc).__name__)
+        return
+
+    if not feature_names:
+        plan["ai_gate_decision"] = "SKIPPED"
+        plan["ai_gate_reason"] = "Model metadata has no feature list"
+        logger.info("Paper plan AI gate skipped: model metadata has no feature list")
+        return
+
+    feature_source = {**signal, **plan}
+    feature_row = {}
+    missing_features = []
+    invalid_features = []
+    for name in feature_names:
+        value = feature_source.get(name)
+        if value in (None, ""):
+            missing_features.append(name)
+            continue
+        try:
+            feature_row[name] = float(value)
+        except (TypeError, ValueError):
+            invalid_features.append(name)
+
+    if missing_features or invalid_features:
+        plan["ai_gate_decision"] = "SKIPPED"
+        plan["ai_gate_reason"] = "Model features incomplete"
+        plan["ai_gate_missing_features"] = missing_features
+        plan["ai_gate_invalid_features"] = invalid_features
+        logger.info(
+            "Paper plan AI gate skipped: missing_features=%s invalid_features=%s",
+            missing_features,
+            invalid_features,
+        )
+        return
+
+    try:
+        ai_result = ml_predict.predict_outcome(feature_row)
+    except Exception as exc:
+        plan["ai_gate_decision"] = "SKIPPED"
+        plan["ai_gate_reason"] = f"Prediction failed: {type(exc).__name__}"
+        logger.warning("Paper plan AI gate skipped: prediction failed for %s: %s", plan.get("symbol"), exc)
+        return
+
+    prediction = ai_result.get("prediction")
+    confidence = ai_result.get("confidence")
+    plan["ai_prediction"] = prediction
+    plan["ai_confidence"] = confidence
+    plan["ai_gate_prediction"] = prediction
+    plan["ai_gate_confidence"] = confidence
+    if ai_result.get("prediction") != "WIN":
+        plan["ai_gate_decision"] = "REJECTED"
+        plan["ai_gate_reason"] = "Model predicted non-WIN"
+        plan["ai_reason"] = "Model predicted non-WIN" if hard_gate_enabled else "Advisory only: Model predicted non-WIN"
+        if hard_gate_enabled:
+            plan["status"] = "AI_REJECTED"
+    else:
+        plan["ai_gate_decision"] = "PASSED"
+        plan["ai_gate_reason"] = "Model predicted WIN"
+        plan["ai_reason"] = "OK"
+
+
 async def atomic_insert_paper_trade_plan(db, plan: dict) -> tuple[dict, bool]:
     identity_plan = apply_setup_identity(plan)
     identity = paper_trade_setup_filter(identity_plan)
@@ -1865,7 +1990,17 @@ async def atomic_insert_paper_trade_plan(db, plan: dict) -> tuple[dict, bool]:
         )
     except DuplicateKeyError:
         return identity_plan, False
-    return identity_plan, getattr(result, "upserted_id", None) is not None
+    inserted = getattr(result, "upserted_id", None) is not None
+    if inserted:
+        find_one = getattr(db.paper_trades, "find_one", None)
+        persisted_trade = await find_one(identity) if callable(find_one) else None
+        await best_effort_update_daily_dataset_from_paper_trade(
+            db,
+            persisted_trade or identity_plan,
+            audit_time=identity_plan.get("updated_at") or datetime.utcnow().isoformat(),
+            link_source="paper_plan_insert",
+        )
+    return identity_plan, inserted
 
 
 def calculate_pnl(plan: dict, latest_close: float, exit_price: float | None) -> tuple[float, float]:
@@ -2480,8 +2615,8 @@ async def build_paper_plans(
         candles = tv_result["candles"]
         plan = build_plan_from_candles(signal, candles, paper_capital, risk_percent)
         if plan:
+            apply_paper_plan_ai_gate_if_ready(plan, signal)
             plans.append(plan)
-
     upserted_count = 0
     modified_count = 0
     if save and plans:
@@ -2983,9 +3118,16 @@ async def run_paper_trade_update(
                     errors.append(error)
                     proposal_result.update({"error": message, **error})
                 updated_count += modified
+                merged_trade = {**plan, **update}
+                if modified > 0:
+                    proposal_result["daily_dataset_update"] = await best_effort_update_daily_dataset_from_paper_trade(
+                        db,
+                        merged_trade,
+                        audit_time=update.get("status_updated_at") or update.get("updated_at") or datetime.utcnow().isoformat(),
+                        link_source="paper_trade_update",
+                    )
                 if modified > 0 and is_completed_trade({**plan, **update}):
                     try:
-                        merged_trade = {**plan, **update}
                         proposal_result["journal"] = await journal_completed_trade(db, merged_trade)
                         await mark_trade_journal_result(db, merged_trade, proposal_result["journal"])
                     except Exception as exc:
@@ -3414,6 +3556,12 @@ async def approve_paper_trade_update(
             updated_count += modified_count
             journal_result = None
             merged_trade = {**current_trades[trade_id], **proposed_update}
+            daily_dataset_update = await best_effort_update_daily_dataset_from_paper_trade(
+                db,
+                merged_trade,
+                audit_time=proposed_update.get("status_updated_at") or proposed_update.get("updated_at") or datetime.utcnow().isoformat(),
+                link_source="paper_update_approval",
+            )
             if is_completed_trade(merged_trade):
                 try:
                     journal_result = await journal_completed_trade(db, merged_trade)
@@ -3434,6 +3582,7 @@ async def approve_paper_trade_update(
                     "write_attempted": True,
                     "applied_update": proposed_update,
                     "journal": journal_result,
+                    "daily_dataset_update": daily_dataset_update,
                 }
             )
 
@@ -3829,6 +3978,7 @@ async def audit_and_fix_waiting_trades(db, *, apply: bool = False, limit: int = 
             would_update += int(should_update)
             modified = 0
             journal_result = None
+            daily_dataset_update = None
             if apply and should_update:
                 original_status = str(trade.get("status") or "").upper()
                 proposed_status = str(update.get("status") or "").upper()
@@ -3851,8 +4001,15 @@ async def audit_and_fix_waiting_trades(db, *, apply: bool = False, limit: int = 
                     )
                     modified = int(getattr(result, "modified_count", 0))
                 updated_count += modified
+                merged_trade = {**trade, **update}
+                if modified > 0:
+                    daily_dataset_update = await best_effort_update_daily_dataset_from_paper_trade(
+                        db,
+                        merged_trade,
+                        audit_time=update.get("status_updated_at") or update.get("updated_at") or datetime.utcnow().isoformat(),
+                        link_source="paper_waiting_trade_audit",
+                    )
                 if modified > 0 and is_completed_trade({**trade, **update}):
-                    merged_trade = {**trade, **update}
                     journal_result = await journal_completed_trade(db, merged_trade)
                     await mark_trade_journal_result(db, merged_trade, journal_result)
             audit_row = {
@@ -3876,6 +4033,8 @@ async def audit_and_fix_waiting_trades(db, *, apply: bool = False, limit: int = 
                 "reason": proposed_update_reason(trade, update) if update else audit_reason_for_market_data(trade, market_row, latest),
                 "journal": journal_result,
             }
+            if daily_dataset_update is not None:
+                audit_row["daily_dataset_update"] = daily_dataset_update
             rows.append(audit_row)
             if modified > 0:
                 affected_trades.append(audit_row)
@@ -3949,6 +4108,7 @@ async def reaudit_active_entry_evidence(
             reason = active_entry_evidence_reason(trade, latest)
             should_revert = reason != "ENTRY_CONFIRMED_BY_SNAPSHOT"
             modified = 0
+            daily_dataset_update = None
             if apply and should_revert:
                 update = {
                     "latest_close": latest.get("close") if latest else trade.get("latest_close"),
@@ -3974,6 +4134,13 @@ async def reaudit_active_entry_evidence(
                 )
                 modified = int(getattr(result, "modified_count", 0))
                 updated_count += modified
+                if modified > 0:
+                    daily_dataset_update = await best_effort_update_daily_dataset_from_paper_trade(
+                        db,
+                        {**trade, **update},
+                        audit_time=for_update_now,
+                        link_source="paper_active_entry_reaudit",
+                    )
             row = {
                 "trade_id": str(trade.get("_id")) if trade.get("_id") is not None else None,
                 "setup_id": trade.get("setup_id"),
@@ -3989,6 +4156,8 @@ async def reaudit_active_entry_evidence(
                 "would_revert": should_revert,
                 "updated": modified > 0,
             }
+            if daily_dataset_update is not None:
+                row["daily_dataset_update"] = daily_dataset_update
             rows.append(row)
             if modified > 0:
                 affected_trades.append(row)
@@ -4111,6 +4280,15 @@ async def run_automatic_outcome_update(
                             modified = int(getattr(result, "modified_count", 0))
                     updated_count += modified
                     journal_result = None
+                    daily_dataset_update = None
+                    merged_trade = {**trade, **update}
+                    if modified > 0 and not dry_run:
+                        daily_dataset_update = await best_effort_update_daily_dataset_from_paper_trade(
+                            db,
+                            merged_trade,
+                            audit_time=update.get("status_updated_at") or update.get("updated_at") or datetime.utcnow().isoformat(),
+                            link_source="paper_auto_outcome_update",
+                        )
                     if modified > 0 and is_completed_trade({**trade, **update}):
                         if dry_run:
                             journal_result = {
@@ -4120,20 +4298,20 @@ async def run_automatic_outcome_update(
                                 "symbol": trade.get("symbol"),
                             }
                         else:
-                            merged_trade = {**trade, **update}
                             journal_result = await journal_completed_trade(db, merged_trade)
                             await mark_trade_journal_result(db, merged_trade, journal_result)
-                    results.append(
-                        {
-                            "symbol": trade.get("symbol"),
-                            "previous_status": trade.get("status"),
-                            "status": update.get("status", trade.get("status")),
-                            "updated": modified > 0,
-                            "reason": proposed_update_reason(trade, update),
-                            "market_data_updated_at": market_row.get("updated_at") if market_row else None,
-                            "journal": journal_result,
-                        }
-                    )
+                    result_row = {
+                        "symbol": trade.get("symbol"),
+                        "previous_status": trade.get("status"),
+                        "status": update.get("status", trade.get("status")),
+                        "updated": modified > 0,
+                        "reason": proposed_update_reason(trade, update),
+                        "market_data_updated_at": market_row.get("updated_at") if market_row else None,
+                        "journal": journal_result,
+                    }
+                    if daily_dataset_update is not None:
+                        result_row["daily_dataset_update"] = daily_dataset_update
+                    results.append(result_row)
                 except Exception as exc:
                     logger.exception("Automatic outcome update failed for symbol=%s", trade.get("symbol"))
                     await record_system_error(
@@ -4576,18 +4754,29 @@ async def update_pipeline_plans(
                 continue
             updated_count += modified
         journal_result = None
+        daily_dataset_update = None
+        merged_trade = {**plan, **update}
+        if modified > 0:
+            daily_dataset_update = await best_effort_update_daily_dataset_from_paper_trade(
+                db,
+                merged_trade,
+                audit_time=update.get("status_updated_at") or update.get("updated_at") or datetime.utcnow().isoformat(),
+                link_source="paper_pipeline_update",
+            )
         if modified > 0 and is_completed_trade({**plan, **update}):
             try:
-                merged_trade = {**plan, **update}
                 journal_result = await journal_completed_trade(db, merged_trade)
                 await mark_trade_journal_result(db, merged_trade, journal_result)
             except Exception as exc:
                 results.append({"symbol": plan["symbol"], "status": update.get("status", plan["status"]), "updated": True, "journal_error": str(exc)})
                 continue
-        results.append({
+        result_row = {
             "symbol": plan["symbol"],
             "status": update.get("status", plan["status"]),
             "updated": bool(modified),
             "journal": journal_result,
-        })
+        }
+        if daily_dataset_update is not None:
+            result_row["daily_dataset_update"] = daily_dataset_update
+        results.append(result_row)
     return {"processed": processed, "updated_count": updated_count, "results": results}

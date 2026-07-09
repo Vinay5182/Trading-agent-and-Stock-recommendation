@@ -462,39 +462,24 @@ async def get_swing_tv_confirmed(
     timeframes: str | None = Query(default=None),
     timeframe: str | None = Query(default=None),
     limit: int | None = Query(default=None, ge=1),
+    detail: str = Query(default="compact"),
 ) -> dict:
+    from services.tv_saved_results import load_current_scoped_saved_tv_results
+
     clean_index = clean_index_name(index_name)
     checked_timeframes = parse_timeframes(timeframes, timeframe) if (timeframes or timeframe) else None
-    query = {"index_name": clean_index}
-    if checked_timeframes:
-        query["timeframes_hash"] = timeframes_hash(checked_timeframes)
     db = get_database()
-    cursor = db.swing_tv_confirmations.find(query).sort([("updated_at", -1), ("symbol", 1)])
-    seen = set()
-    deduped_rows = []
-    async for row in cursor:
-        row.pop("_id", None)
-        row = serialize_swing_confirmation_row(row)
-        key = (
-            row.get("symbol"),
-            row.get("tradingview_symbol"),
-            row.get("index_name"),
-            row.get("timeframes_hash"),
-        )
-        if key not in seen:
-            seen.add(key)
-            deduped_rows.append(row)
-    saved_rows_count = len(seen)
-    if limit is not None:
-        deduped_rows = deduped_rows[:limit]
-    response = {
-        "index_name": clean_index,
-        "limit": limit,
-        "saved_rows_count": saved_rows_count,
-        "count": len(deduped_rows),
-        "rows": deduped_rows,
-    }
-    if checked_timeframes:
-        response["timeframes_checked"] = checked_timeframes
-        response["timeframes_hash"] = timeframes_hash(checked_timeframes)
-    return response
+    return await load_current_scoped_saved_tv_results(
+        db=db,
+        strategy_type="swing",
+        index_name=clean_index,
+        candidate_query=swing_candidate_query(clean_index),
+        candidate_projection=SWING_CANDIDATE_FIELDS,
+        candidate_sort=[("score", -1), ("traded_value", -1), ("relative_volume", -1), ("symbol", 1)],
+        confirmation_collection_name="swing_tv_confirmations",
+        serialize_row=serialize_swing_confirmation_row,
+        timeframes_hash=timeframes_hash(checked_timeframes) if checked_timeframes else None,
+        timeframes_checked=checked_timeframes,
+        limit=limit,
+        detail=detail,
+    )

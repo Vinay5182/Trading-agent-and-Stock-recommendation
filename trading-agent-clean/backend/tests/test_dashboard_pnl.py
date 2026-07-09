@@ -152,6 +152,8 @@ def test_dashboard_uses_journal_realized_pnl_and_open_margin_formulas(monkeypatc
     result = asyncio.run(dashboard.get_paper_equity())
 
     assert result["starting_virtual_balance"] == 250000.0
+    assert result["starting_virtual_capital"] == 250000.0
+    assert result["starting_virtual_capital"] == result["starting_virtual_balance"]
     assert result["realized_pnl"] == 210.0
     assert result["current_virtual_balance"] == 250210.0
     assert result["effective_exposure"] == 14000.0
@@ -209,6 +211,8 @@ def test_dashboard_empty_data_returns_zero_metrics(monkeypatch) -> None:
     result = asyncio.run(dashboard.get_paper_equity())
 
     assert result["starting_virtual_balance"] == 250000.0
+    assert result["starting_virtual_capital"] == 250000.0
+    assert result["starting_virtual_capital"] == result["starting_virtual_balance"]
     assert result["realized_pnl"] == 0.0
     assert result["current_virtual_balance"] == 250000.0
     assert result["open_margin_used"] == 0.0

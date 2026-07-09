@@ -445,7 +445,94 @@ def test_build_paper_plans_concurrent_calls_create_one_logical_trade(monkeypatch
     assert sum(response["upserted_count"] for response in responses) == 1
     assert rows[0]["status"] == "WAITING_FOR_ENTRY"
     assert rows[0]["setup_id"]
+    assert rows[0]["ai_gate_mode"] == "ADVISORY"
     assert all("$set" not in update for _query, update, upsert in db.paper_trades.update_calls if upsert)
+
+
+def test_paper_ai_gate_is_advisory_by_default_and_preserves_prediction(monkeypatch) -> None:
+    import ml.predict as ml_predict
+    import ml.train as ml_train
+
+    feature_names = ["rule_score", "trend_score", "momentum_score", "volume_score", "risk_score"]
+    signal = paper_signal_row("ADVISORY")
+    signal.update({name: index + 1 for index, name in enumerate(feature_names)})
+    plan = paper.build_plan_from_candles(signal, build_plan_candles(), 500000, 1)
+    settings_override = {**vars(paper.settings), "PAPER_AI_HARD_GATE_ENABLED": False}
+    monkeypatch.setattr(paper, "settings", SimpleNamespace(**settings_override))
+    monkeypatch.setattr(ml_predict, "_loaded_meta", {"features": feature_names})
+
+    def fake_predict(feature_row: dict) -> dict:
+        assert set(feature_row) == set(feature_names)
+        return {"prediction": "LOSS", "confidence": {"LOSS": 0.9, "WIN": 0.1}}
+
+    training_called = False
+
+    async def fake_train():
+        nonlocal training_called
+        training_called = True
+        return {}
+
+    monkeypatch.setattr(ml_predict, "predict_outcome", fake_predict)
+    monkeypatch.setattr(ml_train, "run_model_training", fake_train)
+
+    paper.apply_paper_plan_ai_gate_if_ready(plan, signal)
+
+    assert plan["status"] == "WAITING_FOR_ENTRY"
+    assert plan["ai_gate_mode"] == "ADVISORY"
+    assert plan["ai_gate_decision"] == "REJECTED"
+    assert plan["ai_gate_prediction"] == "LOSS"
+    assert plan["ai_gate_confidence"] == {"LOSS": 0.9, "WIN": 0.1}
+    assert plan["ai_reason"] == "Advisory only: Model predicted non-WIN"
+    assert training_called is False
+
+
+def test_paper_ai_gate_can_hard_reject_only_when_enabled_and_ready(monkeypatch) -> None:
+    import ml.predict as ml_predict
+
+    feature_names = ["rule_score", "trend_score", "momentum_score", "volume_score", "risk_score"]
+    signal = paper_signal_row("HARDGATE")
+    signal.update({name: index + 1 for index, name in enumerate(feature_names)})
+    plan = paper.build_plan_from_candles(signal, build_plan_candles(), 500000, 1)
+    settings_override = {**vars(paper.settings), "PAPER_AI_HARD_GATE_ENABLED": True}
+    monkeypatch.setattr(paper, "settings", SimpleNamespace(**settings_override))
+    monkeypatch.setattr(ml_predict, "_loaded_meta", {"features": feature_names})
+    monkeypatch.setattr(
+        ml_predict,
+        "predict_outcome",
+        lambda _features: {"prediction": "LOSS", "confidence": {"LOSS": 0.8, "WIN": 0.2}},
+    )
+
+    paper.apply_paper_plan_ai_gate_if_ready(plan, signal)
+
+    assert plan["status"] == "AI_REJECTED"
+    assert plan["ai_gate_mode"] == "HARD"
+    assert plan["ai_gate_decision"] == "REJECTED"
+    assert plan["ai_gate_prediction"] == "LOSS"
+
+
+def test_missing_ai_features_do_not_block_paper_trade_when_hard_gate_off(monkeypatch) -> None:
+    import ml.predict as ml_predict
+
+    feature_names = ["rule_score", "trend_score", "momentum_score", "volume_score", "risk_score"]
+    signal = paper_signal_row("MISSINGAI")
+    signal["rule_score"] = None
+    plan = paper.build_plan_from_candles(signal, build_plan_candles(), 500000, 1)
+    settings_override = {**vars(paper.settings), "PAPER_AI_HARD_GATE_ENABLED": False}
+    monkeypatch.setattr(paper, "settings", SimpleNamespace(**settings_override))
+    monkeypatch.setattr(ml_predict, "_loaded_meta", {"features": feature_names})
+    monkeypatch.setattr(
+        ml_predict,
+        "predict_outcome",
+        lambda _features: (_ for _ in ()).throw(AssertionError("prediction should not run with incomplete features")),
+    )
+
+    paper.apply_paper_plan_ai_gate_if_ready(plan, signal)
+
+    assert plan["status"] == "WAITING_FOR_ENTRY"
+    assert plan["ai_gate_mode"] == "ADVISORY"
+    assert plan["ai_gate_decision"] == "SKIPPED"
+    assert plan["ai_gate_reason"] == "Model features incomplete"
+    assert "rule_score" in plan["ai_gate_missing_features"]
 
 
 def test_upsert_paper_plans_concurrent_calls_create_one_logical_trade(monkeypatch) -> None:

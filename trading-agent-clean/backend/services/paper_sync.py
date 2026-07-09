@@ -6,6 +6,7 @@ from math import floor
 from pymongo.errors import DuplicateKeyError
 
 from database import get_database
+from services.daily_dataset import aggregate_daily_dataset_update_results, update_daily_dataset_from_paper_trade
 from services.paper_identity import (
     apply_setup_identity,
     legacy_paper_trade_identity,
@@ -54,6 +55,27 @@ TERMINAL_STATUSES = {
 SYNC_STATUS = "WAITING_FOR_ENTRY"
 logger = logging.getLogger("uvicorn.error")
 _SYNC_LOCK = asyncio.Lock()
+
+
+async def _best_effort_update_daily_dataset_from_trade(db, trade: dict, *, audit_time: str, link_source: str) -> dict:
+    try:
+        return await update_daily_dataset_from_paper_trade(
+            db,
+            trade,
+            audit_time=audit_time,
+            link_source=link_source,
+        )
+    except Exception as exc:  # pragma: no cover - defensive production guard
+        logger.warning("daily_trade_dataset paper sync side effect failed: %s", exc, exc_info=True)
+        return {
+            "processed_count": 1,
+            "updated_count": 0,
+            "unmatched_count": 0,
+            "skipped_count": 0,
+            "error_count": 1,
+            "status_counts": {},
+            "validation_errors": [{"paper_trade_id": trade.get("_id"), "errors": [f"{type(exc).__name__}: {exc}"]}],
+        }
 
 
 def _clean_grade(value: object) -> str:
@@ -332,6 +354,7 @@ async def sync_trade_ready(index_name: str = "BROAD_MARKET_750", db_override=Non
         now = datetime.now(timezone.utc).isoformat()
         signals_upserted = signals_updated = trades_upserted = 0
         existing_protected = completed_protected = 0
+        daily_dataset_updates = []
 
         for row, source_signal_type, source_collection in trade_ready_rows:
             try:
@@ -389,7 +412,18 @@ async def sync_trade_ready(index_name: str = "BROAD_MARKET_750", db_override=Non
                         {"$setOnInsert": trade},
                         upsert=True,
                     )
-                    trades_upserted += 1 if getattr(result, "upserted_id", None) is not None else 0
+                    inserted = getattr(result, "upserted_id", None) is not None
+                    trades_upserted += 1 if inserted else 0
+                    if inserted:
+                        persisted_trade = await db.paper_trades.find_one(trade_identity) or trade
+                        daily_dataset_updates.append(
+                            await _best_effort_update_daily_dataset_from_trade(
+                                db,
+                                persisted_trade,
+                                audit_time=now,
+                                link_source="paper_sync",
+                            )
+                        )
                 else:
                     trades_upserted += 1
             except DuplicateKeyError:
@@ -421,6 +455,8 @@ async def sync_trade_ready(index_name: str = "BROAD_MARKET_750", db_override=Non
             "identity_fields": ["setup_id", "paper_only"],
             "message": f"Synced {len(trade_ready_rows)} Trade Ready setups into Paper Trades.",
         }
+        if daily_dataset_updates:
+            result["daily_dataset_update"] = aggregate_daily_dataset_update_results(daily_dataset_updates)
         logger.info(
             "sync_trade_ready() complete rows found=%d rows inserted=%d rows skipped=%d duplicates=%d completed protected=%d",
             len(trade_ready_rows),

@@ -9,6 +9,28 @@ from typing import Any, Iterable, Mapping
 
 from services.migration_safety import safe_json_value
 from services.paper_identity import canonical_setup_id, clean_symbol
+from ai.indicator_primitives import (
+    _number,
+    _first_number_from_fields,
+    _breakdown_sum,
+    _average,
+    _ema,
+    _atr,
+    _rsi,
+    _percent,
+    _return_percent,
+    _parse_time,
+    _round,
+    TREND_BREAKDOWN_KEYS,
+    VOLUME_BREAKDOWN_KEYS,
+    canonicalise_column_names,
+    resolve_scores,
+)
+from ai.trade_status import (
+    WIN_STATUSES,
+    LOSS_STATUSES,
+    CLOSED_TRADE_STATUSES,
+)
 
 
 DECISION_OUTCOME_DATASET_VERSION = "data4a-preview-v1"
@@ -45,27 +67,7 @@ OPEN_TRADE_STATUSES = {
     "T2_PARTIAL",
     "TARGET_1_HIT",
 }
-WIN_STATUSES = {
-    "T1_HIT",
-    "T2_HIT",
-    "T3_HIT",
-    "TARGET_HIT",
-    "TARGET_1_HIT",
-    "TARGET_1_HIT_FINAL",
-    "TARGET_2_HIT",
-    "TARGET_3_HIT",
-    "WON_T1",
-    "WON_T2",
-    "WON_T3",
-}
-LOSS_STATUSES = {
-    "LOST_SL",
-    "SL_HIT",
-    "STOP_HIT",
-    "STOPPED",
-    "STOPPED_AFTER_T1",
-    "STOP_LOSS_HIT",
-}
+
 OUTPUT_BUCKETS = (
     "REJECTED_PRICE_UP",
     "REJECTED_PRICE_DOWN",
@@ -171,43 +173,9 @@ def _upper(value: Any) -> str:
     return _text(value).upper()
 
 
-def _number(value: Any) -> float | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        number = float(value)
-        return number if math.isfinite(number) else None
-    try:
-        text = str(value).replace(",", "").strip()
-        if not text:
-            return None
-        number = float(text)
-        return number if math.isfinite(number) else None
-    except (TypeError, ValueError):
-        return None
 
 
-def _first_number(row: Mapping[str, Any], fields: Iterable[str]) -> float | None:
-    for field in fields:
-        number = _number(row.get(field))
-        if number is not None:
-            return number
-    return None
 
-
-def _parse_time(value: Any) -> datetime | None:
-    if value in (None, ""):
-        return None
-    if isinstance(value, datetime):
-        dt = value
-    else:
-        try:
-            dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
-        except Exception:
-            return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt.astimezone(UTC)
 
 
 def _iso(value: Any) -> str | None:
@@ -350,69 +318,34 @@ def _status_for_source(row: Mapping[str, Any], *, event_source: str, strategy_ty
 
 
 
-def _breakdown_sum(breakdown: Mapping[str, Any], keys: tuple[str, ...]) -> float | int | None:
-    values = []
-    for key in keys:
-        val = breakdown.get(key)
-        if val is not None and val != "":
-            try:
-                values.append(float(val))
-            except (TypeError, ValueError):
-                pass
-    if not values:
-        return None
-    total = sum(values)
-    return int(total) if float(total).is_integer() else total
+
 
 
 def _score_fields(row: Mapping[str, Any], strategy_type: str | None = None) -> dict[str, Any]:
     fields = (
         "score",
         "nse_score",
-        "momentum_score",
         "swing_score",
         "confidence_score",
-        "risk_score",
         "rr",
         "risk_reward",
         "risk_reward_1",
         "paper_rr_1",
     )
     scores = {field: row.get(field) for field in fields if row.get(field) not in (None, "")}
-    breakdown = row.get("score_breakdown")
     
-    # Try to derive trend_score and volume_score from breakdown
-    if isinstance(breakdown, Mapping) and strategy_type:
-        strat = strategy_type.lower()
-        sub_breakdown = breakdown.get(strat)
-        if not isinstance(sub_breakdown, Mapping):
-            # Fallback to key checks
-            sub_breakdown = {}
-            for key in ("swing", "momentum"):
-                if isinstance(breakdown.get(key), Mapping):
-                    sub_breakdown = breakdown[key]
-                    break
-            if not sub_breakdown:
-                sub_breakdown = breakdown
-                
-        trend_keys = {
-            "swing": ("price_strength", "near_day_high", "thirty_day_momentum", "above_open", "above_previous_close"),
-            "momentum": ("price_strength", "near_high", "thirty_day_momentum", "clean_price_behavior"),
-        }.get(strat, ())
-        
-        volume_keys = {
-            "swing": ("traded_value", "relative_volume"),
-            "momentum": ("liquidity",),
-        }.get(strat, ())
-        
-        trend_score = _breakdown_sum(sub_breakdown, trend_keys)
-        volume_score = _breakdown_sum(sub_breakdown, volume_keys)
-        
-        if trend_score is not None:
-            scores["trend_score"] = trend_score
-        if volume_score is not None:
-            scores["volume_score"] = volume_score
+    resolved = resolve_scores(
+        scored_candidate=row,
+        tv_confirmation=row,
+        strategy_type=strategy_type,
+        paper_signal=row,
+        paper_trade=row,
+    )
+    for k, v in resolved.items():
+        if v is not None:
+            scores[k] = v
 
+    breakdown = row.get("score_breakdown")
     if isinstance(breakdown, Mapping):
         scores["score_breakdown"] = safe_json_value(dict(breakdown))
     return scores
@@ -420,11 +353,11 @@ def _score_fields(row: Mapping[str, Any], strategy_type: str | None = None) -> d
 
 def _entry_plan(row: Mapping[str, Any]) -> dict[str, float | None]:
     return {
-        "entry": _first_number(row, ("entry_price", "entry", "paper_entry_price")),
-        "stop_loss": _first_number(row, ("stop_loss", "sl", "initial_stop_loss", "paper_stop_loss")),
-        "target_1": _first_number(row, ("target_1", "t1", "paper_target_1")),
-        "target_2": _first_number(row, ("target_2", "t2", "paper_target_2")),
-        "target_3": _first_number(row, ("target_3", "t3", "paper_target_3")),
+        "entry": _first_number_from_fields(row, ("entry_price", "entry", "paper_entry_price")),
+        "stop_loss": _first_number_from_fields(row, ("stop_loss", "sl", "initial_stop_loss", "paper_stop_loss")),
+        "target_1": _first_number_from_fields(row, ("target_1", "t1", "paper_target_1")),
+        "target_2": _first_number_from_fields(row, ("target_2", "t2", "paper_target_2")),
+        "target_3": _first_number_from_fields(row, ("target_3", "t3", "paper_target_3")),
     }
 
 
@@ -656,69 +589,7 @@ def _decision_index(candles: list[Mapping[str, Any]], decision_time: Any) -> int
     return selected
 
 
-def _average(values: list[float]) -> float | None:
-    clean = [value for value in values if value is not None and math.isfinite(value)]
-    return sum(clean) / len(clean) if clean else None
 
-
-def _ema(values: list[float], period: int) -> float | None:
-    if len(values) < period:
-        return None
-    alpha = 2 / (period + 1)
-    ema = sum(values[:period]) / period
-    for value in values[period:]:
-        ema = (value - ema) * alpha + ema
-    return ema
-
-
-def _atr(candles: list[Mapping[str, Any]], period: int = 14) -> float | None:
-    if len(candles) < period + 1:
-        return None
-    ranges = []
-    for index in range(1, len(candles)):
-        high = _number(candles[index].get("high"))
-        low = _number(candles[index].get("low"))
-        prev_close = _number(candles[index - 1].get("close"))
-        if high is None or low is None or prev_close is None:
-            continue
-        ranges.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
-    return _average(ranges[-period:])
-
-
-def _rsi(closes: list[float], period: int = 14) -> float | None:
-    if len(closes) < period + 1:
-        return None
-    changes = [closes[index] - closes[index - 1] for index in range(1, len(closes))]
-    window = changes[-period:]
-    gains = [max(change, 0.0) for change in window]
-    losses = [abs(min(change, 0.0)) for change in window]
-    avg_gain = _average(gains)
-    avg_loss = _average(losses)
-    if avg_gain is None or avg_loss is None:
-        return None
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-
-def _percent(numerator: float | None, denominator: float | None) -> float | None:
-    if numerator is None or denominator in (None, 0):
-        return None
-    return (numerator / denominator) * 100
-
-
-def _return_percent(start: float | None, end: float | None) -> float | None:
-    if start in (None, 0) or end is None:
-        return None
-    return ((end - start) / start) * 100
-
-
-def _round(value: Any, digits: int = 6) -> Any:
-    number = _number(value)
-    if number is None:
-        return value
-    return round(number, digits)
 
 
 def _context_fields(candles: list[Mapping[str, Any]], decision_index: int | None) -> tuple[dict[str, Any], list[str]]:
@@ -1051,6 +922,7 @@ async def build_decision_outcome_preview_from_db(
             "missing_fields": context_missing + outcome_missing,
             "usable": bucket not in {"INCOMPLETE"} and outcome.get("price_at_decision") is not None,
         }
+        row = canonicalise_column_names(row)
         rows.append(safe_json_value(row))
 
     buckets = Counter(row["final_outcome_bucket"] for row in rows)
@@ -1195,3 +1067,161 @@ def _recommendation(usable: int, incomplete: int, buckets: Counter[str]) -> dict
         "populated_core_buckets": populated,
         "minimum_recommended_usable_rows": 25,
     }
+
+
+def derive_ohlcv_future_outcome(
+    row: Mapping[str, Any],
+    ohlcv_rows: list[dict[str, Any]],
+    horizon_days: int = 10,
+    min_move_pct: float = 1.0,
+    flat_move_pct: float = 0.25,
+) -> dict[str, Any]:
+    from ai.daily_dataset_contract import (
+        OUTCOME_INSUFFICIENT_DATA, OUTCOME_READY, OUTCOME_EXCLUDED,
+        ACTION_WAIT_FOR_PULLBACK, ACTION_NO_TRADE, ACTION_STRATEGY_REJECTED, ACTION_TECHNICAL_FAILED,
+        LABEL_EXCLUDED,
+        LABEL_PULLBACK_CAME_THEN_WENT_UP, LABEL_PULLBACK_CAME_THEN_WENT_DOWN,
+        LABEL_NO_PULLBACK_WENT_UP, LABEL_NO_PULLBACK_WENT_DOWN,
+        LABEL_NO_TRADE_WENT_UP, LABEL_NO_TRADE_WENT_DOWN,
+        LABEL_REJECTED_WENT_UP, LABEL_REJECTED_WENT_DOWN,
+    )
+
+    result = {
+        "future_return_1d": None,
+        "future_return_3d": None,
+        "future_return_5d": None,
+        "future_return_10d": None,
+        "max_favorable_excursion_pct": None,
+        "max_adverse_excursion_pct": None,
+        "pullback_occurred": None,
+        "pullback_touch_time": None,
+        "entry_zone_touched": None,
+        "target_would_have_hit": None,
+        "stop_would_have_hit": None,
+        "outcome_direction": "UNKNOWN",
+        "label_category": None,
+        "label_state": "PENDING",
+        "exclusion_reason": None,
+        "outcome_state": "NOT_READY",
+    }
+
+    decision_snapshot = row.get("decision_snapshot") or {}
+    tv_confirmation_snapshot = row.get("tv_confirmation_snapshot") or {}
+    trade_plan_snapshot = row.get("trade_plan_snapshot") or {}
+    
+    action = decision_snapshot.get("action")
+    tv_status = tv_confirmation_snapshot.get("status")
+
+    if action == ACTION_TECHNICAL_FAILED or tv_status == "TECHNICAL_FAILED":
+        result["label_state"] = LABEL_EXCLUDED
+        result["outcome_state"] = OUTCOME_EXCLUDED
+        result["exclusion_reason"] = "technical_failed_not_strategy_decision"
+        return result
+
+    cutoff_iso = row.get("feature_cutoff_at") or row.get("source_candle_at")
+    if not cutoff_iso:
+        result["outcome_state"] = OUTCOME_INSUFFICIENT_DATA
+        return result
+        
+    cutoff_dt = _parse_time(cutoff_iso)
+    if not cutoff_dt:
+        result["outcome_state"] = OUTCOME_INSUFFICIENT_DATA
+        return result
+
+    # Filter strictly after cutoff
+    valid_candles = []
+    for c in ohlcv_rows:
+        c_time = _parse_time(c.get("timestamp") or c.get("open_time"))
+        if c_time and c_time > cutoff_dt:
+            valid_candles.append((c_time, c))
+            
+    valid_candles.sort(key=lambda x: x[0])
+    candles = [c for _, c in valid_candles]
+    
+    if not candles:
+        result["outcome_state"] = OUTCOME_INSUFFICIENT_DATA
+        return result
+
+    start_price = _number(candles[0].get("open"))
+    if not start_price or start_price <= 0:
+        result["outcome_state"] = OUTCOME_INSUFFICIENT_DATA
+        return result
+
+    # Horizon calculation
+    used_candles = candles[:horizon_days]
+    
+    if len(candles) >= 1:
+        result["future_return_1d"] = _round((( _number(candles[0].get("close")) or start_price ) / start_price - 1) * 100)
+    if len(candles) >= 3:
+        result["future_return_3d"] = _round((( _number(candles[2].get("close")) or start_price ) / start_price - 1) * 100)
+    if len(candles) >= 5:
+        result["future_return_5d"] = _round((( _number(candles[4].get("close")) or start_price ) / start_price - 1) * 100)
+    if len(candles) >= 10:
+        result["future_return_10d"] = _round((( _number(candles[9].get("close")) or start_price ) / start_price - 1) * 100)
+
+    max_high = max((_number(c.get("high")) or start_price for c in used_candles), default=start_price)
+    min_low = min((_number(c.get("low")) or start_price for c in used_candles), default=start_price)
+    
+    mfe = ((max_high / start_price) - 1) * 100
+    mae = ((min_low / start_price) - 1) * 100
+    
+    result["max_favorable_excursion_pct"] = _round(mfe)
+    result["max_adverse_excursion_pct"] = _round(mae)
+    
+    final_close = _number(used_candles[-1].get("close")) or start_price
+    total_move_pct = ((final_close / start_price) - 1) * 100
+    
+    direction = "FLAT"
+    if total_move_pct >= min_move_pct:
+        direction = "UP"
+    elif total_move_pct <= -min_move_pct:
+        direction = "DOWN"
+    elif abs(total_move_pct) <= flat_move_pct:
+        direction = "FLAT"
+        
+    result["outcome_direction"] = direction
+
+    # Pullback logic
+    entry_price = _number(trade_plan_snapshot.get("entry_price"))
+    pullback_occurred = False
+    
+    if action == ACTION_WAIT_FOR_PULLBACK and entry_price and entry_price > 0:
+        for c_time, c in valid_candles[:horizon_days]:
+            c_high = _number(c.get("high")) or start_price
+            c_low = _number(c.get("low")) or start_price
+            if c_low <= entry_price <= c_high:
+                pullback_occurred = True
+                result["pullback_occurred"] = True
+                result["pullback_touch_time"] = _iso(c_time)
+                break
+        if not pullback_occurred:
+            result["pullback_occurred"] = False
+
+    if direction == "FLAT" or len(candles) < horizon_days:
+        result["outcome_state"] = OUTCOME_INSUFFICIENT_DATA if len(candles) < horizon_days else OUTCOME_EXCLUDED
+        result["label_state"] = LABEL_EXCLUDED if len(candles) >= horizon_days else "PENDING"
+        if len(candles) >= horizon_days:
+            result["exclusion_reason"] = "flat_or_noisy_movement"
+        return result
+
+    cat = None
+    if action == ACTION_WAIT_FOR_PULLBACK:
+        if pullback_occurred:
+            cat = LABEL_PULLBACK_CAME_THEN_WENT_UP if direction == "UP" else LABEL_PULLBACK_CAME_THEN_WENT_DOWN
+        else:
+            cat = LABEL_NO_PULLBACK_WENT_UP if direction == "UP" else LABEL_NO_PULLBACK_WENT_DOWN
+    elif action == ACTION_NO_TRADE or tv_status in ("CONFIRMED_SIGNAL", "MOMENTUM_CONFIRMED", "SWING_CONFIRMED", "TV_CONFIRMED"):
+        # Confirmed but no trade taken
+        if action == ACTION_NO_TRADE:
+            cat = LABEL_NO_TRADE_WENT_UP if direction == "UP" else LABEL_NO_TRADE_WENT_DOWN
+    elif action == ACTION_STRATEGY_REJECTED:
+        cat = LABEL_REJECTED_WENT_UP if direction == "UP" else LABEL_REJECTED_WENT_DOWN
+
+    if cat:
+        result["label_category"] = cat
+        result["label_state"] = OUTCOME_READY
+        result["outcome_state"] = OUTCOME_READY
+    else:
+        result["outcome_state"] = OUTCOME_INSUFFICIENT_DATA
+        
+    return result

@@ -515,132 +515,103 @@ function DashboardPortfolio({ data }) {
     "Unrealized P&L": money(rowNumber(row, "unrealized_pnl")),
   }));
   return <>
-    <div className="statsGrid dashboardPortfolioGrid">
+    <div className="heroGrid">
       <StatCard label="Starting Virtual Capital" value={money(numberField("starting_virtual_capital"))} />
       <StatCard label="Settled Balance" value={money(numberField("settled_balance"))} />
-      <StatCard label="Reserved Margin" value={money(numberField("reserved_margin"))} tone="yellow" />
       <StatCard label="Available Cash" value={money(numberField("available_cash"))} />
-      <StatCard label="Unrealized P&L" value={money(numberField("unrealized_pnl"))} tone="yellow" />
       <StatCard label="Total Equity" value={money(numberField("total_equity"))} />
-      <StatCard label="Total Realized P&L" value={money(numberField("total_realized_pnl"))} />
-      <StatCard label="Effective Open Exposure" value={money(numberField("effective_open_exposure"))} tone="yellow" />
-      <StatCard label="Broker Funded Exposure" value={money(numberField("broker_funded_exposure"))} tone="yellow" />
-      <StatCard label="Active/Partial Trade Count" value={data?.active_partial_trade_count || "0 / 0"} />
-      <StatCard label="Total Margin Released" value={money(numberField("total_margin_released"))} />
-      <StatCard label="Capital Returned From Latest Exits" value={money(numberField("capital_returned_from_latest_exits"))} />
-
-      <StatCard label="Drawdown" value={pct(numberField("drawdown_percent"))} tone={numberField("drawdown_percent") > 0 ? "red" : "green"} />
-      <StatCard label="Win Rate" value={pct(numberField("win_rate_percent"))} tone="yellow" />
-      <StatCard label="Profit Factor" value={fmt(numberField("profit_factor"))} />
-      <StatCard label="Average RR" value={fmt(numberField("average_rr"))} />
-      <StatCard label="Waiting" value={countField("waiting")} />
-      <StatCard label="Active" value={countField("active")} />
-      <StatCard label="Partial" value={countField("partial")} tone="yellow" />
-      <StatCard label="Completed" value={countField("completed")} />
-      <StatCard label="SL Hit" value={countField("sl_hit")} tone="red" />
-      <StatCard label="Ambiguous" value={countField("ambiguous")} tone="yellow" />
     </div>
-    <div className="twoGrid">
-      <Card title="Capital Flow" eyebrow="Accounting reconciliation">
+    <div className="statsGrid">
+      <StatCard label="Open Trades" value={(() => {
+        const raw = data?.active_partial_trade_count;
+        if (typeof raw === "string" && raw.trim()) return raw.trim();
+        if (typeof raw === "number" && Number.isFinite(raw)) return String(raw);
+        return "0 / 0";
+      })()} />
+      <StatCard label="Waiting" value={countField("waiting")} />
+      <StatCard label="Completed" value={countField("completed")} />
+      <StatCard label="Win Rate" value={pct(numberField("win_rate_percent"))} tone="yellow" />
+      <StatCard label="Profit Factor" value={fmt(numberField("profit_factor"))} tone="green" />
+    </div>
+    <div className="twoColGrid">
+      <Card title="Capital Flow" eyebrow="ACCOUNTING">
         <div style={{ padding: "12px", fontSize: "14px", lineHeight: "1.8" }}>
-          <div><strong>Starting Capital:</strong> {money(numberField("starting_virtual_capital"))}</div>
-          <div><strong>− Reserved Margin:</strong> {money(numberField("reserved_margin"))}</div>
-          <div><strong>+ Realized P&L:</strong> {money(numberField("total_realized_pnl"))}</div>
-          <hr style={{ border: "0", borderTop: "1px solid var(--border)", margin: "8px 0" }} />
-          <div><strong>= Available Cash:</strong> {money(numberField("available_cash"))}</div>
-          <div style={{ marginTop: "12px", fontWeight: "bold" }}>
+          <div style={{ display: "flex", justifyContent: "space-between" }}><span>Starting Virtual Capital</span><strong>{money(numberField("starting_virtual_capital"))}</strong></div>
+          <div style={{ display: "flex", justifyContent: "space-between" }}><span>Reserved Margin</span><strong style={{color:"var(--warning)"}}>− {money(numberField("reserved_margin"))}</strong></div>
+          <div style={{ display: "flex", justifyContent: "space-between" }}><span>Total Realized P&L</span><strong style={{color:"var(--profit)"}}>+ {money(numberField("total_realized_pnl"))}</strong></div>
+          <hr style={{ border: "0", borderTop: "1px solid var(--border-soft)", margin: "12px 0" }} />
+          <div style={{ display: "flex", justifyContent: "space-between" }}><span>Available Cash</span><strong>{money(numberField("available_cash"))}</strong></div>
+          <div style={{ marginTop: "16px", color: "var(--text-muted)", fontSize: "12px" }}>
             Total Equity = Settled Balance ({money(numberField("settled_balance"))}) + Unrealized P&L ({money(numberField("unrealized_pnl"))}) = {money(numberField("total_equity"))}
           </div>
         </div>
       </Card>
-      <Card title="Equity Curve" eyebrow="trade_journal"><MiniLineChart points={data?.equity_curve} /></Card>
+      <Card title="Swing vs Momentum" eyebrow="PERFORMANCE"><MiniTable rows={comparisonRows} columns={["Strategy", "Trades", "Win %", "Profit Factor", "Average RR"]} /></Card>
     </div>
-    <div className="twoGrid">
-      <Card title="Monthly P&L" eyebrow="trade_journal"><MiniBarChart rows={monthlyRows} /></Card>
-      <Card title="Swing vs Momentum" eyebrow="completed performance"><MiniTable rows={comparisonRows} columns={["Strategy", "Trades", "Win %", "Profit Factor", "Average RR"]} /></Card>
-    </div>
-    <div className="twoGrid">
-      <Card title="Recent Completed Trades" eyebrow="trade_journal"><MiniTable rows={recentRows} columns={["Symbol", "Strategy", "Exit Date", "Reason", "Original Margin", "Total Released", "Realized P&L", "Cash Returned"]} /></Card>
-      <Card title="Open-Position Exposure" eyebrow="paper_trades">
+    <div className="twoColGrid">
+      <Card title="Recent Completed Trades" eyebrow="COMPLETED TRADES"><MiniTable rows={recentRows} columns={["Symbol", "Strategy", "Exit Date", "Reason", "Original Margin", "Total Released", "Realized P&L", "Cash Returned"]} /></Card>
+      <Card title="Open-Position Exposure" eyebrow="ACTIVE POSITIONS">
         <MiniTable rows={openRows} columns={["Symbol", "Strategy", "Status", "Original Qty", "Remaining Qty", "Original Margin", "Remaining Margin", "Margin Released", "Realized P&L", "Unrealized P&L"]} />
       </Card>
     </div>
+    
+    <details className="debug" style={{ marginTop: "20px" }}>
+      <summary>Detailed Metrics (Diagnostic)</summary>
+      <div className="statsGrid compact" style={{ marginTop: "16px" }}>
+        <StatCard label="Effective Open Exposure" value={money(numberField("effective_open_exposure"))} />
+        <StatCard label="Broker Funded Exposure" value={money(numberField("broker_funded_exposure"))} />
+        <StatCard label="Active/Partial Trade Count" value={data?.active_partial_trade_count || "0 / 0"} />
+        <StatCard label="Total Margin Released" value={money(numberField("total_margin_released"))} />
+        <StatCard label="Capital Returned From Latest Exits" value={money(numberField("capital_returned_from_latest_exits"))} />
+        <StatCard label="Drawdown" value={pct(numberField("drawdown_percent"))} />
+        <StatCard label="Average RR" value={fmt(numberField("average_rr"))} />
+      </div>
+    </details>
   </>;
 }
-
 function Dashboard({
-  summary,
-  scoreSummary,
-  swingSummary,
-  momentumSummary,
   dashboardEquity,
   health,
   tvRuntimeStatus,
-  aiDatasetSummary,
-  aiFeatureSnapshots,
-  aiOutcomePreview,
-  aiDataCollectionStatus,
-  aiDatasetFilters,
-  aiDatasetErrors,
   dashboardErrors,
-  paperUpdateProgress,
-  paperUpdateRuns,
-  paperUpdateLock,
   paperUpdateScheduler,
   onSummary,
   onDryRun,
   onSaveRun,
-  onAiDatasetFiltersChange,
-  onAiDatasetRefresh,
-  aiDatasetLoading,
   loading,
 }) {
   return <div className="pageStack">
-    <section className="heroCard">
-      <div><span>Paper control room</span><h1>Indian Stock Trading Assistant</h1><p>Swing and momentum workflows powered by TradingView candles. Paper records only.</p></div>
-      <div className="heroActions"><ActionButton onClick={onSummary} disabled={loading}>Load Summary</ActionButton><ActionButton onClick={onDryRun} disabled={loading}>Pipeline Dry Run</ActionButton><ActionButton onClick={onSaveRun} disabled={loading}>Save Paper Run</ActionButton></div>
-    </section>
-    <div className="warningText">Save mode updates PAPER records only. No broker orders. No live trading.</div>
-    {dashboardErrors && dashboardErrors.length > 0 && (
-      <div className="errorSummary warningText" style={{ color: "var(--red)" }}>
-        <strong>Some dashboard panels could not refresh:</strong>
-        <ul style={{ margin: "5px 0 0 20px", padding: 0 }}>
-          {dashboardErrors.map((err, idx) => (
-            <li key={idx}>{err.endpoint}: {err.message}</li>
-          ))}
-        </ul>
+    <div className="topHeader">
+      <div>
+        <h2>Trading Dashboard</h2>
+        <p>Paper terminal overview and system performance</p>
       </div>
-    )}
-    <DashboardPortfolio data={dashboardEquity} />
-    <DashboardHealthPanel health={health} tradingViewStatus={tvRuntimeStatus} schedulerStatus={paperUpdateScheduler} />
-    <div className="statsGrid">
-      <StatCard label="Total Paper Trades" value={summary?.total_trades ?? 0} />
-      <StatCard label="Open Trades" value={summary?.open_trades ?? 0} />
-      <StatCard label="Closed Trades" value={summary?.closed_trades ?? 0} tone="yellow" />
-      <StatCard label="Total Paper P&L" value={summary?.total_paper_pnl ?? 0} />
-      <StatCard label="Win Rate" value={summary?.win_rate_percent ?? 0} tone="yellow" />
-      <StatCard label="Active Symbols" value={Array.isArray(summary?.symbols) ? summary.symbols.length : 0} />
+      <div className="topHeaderRight">
+        <Badge tone={health?.online ? "green" : "red"}>API {health?.online ? "ONLINE" : "OFFLINE"}</Badge>
+        <Badge tone={tvRuntimeStatus?.worker_running ? "yellow" : tvRuntimeStatus?.connected ? "green" : "red"}>TV {tvRuntimeStatus?.worker_running ? "BUSY" : tvRuntimeStatus?.connected ? "READY" : "OFFLINE"}</Badge>
+        <Badge tone={paperUpdateScheduler?.active ? "green" : "gray"}>SYNC {paperUpdateScheduler?.active ? "ON" : "OFF"}</Badge>
+      </div>
     </div>
-    <div className="statsGrid compact">
-      <StatCard label="Scored Rows" value={scoreSummary?.total_scored ?? 0} />
-      <StatCard label="Swing Candidates" value={swingSummary?.swing_candidates_count ?? scoreSummary?.swing_candidates_count ?? 0} tone="yellow" />
-      <StatCard label="Momentum Candidates" value={momentumSummary?.momentum_candidates_count ?? scoreSummary?.momentum_candidates_count ?? 0} />
-    </div>
-    <AiDatasetSummary summary={aiDatasetSummary} snapshots={aiFeatureSnapshots} outcomePreview={aiOutcomePreview} collectionStatus={aiDataCollectionStatus} filters={aiDatasetFilters} onFiltersChange={onAiDatasetFiltersChange} onRefresh={onAiDatasetRefresh} loading={aiDatasetLoading} errors={aiDatasetErrors} />
-    <PaperAutomationStatus
-      progress={paperUpdateProgress}
-      schedulerStatus={paperUpdateScheduler}
-      lockStatus={paperUpdateLock}
-    />
-    <PaperUpdateRunHistory runs={paperUpdateRuns} />
-    <div className="threeGrid">
-      <Card title="Recent Activity" eyebrow="paper log"><div className="activityList"><p>Summary ready</p><p>TradingView candles available</p><p>Pipeline dry-run enabled</p></div></Card>
-      <Card title="Swing Strategy" eyebrow="score > 80"><div className="strategyCard"><strong>Confirmation-first swing flow</strong><Badge tone="green">Paper plans</Badge></div></Card>
-      <Card title="Momentum Strategy" eyebrow="momentum >= 70"><div className="strategyCard"><strong>Volume and 20D high validation</strong><Badge tone="yellow">Watch mode</Badge></div></Card>
+    <div className="pageContent pageStack">
+      <div className="buttonRow">
+        <ActionButton className="primary" onClick={onSummary} disabled={loading}>Refresh Summary</ActionButton>
+        <ActionButton onClick={onDryRun} disabled={loading}>Pipeline Dry Run</ActionButton>
+        <ActionButton onClick={onSaveRun} disabled={loading}>Save Paper Run</ActionButton>
+      </div>
+      {dashboardErrors && dashboardErrors.length > 0 && (
+        <div className="errorPanel">
+          <strong>Some dashboard panels could not refresh:</strong>
+          <ul style={{ margin: "5px 0 0 20px", padding: 0 }}>
+            {dashboardErrors.map((err, idx) => (
+              <li key={idx}>{err.endpoint}: {err.message}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+      <DashboardPortfolio data={dashboardEquity} />
     </div>
   </div>;
 }
-
 function SummaryCards({ data, fields }) {
   return <div className="statsGrid compact">{fields.map((field) => (
     <StatCard key={field} label={field} value={data?.[field] ?? "--"} tone={field.includes("invalid") || field.includes("overextended") ? "red" : "green"} />
@@ -926,7 +897,13 @@ function TvResultSummaryPanel({ title, rows, mode, loaded, onOpenStock }) {
         <span>Technical Failed</span><strong>{technicalFailedRows.length}</strong>
       </button>
     </div>
-    <p className="muted">{mode === "momentum" ? "Momentum" : "Swing"} TV rows available: {safeRows.length}</p>
+    <p className="muted">
+      {(() => {
+        const savedResultCount = safeRows.length;
+        const strategyLabel = mode === "momentum" ? "Momentum" : "Swing";
+        return <>Only {savedResultCount}/{candidateCount} current {strategyLabel} candidates have saved TV results.<br />(stale or outside-scope saved TV rows ignored.)</>;
+      })()}
+    </p>
     {safeRows.length === 0 && <p className="muted">No saved TV rows found.</p>}
     {openSection && <div className="savedResultList">
       {activeRows.length ? activeRows.map((row, index) => <SavedResultCard key={`${row?.symbol || row?.tradingview_symbol || openSection}-${index}`} row={row} mode={mode} onOpenStock={onOpenStock} />) : <p className="muted">No {openSection === "confirmed" ? "Confirmed / Watch" : openSection === "rejected" ? "Strategy Rejected" : "Technical Failed"} TV results.</p>}
@@ -2018,6 +1995,8 @@ function PaperTrades({ openTrades, history, summary, liveStatus }) {
   const [paperSearch, setPaperSearch] = useState("");
   const [strategyFilter, setStrategyFilter] = useState("ALL");
   const [activeTradeFilter, setActiveTradeFilter] = useState("waiting");
+  const [sortField, setSortField] = useState("setup_time");
+  const [sortDirection, setSortDirection] = useState("desc");
   const waitingTrades = withPaperGroup(arr(openTrades, ["waiting_for_entry"]), "waiting");
   const activeTrades = withPaperGroup(arr(openTrades, ["active_partial"]), "active");
   const completedTrades = withPaperGroup(arr(history, ["completed"]), "completed");
@@ -2027,55 +2006,70 @@ function PaperTrades({ openTrades, history, summary, liveStatus }) {
   const allRows = dedupePaperTrades([...waitingTrades, ...activeTrades, ...completedTrades, ...stoppedTrades, ...ambiguousTrades, ...expiredTrades]);
   const selectedFilter = PAPER_TRADE_FILTERS.find((filter) => filter.key === activeTradeFilter) || PAPER_TRADE_FILTERS[0];
   const tabRows = selectedFilter.groups ? allRows.filter((trade) => selectedFilter.groups.has(trade.paper_group)) : allRows;
-  const filteredRows = tabRows.filter((trade) => paperTradeMatchesFilters(trade, paperSearch, strategyFilter));
+  let filteredRows = tabRows.filter((trade) => paperTradeMatchesFilters(trade, paperSearch, strategyFilter));
+  filteredRows = sortPaperTrades(filteredRows, sortField, sortDirection);
   const initialLoading = liveStatus?.running && !liveStatus?.hasLoaded;
   const emptyMessage = liveStatus?.hasLoaded ? "No paper trades match the current filters." : "No paper trades loaded yet.";
   const waitingCount = summary?.waiting_for_entry ?? summary?.waiting_trades ?? openTrades?.waiting_count ?? waitingTrades.length;
   const activeCount = summary?.open_trades ?? openTrades?.active_partial_count ?? activeTrades.length;
   const targetHitCount = summary?.target_hit_count ?? completedTrades.length;
   const slHitCount = summary?.sl_hit_count ?? history?.sl_hit_count ?? stoppedTrades.length;
-  const ambiguousCount = summary?.ambiguous_count ?? history?.ambiguous_count ?? ambiguousTrades.length;
-  const expiredCount = summary?.expired_not_triggered_count ?? history?.expired_not_triggered_count ?? expiredTrades.length;
   return <div className="pageStack">
-    {liveStatus?.error && <div className="errorPanel paperInlineState">{liveStatus.error}</div>}
-    <div className="statsGrid compact">
-      <StatCard label="Waiting for Entry" value={waitingCount} tone="yellow" />
-      <StatCard label="Active" value={activeCount} />
-      <StatCard label="Target Hit" value={targetHitCount} />
-      <StatCard label="SL Hit" value={slHitCount} tone="red" />
-      <StatCard label="Ambiguous" value={ambiguousCount} tone="yellow" />
-      <StatCard label="Expired / Not Triggered" value={expiredCount} tone="gray" />
+    <div className="topHeader">
+      <div><h2>Paper Trades</h2><p>Live tracking and history of automated paper executions.</p></div>
     </div>
-    <div className="paperTradeToolbar">
-      <input value={paperSearch} onChange={(event) => setPaperSearch(event.target.value)} placeholder="Search by symbol" />
-      <select value={strategyFilter} onChange={(event) => setStrategyFilter(event.target.value)}>
-        <option value="ALL">All strategies</option>
-        <option value="SWING">Swing</option>
-        <option value="MOMENTUM">Momentum</option>
-      </select>
-    </div>
-    <div className="paperFilterButtons" role="group" aria-label="Paper trade status filter">
-      {PAPER_TRADE_FILTERS.map((filter) => (
-        <button
-          key={filter.key}
-          type="button"
-          className={`paperStateButton ${activeTradeFilter === filter.key ? "active" : ""}`}
-          onClick={() => setActiveTradeFilter(filter.key)}
-        >
-          {filter.label}
-        </button>
-      ))}
-    </div>
-    <Card title="Paper Trades" eyebrow="automatic open/history feed" className="paperTableCard">
-      <div className="paperTableMeta">
-        <span>{filteredRows.length} of {tabRows.length} shown</span>
-        <Badge tone={selectedFilter.key === "completed" ? "yellow" : selectedFilter.key === "active" ? "green" : "gray"}>{selectedFilter.label}</Badge>
+    <div className="pageContent pageStack">
+      {liveStatus?.error && <div className="errorPanel">{liveStatus.error}</div>}
+      <div className="heroGrid">
+        <StatCard label="Waiting for Entry" value={waitingCount} tone="yellow" />
+        <StatCard label="Active" value={activeCount} />
+        <StatCard label="Target Hit" value={targetHitCount} />
+        <StatCard label="SL Hit" value={slHitCount} tone="red" />
       </div>
-      <PaperTradeTable rows={filteredRows} loading={initialLoading} emptyMessage={emptyMessage} />
-    </Card>
+      <div className="card paperTableCard">
+        <div className="paperTradeToolbar">
+          <div className="paperFilterButtons" role="group" aria-label="Paper trade status filter">
+            {PAPER_TRADE_FILTERS.map((filter) => (
+              <button key={filter.key} type="button" className={`paperStateButton ${activeTradeFilter === filter.key ? "active" : ""}`} onClick={() => setActiveTradeFilter(filter.key)}>
+                {filter.label}
+              </button>
+            ))}
+          </div>
+          <input value={paperSearch} onChange={(event) => setPaperSearch(event.target.value)} placeholder="Search by symbol" className="searchInput" />
+          <div style={{display:"flex", gap:"10px"}}>
+            <select value={strategyFilter} onChange={(event) => setStrategyFilter(event.target.value)}>
+              <option value="ALL">All strategies</option>
+              <option value="SWING">Swing</option>
+              <option value="MOMENTUM">Momentum</option>
+            </select>
+            <select value={`${sortField}|${sortDirection}`} onChange={(event) => {
+              const [f, d] = event.target.value.split('|');
+              setSortField(f);
+              setSortDirection(d);
+            }}>
+              <option value="setup_time|desc">Newest setup first</option>
+              <option value="setup_time|asc">Oldest setup first</option>
+              <option value="pnl|desc">P&L high to low</option>
+              <option value="pnl|asc">P&L low to high</option>
+              <option value="t1|asc">T1 low to high</option>
+              <option value="t1|desc">T1 high to low</option>
+              <option value="symbol|asc">Symbol A-Z</option>
+              <option value="strategy|asc">Strategy</option>
+              <option value="status|asc">Status</option>
+            </select>
+          </div>
+        </div>
+        <div className="paperTableMeta">
+          <span>{filteredRows.length} of {tabRows.length} shown &middot; Sorted by {(PAPER_SORT_LABELS[`${sortField}|${sortDirection}`] || "custom").toLowerCase()}</span>
+          <Badge tone={selectedFilter.key === "completed" ? "yellow" : selectedFilter.key === "active" ? "green" : "gray"}>{selectedFilter.label}</Badge>
+        </div>
+        <div className="paperTableShell">
+          <PaperTradeTable rows={filteredRows} loading={initialLoading} emptyMessage={emptyMessage} />
+        </div>
+      </div>
+    </div>
   </div>;
 }
-
 function Settings({ settings, health, runtimeInfo, tvRuntimeStatus, tvAttachableTabs, onRefreshTvTabs, onAttachTvTab, onDetachTvTab, loading }) {
   const gitCommit = runtimeInfo?.git_commit || "unknown";
   const startedAt = runtimeInfo?.started_at ? new Date(runtimeInfo.started_at).toLocaleString() : "unknown";
@@ -3027,7 +3021,10 @@ export default function App() {
       }
     }),
     swingSavedTv: () => act("saved swing tv results", async () => {
-      const data = await getSwingTvConfirmed({ limit: 50 });
+      setSwingSavedTvResult(null);
+      setLatestSwingTvRows([]);
+      setSwingTvRowsLoaded(false);
+      const data = await getSwingTvConfirmed();
       setSwingSavedTvResult(data);
       setLatestSwingTvRows(tvRows(data));
       setSwingTvRowsLoaded(true);
@@ -3068,8 +3065,11 @@ export default function App() {
       return data;
     }),
     momentumSavedTv: () => act("saved momentum tv results", async () => {
-      const data = await getMomentumTvConfirmed({ limit: 20 });
-      const normalized = normalizeSavedTvResponse(data, 20);
+      setMomentumSavedTvResult(null);
+      setLatestMomentumTvRows([]);
+      setMomentumTvRowsLoaded(false);
+      const data = await getMomentumTvConfirmed();
+      const normalized = normalizeSavedTvResponse(data);
       setMomentumSavedTvResult(normalized);
       setLatestMomentumTvRows(tvRows(normalized));
       setMomentumTvRowsLoaded(true);
@@ -3275,8 +3275,8 @@ export default function App() {
   }, [aiOutcomePreview, aiDatasetFilters]);
 
   const page = useMemo(() => {
-    if (activePage === "Swing Trading") return <SwingTrading swingRows={swingRows} swingSummary={swingSummary} latestSwingTvRows={latestSwingTvRows} swingTvRowsLoaded={swingTvRowsLoaded} swingBatchResults={swingBatchResults} swingBatchProgress={swingBatchProgress} swingBatchError={swingBatchError} swingBatchStopRequested={swingBatchStopRequested} swingBatchStopMessage={swingBatchStopMessage} swingBatchRunning={loading === "swing batch tv confirm"} candidatesStale={swingCandidatesStale} onSummary={handlers.swingSummary} onLoad={handlers.swing} onBatchConfirm={handlers.swingTvConfirm} onStopBatch={handlers.swingStopBatch} onLoadSaved={handlers.swingSavedTv} onOpenStock={openStockDetail} loading={!!loading} tvRuntimeStatus={tvRuntimeStatus} tvRuntimeLastUpdatedAt={tvRuntimeLastUpdatedAt} onRefreshTvStatus={handlers.tvRefreshStatus} />;
-    if (activePage === "Momentum Trading") return <MomentumTrading momentumRows={momentumRows} momentumSummary={momentumSummary} latestMomentumTvRows={latestMomentumTvRows} momentumTvRowsLoaded={momentumTvRowsLoaded} momentumBatchResults={momentumBatchResults} momentumBatchProgress={momentumBatchProgress} momentumBatchError={momentumBatchError} momentumBatchStopRequested={momentumBatchStopRequested} momentumBatchStopMessage={momentumBatchStopMessage} momentumBatchRunning={loading === "momentum batch tv confirm"} candidatesStale={momentumCandidatesStale} onSummary={handlers.momentumSummary} onLoad={handlers.momentum} onBatchConfirm={handlers.momentumBatchConfirm} onStopBatch={handlers.momentumStopBatch} onLoadSaved={handlers.momentumSavedTv} onOpenStock={openStockDetail} loading={!!loading} tvRuntimeStatus={tvRuntimeStatus} tvRuntimeLastUpdatedAt={tvRuntimeLastUpdatedAt} onRefreshTvStatus={handlers.tvRefreshStatus} />;
+    if (activePage === "Swing Trading") return <SwingTrading swingRows={swingRows} swingSummary={swingSummary} latestSwingTvRows={latestSwingTvRows} swingTvRowsLoaded={swingTvRowsLoaded} swingBatchResults={swingBatchResults} swingBatchProgress={swingBatchProgress} swingBatchError={swingBatchError} swingBatchStopRequested={swingBatchStopRequested} swingBatchStopMessage={swingBatchStopMessage} swingBatchRunning={loading === "swing batch tv confirm"} candidatesStale={swingCandidatesStale} metadata={swingSavedTvResult} onSummary={handlers.swingSummary} onLoad={handlers.swing} onBatchConfirm={handlers.swingTvConfirm} onStopBatch={handlers.swingStopBatch} onLoadSaved={handlers.swingSavedTv} onOpenStock={openStockDetail} loading={!!loading} tvRuntimeStatus={tvRuntimeStatus} tvRuntimeLastUpdatedAt={tvRuntimeLastUpdatedAt} onRefreshTvStatus={handlers.tvRefreshStatus} />;
+    if (activePage === "Momentum Trading") return <MomentumTrading momentumRows={momentumRows} momentumSummary={momentumSummary} latestMomentumTvRows={latestMomentumTvRows} momentumTvRowsLoaded={momentumTvRowsLoaded} momentumBatchResults={momentumBatchResults} momentumBatchProgress={momentumBatchProgress} momentumBatchError={momentumBatchError} momentumBatchStopRequested={momentumBatchStopRequested} momentumBatchStopMessage={momentumBatchStopMessage} momentumBatchRunning={loading === "momentum batch tv confirm"} candidatesStale={momentumCandidatesStale} metadata={momentumSavedTvResult} onSummary={handlers.momentumSummary} onLoad={handlers.momentum} onBatchConfirm={handlers.momentumBatchConfirm} onStopBatch={handlers.momentumStopBatch} onLoadSaved={handlers.momentumSavedTv} onOpenStock={openStockDetail} loading={!!loading} tvRuntimeStatus={tvRuntimeStatus} tvRuntimeLastUpdatedAt={tvRuntimeLastUpdatedAt} onRefreshTvStatus={handlers.tvRefreshStatus} />;
     if (activePage === "Market Data") return <MarketDataPage tv={tv} setTv={setTv} tvResult={tvResult} onTest={handlers.tvTest} onDryRun750={handlers.dryRun750} onScanAll750={handlers.scanAll750} onScoreMarketData={handlers.scoreMarketData} marketLoadResult={marketLoadResult} marketProgress={marketProgress} scoreRunResult={scoreRunResult} scoreSummary={scoreSummary} marketDataNeedsScore={marketDataNeedsScore} loading={!!loading} loadingText={loading} lastResponse={lastResponse} />;
     if (activePage === "Stock Detail") return <StockDetailPage search={search} stockMarketData={stockMarketData} stockSwingPrecheck={stockSwingPrecheck} stockMomentumPrecheck={stockMomentumPrecheck} stockSwingTvResult={stockSwingTvResult} stockMomentumTvResult={stockMomentumTvResult} stockSavedSwingResult={stockSavedSwingResult} stockSavedMomentumResult={stockSavedMomentumResult} latestSwingTvRows={latestSwingTvRows} latestMomentumTvRows={latestMomentumTvRows} stockSwingTimeframes={stockSwingTimeframes} setStockSwingTimeframes={setStockSwingTimeframes} stockMomentumTimeframes={stockMomentumTimeframes} setStockMomentumTimeframes={setStockMomentumTimeframes} onLoadStockMarket={handlers.stockMarketData} onSwingPrecheck={handlers.stockSwingPrecheck} onMomentumPrecheck={handlers.stockMomentumPrecheck} onStockSwingTvConfirm={handlers.stockSwingTvConfirm} onStockMomentumTvConfirm={handlers.stockMomentumTvConfirm} loading={!!loading} />;
     if (activePage === "Paper Trades") return <PaperTrades openTrades={paperOpenTrades} history={paperHistory} summary={summary} liveStatus={paperLiveStatus} />;

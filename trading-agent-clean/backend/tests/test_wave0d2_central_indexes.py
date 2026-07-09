@@ -30,6 +30,52 @@ class FakeCursor:
         return dict(row)
 
 
+_MISSING = object()
+
+
+def _dotted_get(row: dict, dotted_field: str):
+    value = row
+    for part in dotted_field.split("."):
+        if not isinstance(value, dict) or part not in value:
+            return _MISSING
+        value = value[part]
+    return value
+
+
+def _matches_partial_condition(row: dict, field: str, condition) -> bool:
+    value = _dotted_get(row, field)
+    if isinstance(condition, dict):
+        for operator, expected in condition.items():
+            if operator == "$exists":
+                if (value is not _MISSING) is not bool(expected):
+                    return False
+            elif operator == "$type":
+                if expected == "string" and not isinstance(value, str):
+                    return False
+                if expected != "string":
+                    raise AssertionError(f"unsupported fake partialFilterExpression $type: {expected}")
+            elif operator == "$gt":
+                if value is _MISSING or not value > expected:
+                    return False
+            elif operator == "$in":
+                if value is _MISSING or value not in expected:
+                    return False
+            else:
+                raise AssertionError(f"unsupported fake partialFilterExpression operator: {operator}")
+        return True
+    return value is not _MISSING and value == condition
+
+
+def _matches_partial_filter(row: dict, partial_filter: dict | None) -> bool:
+    if partial_filter is None:
+        return True
+    return all(_matches_partial_condition(row, field, condition) for field, condition in partial_filter.items())
+
+
+def _unique_key(row: dict, keys: list[tuple[str, int]]) -> tuple:
+    return tuple(None if (value := _dotted_get(row, field)) is _MISSING else value for field, _direction in keys)
+
+
 def index_doc(spec: mongo_indexes.IndexSpec, **overrides) -> dict:
     doc = {"key": spec.create_keys()}
     if spec.unique:
@@ -69,6 +115,17 @@ class FakeIndexedCollection:
         name = kwargs["name"]
         if name in self.fail_create_names:
             raise RuntimeError(f"simulated create failure for {name}")
+        if kwargs.get("unique"):
+            seen = {}
+            key_list = list(keys)
+            partial_filter = kwargs.get("partialFilterExpression")
+            for row in self.rows:
+                if not _matches_partial_filter(row, partial_filter):
+                    continue
+                unique_key = _unique_key(row, key_list)
+                if unique_key in seen:
+                    raise RuntimeError(f"simulated duplicate key for {name}: {unique_key}")
+                seen[unique_key] = row
         self.create_calls.append((list(keys), deepcopy(kwargs)))
         self.indexes[name] = {"key": list(keys)}
         for option in ("unique", "sparse", "partialFilterExpression", "expireAfterSeconds"):
@@ -182,6 +239,10 @@ def test_registry_has_deterministic_critical_specs_without_duplicate_names() -> 
         "system_errors",
         "trade_journal",
         "ai_feature_snapshots",
+        "historical_scored_candidates",
+        "historical_ohlcv",
+        "daily_trade_dataset",
+        "dataset_build_runs",
     }
     assert required <= set(mongo_indexes.CENTRALIZED_INDEX_COLLECTIONS)
     seen = set()
@@ -208,6 +269,71 @@ def test_registry_has_deterministic_critical_specs_without_duplicate_names() -> 
     legacy_error_spec = mongo_indexes.get_index_spec("system_errors", "system_errors_dedup_identity")
     assert legacy_error_spec.critical is False
     assert legacy_error_spec.unique is False
+
+
+def test_dataset_build_runs_unique_indexes_are_partial_string_identity() -> None:
+    expected_build_filter = {"dataset_build_id": {"$exists": True, "$type": "string"}}
+    expected_run_filter = {"run_id": {"$exists": True, "$type": "string"}}
+
+    build_spec = mongo_indexes.get_index_spec("dataset_build_runs", "dataset_build_runs_build_id_unique")
+    run_spec = mongo_indexes.get_index_spec("dataset_build_runs", "dataset_build_runs_run_id_unique")
+
+    assert build_spec.unique is True
+    assert build_spec.create_keys() == [("dataset_build_id", 1)]
+    assert build_spec.partial_filter == expected_build_filter
+    assert build_spec.create_options()["partialFilterExpression"] == expected_build_filter
+
+    assert run_spec.unique is True
+    assert run_spec.create_keys() == [("run_id", 1)]
+    assert run_spec.partial_filter == expected_run_filter
+    assert run_spec.create_options()["partialFilterExpression"] == expected_run_filter
+
+
+def test_historical_ohlcv_daily_collection_indexes_are_registered() -> None:
+    candle_spec = mongo_indexes.get_index_spec("historical_ohlcv", "historical_ohlcv_candle_id_unique")
+    trade_date_spec = mongo_indexes.get_index_spec("historical_ohlcv", "historical_ohlcv_symbol_trade_date_timeframe")
+    specs = {spec.name: spec for spec in mongo_indexes.get_collection_index_specs("historical_ohlcv")}
+
+    assert candle_spec.unique is True
+    assert candle_spec.create_keys() == [("candle_id", 1)]
+    assert candle_spec.partial_filter == {"candle_id": {"$exists": True, "$type": "string"}}
+    assert specs["historical_ohlcv_symbol_open_timeframe"].create_keys() == [
+        ("canonical_symbol", 1),
+        ("candle_open_at", 1),
+        ("timeframe", 1),
+    ]
+    assert trade_date_spec.create_keys() == [("canonical_symbol", 1), ("trade_date", 1), ("timeframe", 1)]
+    assert trade_date_spec.partial_filter == {"trade_date": {"$exists": True, "$type": "string"}}
+    assert "historical_ohlcv_provider_symbol" in specs
+    assert "historical_ohlcv_persistence_run_id" in specs
+
+
+def test_dataset_build_runs_missing_or_null_build_id_does_not_block_index_creation() -> None:
+    rows = [
+        {"_id": "missing-a", "run_id": "run-a"},
+        {"_id": "missing-b", "run_id": "run-b"},
+        {"_id": "null-a", "dataset_build_id": None, "run_id": "run-c"},
+        {"_id": "null-b", "dataset_build_id": None, "run_id": "run-d"},
+    ]
+    db = fake_db(rows={"dataset_build_runs": rows})
+
+    summary = run(mongo_indexes.ensure_collection_indexes(db, "dataset_build_runs", critical=True))
+
+    created_names = {item["name"] for item in summary["critical_created"]}
+    assert "dataset_build_runs_build_id_unique" in created_names
+    assert "dataset_build_runs_run_id_unique" in created_names
+    assert db.dataset_build_runs.drop_calls == []
+    assert db.dataset_build_runs.document_mutation_calls == []
+
+
+def test_dataset_build_runs_run_id_unique_partial_index_exists() -> None:
+    db = fake_db(rows={"dataset_build_runs": [{"_id": "legacy-a"}, {"_id": "legacy-b", "run_id": None}]})
+    spec = mongo_indexes.get_index_spec("dataset_build_runs", "dataset_build_runs_run_id_unique")
+
+    summary = run(mongo_indexes.ensure_collection_indexes(db, "dataset_build_runs", critical=True))
+
+    assert db.dataset_build_runs.indexes[spec.name] == index_doc(spec)
+    assert {"collection": "dataset_build_runs", "name": spec.name} in summary["critical_created"]
 
 
 def test_startup_initializer_visits_every_critical_collection_and_is_idempotent() -> None:

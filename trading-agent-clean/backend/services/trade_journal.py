@@ -305,6 +305,7 @@ async def sync_completed_trades_to_journal(db, limit: int = 1000) -> dict:
         return {"ok": False, "processed": 0, "journaled": 0, "duplicates": 0, "skipped": 0, "errors_count": 1, "errors": [{"reason": "NO_JOURNAL_COLLECTION"}]}
     processed = journaled = duplicates = skipped = errors_count = 0
     errors = []
+    daily_dataset_outcome_updates = []
     await ensure_trade_journal_indexes(db)
     cursor = trades_collection.find({"paper_only": True}).sort("updated_at", -1).limit(limit)
     async for trade in cursor:
@@ -325,6 +326,35 @@ async def sync_completed_trades_to_journal(db, limit: int = 1000) -> dict:
         else:
             skipped += 1
         if result.get("journaled") or result.get("duplicate"):
+            try:
+                from services.daily_dataset import update_daily_dataset_outcome_from_paper_trade
+
+                daily_dataset_outcome_updates.append(
+                    await update_daily_dataset_outcome_from_paper_trade(
+                        db,
+                        trade,
+                        trade_journal=result.get("record"),
+                        audit_time=datetime.utcnow().isoformat(),
+                        link_source="trade_journal_sync",
+                    )
+                )
+            except Exception as exc:  # pragma: no cover - defensive production guard
+                daily_dataset_outcome_updates.append(
+                    {
+                        "processed_count": 1,
+                        "updated_count": 0,
+                        "unmatched_count": 0,
+                        "skipped_count": 0,
+                        "error_count": 1,
+                        "label_counts": {},
+                        "validation_errors": [
+                            {
+                                "paper_trade_id": str(trade.get("_id") or trade.get("paper_trade_id") or ""),
+                                "errors": [f"{type(exc).__name__}: {exc}"],
+                            }
+                        ],
+                    }
+                )
             if trade.get("journal_pending") or trade.get("journal_status") == "PENDING":
                 await trades_collection.update_one(
                     {"_id": trade["_id"], "paper_only": True},
@@ -347,6 +377,7 @@ async def sync_completed_trades_to_journal(db, limit: int = 1000) -> dict:
         "skipped": skipped,
         "errors_count": errors_count,
         "errors": errors,
+        "daily_dataset_outcome_updates": daily_dataset_outcome_updates,
     }
 
 

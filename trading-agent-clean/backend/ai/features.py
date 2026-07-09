@@ -8,43 +8,26 @@ from services.timestamps import (
     parse_legacy_timestamp_for_ordering,
     utc_now_iso as canonical_utc_now_iso,
 )
+from ai.indicator_primitives import (
+    _number,
+    _first_number,
+    _breakdown_sum,
+    TREND_BREAKDOWN_KEYS,
+    VOLUME_BREAKDOWN_KEYS,
+    ema,
+    atr,
+    rsi,
+    _round,
+    resolve_scores,
+)
+from ai.trade_status import (
+    CLOSED_TRADE_STATUSES,
+    WIN_STATUSES,
+    LOSS_STATUSES,
+)
 
 
-CLOSED_TRADE_STATUSES = {
-    "CLOSED",
-    "EXPIRED",
-    "TARGET_HIT",
-    "TARGET_1_HIT_FINAL",
-    "TARGET_2_HIT",
-    "TARGET_3_HIT",
-    "T1_HIT",
-    "T2_HIT",
-    "T3_HIT",
-    "WON_T1",
-    "WON_T2",
-    "WON_T3",
-    "STOP_HIT",
-    "STOPPED",
-    "STOPPED_AFTER_T1",
-    "SL_HIT",
-    "LOST_SL",
-    "AMBIGUOUS",
-}
 
-WIN_STATUSES = {
-    "TARGET_HIT",
-    "TARGET_1_HIT_FINAL",
-    "TARGET_2_HIT",
-    "TARGET_3_HIT",
-    "T1_HIT",
-    "T2_HIT",
-    "T3_HIT",
-    "WON_T1",
-    "WON_T2",
-    "WON_T3",
-}
-
-LOSS_STATUSES = {"STOP_HIT", "STOPPED", "STOPPED_AFTER_T1", "SL_HIT", "LOST_SL"}
 
 OUTCOME_FIELDS = (
     "outcome_status",
@@ -69,15 +52,7 @@ ATTACHED_OUTCOME_FIELDS = (
     "outcome_attached_at",
 )
 
-TREND_BREAKDOWN_KEYS = {
-    "swing": ("price_strength", "near_day_high", "thirty_day_momentum", "above_open", "above_previous_close"),
-    "momentum": ("price_strength", "near_high", "thirty_day_momentum", "clean_price_behavior"),
-}
 
-VOLUME_BREAKDOWN_KEYS = {
-    "swing": ("traded_value", "relative_volume"),
-    "momentum": ("liquidity",),
-}
 
 
 def utc_now_iso() -> str:
@@ -95,24 +70,10 @@ def _first_value(*values: Any) -> Any:
     return None
 
 
-def _number(value: Any) -> float | int | None:
-    if value is None or value == "":
-        return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if number != number:
-        return None
-    return int(number) if number.is_integer() else number
 
 
-def _first_number(*values: Any) -> float | int | None:
-    for value in values:
-        number = _number(value)
-        if number is not None:
-            return number
-    return None
+
+
 
 
 def _split_symbol(value: Any) -> tuple[str | None, str | None]:
@@ -184,13 +145,7 @@ def _score_breakdown(scored_candidate: Mapping[str, Any], strategy_type: str | N
     return breakdown
 
 
-def _breakdown_sum(breakdown: Mapping[str, Any], keys: tuple[str, ...]) -> float | int | None:
-    values = [_number(breakdown.get(key)) for key in keys]
-    values = [value for value in values if value is not None]
-    if not values:
-        return None
-    total = sum(values)
-    return int(total) if float(total).is_integer() else total
+
 
 
 def _status_values(document: Mapping[str, Any]) -> set[str]:
@@ -306,65 +261,6 @@ def chronological_split(
     test = sorted_rows[val_end:]
     return train, val, test
 
-
-def _extract_risk_score(
-    strategy_type: str | None,
-    scored_candidate: Mapping[str, Any],
-    tv_confirmation: Mapping[str, Any],
-    paper_signal: Mapping[str, Any],
-    paper_trade: Mapping[str, Any],
-) -> float | int | None:
-    val = _first_number(
-        scored_candidate.get("risk_score"),
-        tv_confirmation.get("risk_score"),
-        paper_signal.get("risk_score"),
-        paper_trade.get("risk_score"),
-    )
-    if val is not None:
-        return val
-
-    if strategy_type == "momentum":
-        trap_score = _first_number(
-            tv_confirmation.get("momentum_trap_score"),
-            scored_candidate.get("momentum_trap_score"),
-            paper_signal.get("momentum_trap_score"),
-        )
-        if trap_score is not None:
-            return trap_score
-            
-    elif strategy_type == "swing":
-        fake_risk = _first_value(
-            tv_confirmation.get("fake_breakout_risk"),
-            scored_candidate.get("fake_breakout_risk"),
-            paper_signal.get("fake_breakout_risk"),
-        )
-        retail_risk = _first_value(
-            tv_confirmation.get("retail_trap_risk"),
-            scored_candidate.get("retail_trap_risk"),
-            paper_signal.get("retail_trap_risk"),
-        )
-        if fake_risk is not None or retail_risk is not None:
-            f_r = str(fake_risk).upper() if fake_risk else "LOW"
-            r_r = str(retail_risk).upper() if retail_risk else "LOW"
-            trap_safety = 5 if f_r == "LOW" and r_r == "LOW" else 3 if "HIGH" not in {f_r, r_r} else 0
-            return 5 - trap_safety
-
-    risk_sum = _doc(_first_value(
-        tv_confirmation.get("risk_summary"),
-        scored_candidate.get("risk_summary"),
-        paper_signal.get("risk_summary"),
-    ))
-    if risk_sum:
-        f_r = str(risk_sum.get("fake_breakout_risk") or "LOW").upper()
-        o_r = str(risk_sum.get("overextended_risk") or "LOW").upper()
-        r_r = str(risk_sum.get("retail_trap_risk") or "LOW").upper()
-        pts = {"HIGH": 3, "MEDIUM": 1.5, "LOW": 0}
-        total_pts = pts.get(f_r, 0) + pts.get(o_r, 0) + pts.get(r_r, 0)
-        return total_pts
-
-    return None
-
-
 def build_ai_feature_snapshot(
     scored_candidate: Mapping[str, Any],
     market_data: Mapping[str, Any] | None = None,
@@ -426,24 +322,34 @@ def build_ai_feature_snapshot(
 
     max_source_ts = max(timestamps) if timestamps else as_of_dt
 
-    trend_score = _first_number(
-        scored_candidate.get("trend_score"),
-        tv_confirmation.get("trend_score"),
-        paper_signal.get("trend_score"),
-        _breakdown_sum(breakdown, TREND_BREAKDOWN_KEYS.get(strategy_type or "", ())),
+    candles = _first_value(market_data.get("candles"), scored_candidate.get("candles"), paper_signal.get("candles")) or []
+    closes = [_number(c.get("close")) for c in candles if _number(c.get("close")) is not None]
+
+    def _extract_indicator(key: str, live_calc_func) -> float | None:
+        val = _first_number(
+            scored_candidate.get(key),
+            market_data.get(key),
+            paper_signal.get(key),
+            tv_confirmation.get(key)
+        )
+        if val is None and live_calc_func:
+            return _round(live_calc_func())
+        return val
+
+    atr14 = _extract_indicator("atr14", lambda: atr(candles, 14) if candles else None)
+    rsi14 = _extract_indicator("rsi14", lambda: rsi(closes, 14) if closes else None)
+    daily_ema20 = _extract_indicator("daily_ema20", lambda: ema(closes, 20) if closes else None)
+    daily_ema50 = _extract_indicator("daily_ema50", lambda: ema(closes, 50) if closes else None)
+
+    scores = resolve_scores(
+        scored_candidate=scored_candidate,
+        tv_confirmation=tv_confirmation,
+        strategy_type=strategy_type,
+        paper_signal=paper_signal,
+        paper_trade=paper_trade,
     )
-    volume_score = _first_number(
-        scored_candidate.get("volume_score"),
-        tv_confirmation.get("volume_score"),
-        paper_signal.get("volume_score"),
-        _breakdown_sum(breakdown, VOLUME_BREAKDOWN_KEYS.get(strategy_type or "", ())),
-    )
-    rule_score_val = _first_number(
-        scored_candidate.get("rule_score"),
-        scored_candidate.get("score"),
-        scored_candidate.get("nse_score"),
-        paper_signal.get("score"),
-    )
+    rule_score_val = scores.get("rule_score")
+    trend_score = scores.get("trend_score")
 
     if rule_score_val is None or trend_score is None:
         import logging
@@ -528,19 +434,13 @@ def build_ai_feature_snapshot(
         "data_source_ids": _source_ids(scored_candidate, market_data, tv_confirmation, paper_signal, paper_trade),
         "rule_score": rule_score_val,
         "trend_score": trend_score,
-        "momentum_score": _first_number(
-            scored_candidate.get("momentum_score"),
-            paper_signal.get("momentum_score"),
-            tv_confirmation.get("momentum_score"),
-        ),
-        "volume_score": volume_score,
-        "risk_score": _extract_risk_score(
-            strategy_type,
-            scored_candidate,
-            tv_confirmation,
-            paper_signal,
-            paper_trade,
-        ),
+        "momentum_score": scores.get("momentum_score"),
+        "volume_score": scores.get("volume_score"),
+        "atr14": atr14,
+        "rsi14": rsi14,
+        "daily_ema20": daily_ema20,
+        "daily_ema50": daily_ema50,
+        "risk_score": scores.get("risk_score"),
         "setup_status": setup_status,
         "entry_price": _first_number(
             paper_trade.get("entry_price"),

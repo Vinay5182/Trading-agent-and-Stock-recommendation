@@ -267,6 +267,28 @@ def test_swing_tv_confirmed_deduplication(monkeypatch) -> None:
     db = patch_database(monkeypatch)
     from datetime import datetime, timedelta
     now = datetime.utcnow()
+    db.scored_candidates.rows = [
+        {
+            "symbol": "TCS",
+            "canonical_symbol": "TCS",
+            "tradingview_symbol": "NSE:TCS",
+            "index_name": "BROAD_MARKET_750",
+            "selected_for_tv": True,
+            "swing_candidate": True,
+            "swing_status": "SWING_SELECTED_FOR_TV",
+            "updated_at": now,
+        },
+        {
+            "symbol": "INFY",
+            "canonical_symbol": "INFY",
+            "tradingview_symbol": "NSE:INFY",
+            "index_name": "BROAD_MARKET_750",
+            "selected_for_tv": True,
+            "swing_candidate": True,
+            "swing_status": "SWING_SELECTED_FOR_TV",
+            "updated_at": now,
+        },
+    ]
 
     db.swing_tv_confirmations.rows = [
         {

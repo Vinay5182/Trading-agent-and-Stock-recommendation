@@ -15,10 +15,12 @@ import {
   getDashboardPaperEquity,
   getHealth,
   getMarketPipelineStatus,
+  getMomentumTvConfirmed,
   getPaperHistory,
   getPaperOpenTrades,
   getPaperSummary,
   getScanRows,
+  getSwingTvConfirmed,
   getSystemRuntimeInfo,
   getTradingViewRuntimeStatus,
   isRequestCancellation,
@@ -102,6 +104,47 @@ test("scan helpers match active backend routes", async (t) => {
 
   assert.equal(calls[0].url, "http://127.0.0.1:8011/api/scan/rows?scan_run_id=scan-1");
   assert.equal(calls[1].url, "http://127.0.0.1:8011/api/tv/runtime-status");
+});
+
+test("saved TV helpers request current scoped endpoints without arbitrary limits", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url, options });
+    return { ok: true, status: 200, text: async () => JSON.stringify({ rows: [] }) };
+  };
+
+  await getSwingTvConfirmed();
+  await getMomentumTvConfirmed();
+  await getSwingTvConfirmed({ limit: 5 });
+  await getMomentumTvConfirmed({ limit: 6 });
+
+  assert.equal(calls[0].url, "http://127.0.0.1:8011/api/swing/tv-confirmed?index_name=BROAD_MARKET_750");
+  assert.equal(calls[1].url, "http://127.0.0.1:8011/api/momentum/tv-confirmed?index_name=BROAD_MARKET_750");
+  assert.equal(calls[2].url, "http://127.0.0.1:8011/api/swing/tv-confirmed?index_name=BROAD_MARKET_750&limit=5");
+  assert.equal(calls[3].url, "http://127.0.0.1:8011/api/momentum/tv-confirmed?index_name=BROAD_MARKET_750&limit=6");
+});
+
+test("Load Saved TV actions clear stale state and show current candidate scope", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  assert.ok(appSource.includes("setSwingSavedTvResult(null);"));
+  assert.ok(appSource.includes("setLatestSwingTvRows([]);"));
+  assert.ok(appSource.includes("setSwingTvRowsLoaded(false);"));
+  assert.ok(appSource.includes("setMomentumSavedTvResult(null);"));
+  assert.ok(appSource.includes("setLatestMomentumTvRows([]);"));
+  assert.ok(appSource.includes("setMomentumTvRowsLoaded(false);"));
+  assert.ok(appSource.includes("getSwingTvConfirmed();"));
+  assert.ok(appSource.includes("getMomentumTvConfirmed();"));
+  assert.equal(appSource.includes("getSwingTvConfirmed({ limit: 50 })"), false);
+  assert.equal(appSource.includes("getMomentumTvConfirmed({ limit: 20 })"), false);
+  assert.ok(appSource.includes("Only {savedResultCount}/{candidateCount} current {strategyLabel} candidates have saved TV results."));
+  assert.ok(appSource.includes("stale or outside-scope saved TV rows ignored."));
+  assert.ok(appSource.includes("metadata={swingSavedTvResult}"));
+  assert.ok(appSource.includes("metadata={momentumSavedTvResult}"));
 });
 
 test("operator intent header is scoped to trusted mutating helpers", async (t) => {

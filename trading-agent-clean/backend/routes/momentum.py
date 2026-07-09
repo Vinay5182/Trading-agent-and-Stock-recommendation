@@ -505,39 +505,24 @@ async def get_momentum_tv_confirmed(
     timeframes: str | None = Query(default=None),
     timeframe: str | None = Query(default=None),
     limit: int | None = Query(default=None, ge=1),
+    detail: str = Query(default="compact"),
 ) -> dict:
+    from services.tv_saved_results import load_current_scoped_saved_tv_results
+
     clean_index = clean_index_name(index_name)
-    query = {"index_name": clean_index}
     checked_timeframes = parse_timeframes(timeframes, timeframe) if (timeframes or timeframe) else None
-    if checked_timeframes:
-        query["timeframes_hash"] = timeframes_hash(checked_timeframes)
     db = get_database()
-    cursor = db.momentum_tv_confirmations.find(query).sort([("updated_at", -1), ("symbol", 1)])
-    seen = set()
-    deduped_rows = []
-    async for row in cursor:
-        row.pop("_id", None)
-        row = serialize_momentum_confirmation_row(row)
-        key = (
-            row.get("symbol"),
-            row.get("tradingview_symbol"),
-            row.get("index_name"),
-            row.get("timeframes_hash"),
-        )
-        if key not in seen:
-            seen.add(key)
-            deduped_rows.append(row)
-    saved_rows_count = len(seen)
-    if limit is not None:
-        deduped_rows = deduped_rows[:limit]
-    response = {
-        "index_name": clean_index,
-        "limit": limit,
-        "saved_rows_count": saved_rows_count,
-        "rows_count": len(deduped_rows),
-        "rows": deduped_rows,
-    }
-    if checked_timeframes:
-        response["timeframes_checked"] = checked_timeframes
-        response["timeframes_hash"] = timeframes_hash(checked_timeframes)
-    return response
+    return await load_current_scoped_saved_tv_results(
+        db=db,
+        strategy_type="momentum",
+        index_name=clean_index,
+        candidate_query=momentum_tv_candidate_query(clean_index),
+        candidate_projection=MOMENTUM_CANDIDATE_FIELDS,
+        candidate_sort=[("momentum_score", -1), ("score", -1), ("traded_value", -1), ("symbol", 1)],
+        confirmation_collection_name="momentum_tv_confirmations",
+        serialize_row=serialize_momentum_confirmation_row,
+        timeframes_hash=timeframes_hash(checked_timeframes) if checked_timeframes else None,
+        timeframes_checked=checked_timeframes,
+        limit=limit,
+        detail=detail,
+    )

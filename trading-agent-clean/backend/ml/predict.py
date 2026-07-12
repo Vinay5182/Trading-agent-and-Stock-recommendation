@@ -63,3 +63,24 @@ def predict_outcome(feature_row: dict) -> dict:
         "confidence": confidence,
         "model_used": _loaded_meta.get("timestamp", "unknown")
     }
+
+if __name__ == "__main__":
+    import sys
+    if "--smoke-test" in sys.argv:
+        print("Running smoke test...")
+        # A dummy feature row containing the expected fields
+        dummy_row = {
+            "risk_score": 5,
+            "rule_score": 45,
+            "trend_score": 30,
+            "momentum_score": 50,
+            "volume_score": 15
+        }
+        try:
+            result = predict_outcome(dummy_row)
+            print("Verdict: Pipeline sound? YES")
+            print(f"Sample Prediction: {result['prediction']}")
+            print(f"Confidence: {result['confidence']}")
+        except Exception as e:
+            print("Verdict: Pipeline sound? NO")
+            print(f"Error: {e}")

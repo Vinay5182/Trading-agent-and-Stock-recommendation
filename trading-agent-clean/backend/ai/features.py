@@ -366,8 +366,7 @@ def build_ai_feature_snapshot(
             f"rule_score={rule_score_val}, trend_score={trend_score}. Silent nulls in ML dataset are prohibited."
         )
         logger.warning(msg)
-        if strict_linking:
-            raise ValueError(msg)
+        raise ValueError(msg)
 
     setup_status = _setup_status(strategy_type, scored_candidate, tv_confirmation, paper_signal, paper_trade)
     if setup_status in CLOSED_TRADE_STATUSES:

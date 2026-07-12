@@ -280,3 +280,91 @@ def test_closed_paper_outcome_result_labels(status: str, paper_pnl: float, expec
     updated = attach_closed_paper_trade_outcome(snapshot, trade)
 
     assert updated["result_label"] == expected
+
+
+def test_safety_check_ignores_future_updated_at() -> None:
+    from routes.ai import _is_document_safe_at
+    doc = {
+        "created_at": "2026-01-01T08:00:00",
+        "updated_at": "2026-01-02T08:00:00",
+    }
+    assert _is_document_safe_at(doc, "2026-01-01T12:00:00") is True
+
+
+def test_safety_check_rejects_future_created_at() -> None:
+    from routes.ai import _is_document_safe_at
+    doc = {
+        "created_at": "2026-01-02T08:00:00",
+        "updated_at": "2026-01-02T08:00:00",
+    }
+    assert _is_document_safe_at(doc, "2026-01-01T12:00:00") is False
+
+
+def test_safety_check_uses_original_event_timestamps() -> None:
+    from routes.ai import _is_document_safe_at
+    doc = {
+        "momentum_confirmed_at": "2026-01-01T08:00:00",
+        "updated_at": "2026-01-02T08:00:00",
+    }
+    assert _is_document_safe_at(doc, "2026-01-01T12:00:00") is True
+
+
+def test_missing_critical_features_raises_error() -> None:
+    candidate = fake_scored_candidate()
+    candidate.pop("score_breakdown", None)
+    candidate.pop("score", None)
+    candidate.pop("momentum_score", None)
+    
+    with pytest.raises(ValueError, match="SAFETY WARNING: Feature extraction linking failure"):
+        build_ai_feature_snapshot(
+            candidate,
+            fake_market_data(),
+            None,
+            fake_paper_signal(),
+            fake_paper_trade(),
+            snapshot_time="2026-01-01T09:15:00",
+        )
+
+
+@pytest.mark.anyio
+async def test_find_tv_confirmation_momentum() -> None:
+    from routes.ai import _find_tv_confirmation
+    class MockCol:
+        async def find_one(self, query, sort=None):
+            return {"_id": "mom_tv", "type": "momentum"}
+    
+    class MockDB:
+        momentum_tv_confirmations = MockCol()
+        swing_tv_confirmations = MockCol()
+        def __getattr__(self, name):
+            if name == "momentum_tv_confirmations": return self.momentum_tv_confirmations
+            if name == "swing_tv_confirmations": return self.swing_tv_confirmations
+            return getattr(super(), name)
+    
+    db = MockDB()
+    paper_trade = {"symbol": "TEST", "strategy_type": "momentum"}
+    res = await _find_tv_confirmation(db, paper_trade, "momentum", "1D")
+    assert res is not None
+    assert res["_id"] == "mom_tv"
+
+
+@pytest.mark.anyio
+async def test_find_tv_confirmation_swing() -> None:
+    from routes.ai import _find_tv_confirmation
+    class MockCol:
+        async def find_one(self, query, sort=None):
+            return {"_id": "swing_tv", "type": "swing"}
+    
+    class MockDB:
+        momentum_tv_confirmations = MockCol()
+        swing_tv_confirmations = MockCol()
+        def __getattr__(self, name):
+            if name == "momentum_tv_confirmations": return self.momentum_tv_confirmations
+            if name == "swing_tv_confirmations": return self.swing_tv_confirmations
+            return getattr(super(), name)
+    
+    db = MockDB()
+    paper_trade = {"symbol": "TEST", "strategy_type": "swing"}
+    res = await _find_tv_confirmation(db, paper_trade, "swing", "1D")
+    assert res is not None
+    assert res["_id"] == "swing_tv"

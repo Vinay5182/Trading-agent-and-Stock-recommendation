@@ -471,8 +471,8 @@ def _is_document_safe_at(document: dict | None, cutoff: Any) -> bool:
         document.get("source_candle_at")
         or document.get("calculation_timestamp")
         or document.get("confirmed_at")
-        or document.get("updated_at")
-        or document.get("modified_at")
+        or document.get("momentum_confirmed_at")
+        or document.get("swing_confirmed_at")
     )
     return event_time is not None and event_time <= cutoff_time
 

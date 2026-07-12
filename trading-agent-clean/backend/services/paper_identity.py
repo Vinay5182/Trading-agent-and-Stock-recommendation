@@ -6,7 +6,7 @@ from datetime import date, datetime
 from typing import Any
 
 
-SETUP_ID_VERSION = "paper_setup:v1"
+SETUP_ID_VERSION = "paper_setup:v2"
 SOURCE_ID_FIELDS = (
     "source_confirmation_id",
     "tv_confirmation_id",
@@ -14,7 +14,17 @@ SOURCE_ID_FIELDS = (
     "source_id",
 )
 SETUP_DATE_FIELDS = (
+    "source_trade_date",
+    "trade_date",
+    "session_date",
     "setup_date",
+    "source_candle_at",
+    "tv_confirmed_at",
+    "confirmed_at",
+    "swing_confirmed_at",
+    "momentum_confirmed_at",
+    "source_confirmation_updated_at",
+    "updated_at",
     "source_confirmation_created_at",
     "source_created_at",
     "signal_created_at",
@@ -102,11 +112,12 @@ def paper_setup_identity(document: dict) -> dict | None:
         return None
 
     identity = {
-        "version": 1,
+        "version": 2,
         "symbol": symbol,
         "source_signal_type": source_type,
         "timeframe": clean_timeframe(document.get("timeframe")),
         "paper_only": True,
+        "setup_date": setup_date_for_document(document) or "UNKNOWN",
     }
     source_id = first_identity_value(document, SOURCE_ID_FIELDS)
     source_collection = _clean_text(document.get("source_collection") or document.get("tv_confirmation_collection"))
@@ -114,8 +125,6 @@ def paper_setup_identity(document: dict) -> dict | None:
         identity["source_confirmation_id"] = source_id
         if source_collection:
             identity["source_collection"] = source_collection
-    else:
-        identity["setup_date"] = setup_date_for_document(document) or "UNKNOWN"
     return identity
 
 

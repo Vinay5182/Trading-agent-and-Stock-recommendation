@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from services.trade_journal import (
     JournalWriteError,
+    analytics_realized_pnl_record,
     build_trade_analytics,
     journal_completed_trade,
     sync_completed_trades_to_journal,
@@ -275,7 +276,7 @@ def test_trade_analytics_builds_dashboard_cards_and_comparisons() -> None:
     assert analytics["dashboard_cards"]["Monthly Return"] == 20.0
 
 
-def test_ambiguous_records_are_excluded_from_analytics_denominators_and_factor() -> None:
+def test_ambiguous_records_are_in_realized_pnl_but_excluded_from_denominators() -> None:
     records = [
         {
             "symbol": "WIN",
@@ -325,8 +326,88 @@ def test_ambiguous_records_are_excluded_from_analytics_denominators_and_factor()
     assert analytics["ambiguous_count"] == 1
     assert analytics["win_rate"] == 50.0
     assert analytics["profit_factor"] == 3.0
-    assert analytics["monthly_pnl"] == {"2026-06": 200.0}
+    assert analytics["monthly_pnl"] == {"2026-06": 10199.0}
+    assert analytics["yearly_pnl"] == {"2026": 10199.0}
     assert analytics["best_trade"]["symbol"] == "WIN"
     assert analytics["worst_trade"]["symbol"] == "LOSS"
     assert analytics["strategy_comparison"]["Swing"]["total_trades"] == 1
     assert analytics["grade_comparison"]["A+"]["total_trades"] == 1
+
+
+def test_ambiguous_realized_pnl_has_no_date_gate_and_unresolved_rows_are_excluded() -> None:
+    records = [
+        {
+            "symbol": "PAST_AMB",
+            "status": "AMBIGUOUS",
+            "outcome_status": "AMBIGUOUS",
+            "ambiguous": True,
+            "total_trade_pnl": 500.0,
+            "profit_percent": 500.0,
+            "exit_date": "2024-01-05T10:00:00",
+        },
+        {
+            "symbol": "CURRENT_AMB",
+            "status": "AMBIGUOUS",
+            "outcome_status": "AMBIGUOUS",
+            "ambiguous": True,
+            "total_trade_pnl": -50.0,
+            "profit_percent": -50.0,
+            "exit_date": "2026-07-10T10:00:00",
+        },
+        {
+            "symbol": "FUTURE_AMB",
+            "status": "AMBIGUOUS",
+            "outcome_status": "AMBIGUOUS",
+            "ambiguous": True,
+            "total_trade_pnl": -300.0,
+            "profit_percent": -300.0,
+            "exit_date": "2099-12-31T10:00:00",
+        },
+        {
+            "symbol": "WAIT",
+            "status": "WAITING",
+            "total_trade_pnl": 999.0,
+            "profit_percent": 999.0,
+            "exit_date": "2026-07-10T10:00:00",
+        },
+        {
+            "symbol": "ACTIVE",
+            "status": "ACTIVE",
+            "total_trade_pnl": 777.0,
+            "profit_percent": 777.0,
+            "exit_date": "2026-07-10T10:00:00",
+        },
+        {
+            "symbol": "PLANNED",
+            "status": "PLANNED",
+            "total_trade_pnl": 123.0,
+            "profit_percent": 123.0,
+            "exit_date": "2026-07-10T10:00:00",
+        },
+        {
+            "symbol": "NOT_TRIGGERED",
+            "status": "NOT_TRIGGERED",
+            "total_trade_pnl": 456.0,
+            "profit_percent": 456.0,
+            "exit_date": "2026-07-10T10:00:00",
+        },
+    ]
+
+    assert [row["symbol"] for row in records if analytics_realized_pnl_record(row)] == [
+        "PAST_AMB",
+        "CURRENT_AMB",
+        "FUTURE_AMB",
+    ]
+
+    analytics = build_trade_analytics(records)
+
+    assert analytics["total_trades"] == 0
+    assert analytics["ambiguous_count"] == 3
+    assert analytics["win_rate"] == 0.0
+    assert analytics["profit_factor"] == 0.0
+    assert analytics["monthly_pnl"] == {
+        "2024-01": 500.0,
+        "2026-07": -50.0,
+        "2099-12": -300.0,
+    }
+    assert analytics["yearly_pnl"] == {"2024": 500.0, "2026": -50.0, "2099": -300.0}

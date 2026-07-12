@@ -495,7 +495,7 @@ async def test_reliance_tcs_infy_fake_provider_paths_preview_ready(monkeypatch):
         sleep_fn=instant_sleep,
     )
 
-    assert [call["tickers"] for call in calls] == ["INFY.NS", "RELIANCE.NS", "TCS.NS"]
+    assert sorted([call["tickers"] for call in calls]) == ["INFY.NS", "RELIANCE.NS", "TCS.NS"]
     assert plan["state"] == "PREVIEW_READY"
     for symbol in ["INFY", "RELIANCE", "TCS"]:
         symbol_plan = plan["symbols"][symbol]

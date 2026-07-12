@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from config import settings, GENUINE_OPEN_STATUSES
-from services.trade_journal import analytics_eligible_record, analytics_pnl_value, load_trade_journal
+from services.trade_journal import analytics_pnl_value, analytics_realized_pnl_record, load_trade_journal
 
 def is_genuine_open_trade(trade: dict) -> bool:
     """
@@ -56,8 +56,8 @@ async def get_current_virtual_balance_and_pnl(db) -> tuple[float, float]:
     Returns (current_virtual_balance, realized_pnl) from trade journal.
     """
     journal_records = await load_trade_journal(db, 5000)
-    eligible_records = [record for record in journal_records if analytics_eligible_record(record)]
-    realized_pnl = sum(analytics_pnl_value(record) or 0.0 for record in eligible_records)
+    realized_records = [record for record in journal_records if analytics_realized_pnl_record(record)]
+    realized_pnl = sum(analytics_pnl_value(record) or 0.0 for record in realized_records)
     current_balance = settings.STARTING_VIRTUAL_BALANCE + realized_pnl
     return current_balance, realized_pnl
 

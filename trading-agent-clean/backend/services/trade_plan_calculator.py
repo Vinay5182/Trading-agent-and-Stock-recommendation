@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from config import settings
+from services.risk_reward_targets import TARGET_R_MULTIPLES, calculate_r_multiple_targets
 from services.timestamps import utc_now_iso
 
 def tick_round(val: float | None, tick: float = 0.05) -> float | None:
@@ -151,11 +152,14 @@ def calculate_trade_plan(
         return res
 
     # 4. Calculate raw R-multiple targets
-    t1_raw = tick_round(entry_price + 2 * risk_per_share, tick_size)
-    t2_raw = tick_round(entry_price + 3 * risk_per_share, tick_size)
-    t3_raw = tick_round(entry_price + 4 * risk_per_share, tick_size)
+    raw_targets = [
+        tick_round(target, tick_size)
+        for target in calculate_r_multiple_targets(entry_price, final_stop_loss, side="BUY")
+    ]
+    t1_raw, t2_raw, t3_raw = raw_targets
 
-    res["raw_targets"] = [t1_raw, t2_raw, t3_raw]
+    res["target_r_multiples"] = list(TARGET_R_MULTIPLES)
+    res["raw_targets"] = raw_targets
 
     # 5. Apply structure adjustments
     tol_pct = settings.TARGET_STRUCTURE_TOLERANCE_PERCENT
@@ -240,10 +244,10 @@ def calculate_trade_plan(
 
     res["target_rr_values"] = [round(t1_final_rr, 4), round(t2_final_rr, 4), round(t3_final_rr, 4)]
 
-    # Rule: Raw T1 RR must be >= 2.0 to proceed
-    if (t1_raw - entry_price) / risk_per_share < 2.0 - 1e-5:
+    # Preserve the existing 2R viability gate against the target ladder.
+    if max((target - entry_price) / risk_per_share for target in raw_targets) < 2.0 - 1e-5:
         res["block_code"] = "RR_BELOW_2"
-        res["block_message"] = "Raw T1 RR is below 2R limit."
+        res["block_message"] = "Target ladder does not include a 2R reward level."
         return res
 
     # 7. Sizing math

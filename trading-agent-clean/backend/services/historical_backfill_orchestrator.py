@@ -1,3 +1,4 @@
+import anyio
 import asyncio
 import hashlib
 import re
@@ -285,7 +286,7 @@ async def build_historical_multi_symbol_backfill_plan(
     include_incomplete: bool = False,
     now: datetime | None = None,
     fetcher: Any = fetch_historical_ohlcv,
-    sleep_fn: Any = asyncio.sleep,
+    sleep_fn: Any = anyio.sleep,
 ) -> dict[str, Any]:
     now_dt = now or utc_now()
     created_at = canonical_utc_iso(now_dt)
@@ -407,7 +408,7 @@ async def build_historical_multi_symbol_backfill_plan(
     has_failures = False
     rate_limit_delay = request["rate_limit_policy"]["min_delay_seconds"]
     concurrency_limit = max(1, max_concurrency)
-    semaphore = asyncio.Semaphore(concurrency_limit)
+    semaphore = anyio.Semaphore(concurrency_limit)
     effective_fetcher = fetcher or fetch_historical_ohlcv
 
     async def process_symbol(canonical: str) -> dict[str, Any]:
@@ -528,8 +529,12 @@ async def build_historical_multi_symbol_backfill_plan(
                     }
 
     # Execute all symbol plans in parallel under the semaphore
-    tasks = [process_symbol(sym) for sym in sorted_canonicals]
-    results = await asyncio.gather(*tasks)
+    results = [None] * len(sorted_canonicals)
+    async with anyio.create_task_group() as tg:
+        for i, sym in enumerate(sorted_canonicals):
+            async def _run_process(index=i, symbol=sym):
+                results[index] = await process_symbol(symbol)
+            tg.start_soon(_run_process)
 
     for sym, res in zip(sorted_canonicals, results):
         symbol_plans[sym] = res

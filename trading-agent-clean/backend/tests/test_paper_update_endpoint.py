@@ -222,6 +222,7 @@ def test_paper_summary_counts_waiting_open_and_closed_trades(monkeypatch) -> Non
             make_trade("OPEN1", "ACTIVE", paper_pnl=15.0),
             make_trade("CLOSED1", "STOPPED", paper_pnl=-10.0),
             make_trade("CLOSED2", "TARGET_2_HIT", paper_pnl=30.0),
+            make_trade("AMB1", "AMBIGUOUS", paper_pnl=50.0),
         ],
     )
     client = TestClient(app)
@@ -230,15 +231,21 @@ def test_paper_summary_counts_waiting_open_and_closed_trades(monkeypatch) -> Non
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["total_trades"] == 5
+    assert payload["total_trades"] == 6
     assert payload["waiting_trades"] == 2
     assert payload["open_trades"] == 1
-    assert payload["closed_trades"] == 2
+    assert payload["closed_trades"] == 3
     assert payload["not_triggered"] == 1
     assert payload["planned"] == 1
     assert payload["active"] == 1
     assert payload["stopped"] == 1
     assert payload["target_2_hit"] == 1
+    assert payload["ambiguous_count"] == 1
+    assert payload["total_paper_pnl"] == 85.0
+    assert payload["average_paper_pnl"] == 21.25
+    assert payload["winning_trades"] == 1
+    assert payload["losing_trades"] == 1
+    assert payload["win_rate_percent"] == 50.0
 
 
 def test_dry_run_update_endpoint_does_not_write(monkeypatch) -> None:

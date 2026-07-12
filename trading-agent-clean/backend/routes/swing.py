@@ -7,6 +7,7 @@ from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from config import settings
+from services.daily_dataset import update_daily_dataset_from_confirmation
 from database import get_database
 from routes.staleness import score_staleness_for_query
 from security.operator_intent import OPERATOR_INTENT_HEADER, require_operator_intent_value
@@ -265,7 +266,7 @@ def serialize_swing_confirmation_row(row: dict) -> dict:
     return serialized
 
 
-async def save_confirmation_row(row: dict) -> None:
+async def save_confirmation_row(row: dict) -> dict[str, Any]:
     now = row.get("swing_confirmed_at") or row.get("confirmed_at") or utc_now_iso()
     row = stamp_swing_confirmation_row(row, now)
     base_identity = {
@@ -291,6 +292,11 @@ async def save_confirmation_row(row: dict) -> None:
         },
         upsert=True,
     )
+    try:
+        return await update_daily_dataset_from_confirmation(get_database(), document, strategy_type="swing", audit_time=now)
+    except Exception as e:
+        logger.error(f"Failed to update daily dataset: {e}")
+        return {"updated_count": 0, "inserted_count": 0, "error_count": 1, "error": str(e), "validation_errors": [{"errors": [f"{type(e).__name__}: {str(e)}"]}]}
 
 
 def should_save_confirmation_row(row: dict) -> bool:
@@ -332,6 +338,7 @@ async def run_swing_tv_confirmation(
         candidates = [] if limit == 0 else await load_swing_tv_candidate_rows(clean_index, limit, offset)
     rows = []
 
+    dataset_updates = []
     for candidate in candidates:
         symbol_name = candidate.get("tradingview_symbol") or candidate.get("symbol")
         started_at = time.monotonic()
@@ -378,7 +385,9 @@ async def run_swing_tv_confirmation(
         if should_save_confirmation_row(row):
             stamp_swing_confirmation_row(row)
             if save:
-                await save_confirmation_row(row)
+                res = await save_confirmation_row(row)
+                if res:
+                    dataset_updates.append(res)
         rows.append(row)
 
     confirmed_count = sum(1 for row in rows if row.get("tv_status") == "CONFIRMED_SIGNAL")
@@ -412,6 +421,13 @@ async def run_swing_tv_confirmation(
         "saved": save,
         "rows": rows,
     }
+    if save:
+        response["daily_dataset_update"] = {
+            "processed_count": len(dataset_updates),
+            "updated_count": sum(u.get("updated_count") or 0 for u in dataset_updates),
+            "inserted_count": sum(u.get("inserted_count") or 0 for u in dataset_updates),
+            "error_count": sum(u.get("error_count") or 0 for u in dataset_updates),
+        }
     if warning:
         response["warning"] = warning
     return response

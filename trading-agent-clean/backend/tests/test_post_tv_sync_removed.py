@@ -72,6 +72,7 @@ def test_swing_tv_completion_does_not_run_paper_sync(monkeypatch) -> None:
     monkeypatch.setattr(swing, "resolve_tv_limit", fake_resolve_tv_limit)
     monkeypatch.setattr(swing, "load_swing_tv_candidate_rows", fake_load_candidates)
     monkeypatch.setattr(swing.tradingview_manager, "run_sync", fake_run_sync)
+    monkeypatch.setattr(swing.tradingview_manager, "get_preflight_status", lambda: {"operation_allowed": True})
     monkeypatch.setattr(swing, "save_confirmation_row", fake_save)
     monkeypatch.setattr(swing, "sync_trade_ready", fail_if_called, raising=False)
 
@@ -124,6 +125,7 @@ def test_momentum_tv_completion_does_not_run_paper_sync(monkeypatch) -> None:
     monkeypatch.setattr(momentum, "resolve_tv_limit", fake_resolve_tv_limit)
     monkeypatch.setattr(momentum, "load_momentum_tv_candidate_rows", fake_load_candidates)
     monkeypatch.setattr(momentum.tradingview_manager, "run_sync", fake_run_sync)
+    monkeypatch.setattr(momentum.tradingview_manager, "get_preflight_status", lambda: {"operation_allowed": True})
     monkeypatch.setattr(momentum, "save_momentum_confirmation_row", fake_save)
     monkeypatch.setattr(momentum, "sync_trade_ready", fail_if_called, raising=False)
 
@@ -162,6 +164,7 @@ def test_swing_save_false_exception_does_not_record_system_error(monkeypatch) ->
     monkeypatch.setattr(swing, "resolve_tv_limit", fake_resolve_tv_limit)
     monkeypatch.setattr(swing, "load_swing_tv_candidate_rows", fake_load_candidates)
     monkeypatch.setattr(swing.tradingview_manager, "run_sync", fake_run_sync)
+    monkeypatch.setattr(swing.tradingview_manager, "get_preflight_status", lambda: {"operation_allowed": True})
     monkeypatch.setattr(swing, "record_system_error", fake_record_system_error)
 
     result = asyncio.run(
@@ -208,6 +211,7 @@ def test_momentum_save_false_exception_does_not_record_system_error(monkeypatch)
     monkeypatch.setattr(momentum, "resolve_tv_limit", fake_resolve_tv_limit)
     monkeypatch.setattr(momentum, "load_momentum_tv_candidate_rows", fake_load_candidates)
     monkeypatch.setattr(momentum.tradingview_manager, "run_sync", fake_run_sync)
+    monkeypatch.setattr(momentum.tradingview_manager, "get_preflight_status", lambda: {"operation_allowed": True})
     monkeypatch.setattr(momentum, "record_system_error", fake_record_system_error)
 
     result = asyncio.run(

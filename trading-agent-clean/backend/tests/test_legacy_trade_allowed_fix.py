@@ -168,6 +168,10 @@ def test_terminal_setup_not_recreated():
     # Setup ID is generated from confirmation info
     row = trade_ready_row("TERMINAL")
     row["_id"] = "terminal_conf"
+    # Must add a fixed timestamp so setup_date is deterministic.
+    # Without it, setup_date defaults to utcnow() inside sync_trade_ready,
+    # which differs from the timestamp passed here, causing different setup_id hashes.
+    row["updated_at"] = "2026-06-16T09:00:00"
 
     # Let's generate setup_id manually to match the synced trade
     # _paper_docs_from_saved_row generates trade setup_id

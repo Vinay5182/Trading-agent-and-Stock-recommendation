@@ -11,6 +11,18 @@ from unittest.mock import patch, MagicMock
 from services.trade_plan_calculator import calculate_trade_plan
 from tv_confirmation import build_price_action_paper_plan, _empty_paper_trade_plan
 
+
+def assert_targets_match_entry_stop(plan: dict) -> None:
+    entry = plan["paper_entry_price"]
+    stop = plan["paper_stop_loss"]
+    risk = abs(entry - stop)
+    assert plan["paper_target_1"] == pytest.approx(entry + risk)
+    assert plan["paper_target_2"] == pytest.approx(entry + (2 * risk))
+    assert plan["paper_target_3"] == pytest.approx(entry + (3 * risk))
+    assert plan["paper_rr_1"] == pytest.approx(1.0)
+    assert plan["paper_rr_2"] == pytest.approx(2.0)
+    assert plan["paper_rr_3"] == pytest.approx(3.0)
+
 def test_regression_v2_result_always_includes_target_logic() -> None:
     # Test that V2 trade plan calculator returns target_logic on activation-allowed plans
     plan = calculate_trade_plan(
@@ -63,6 +75,7 @@ def test_regression_build_price_action_paper_plan_no_keyerror() -> None:
     assert plan_swing.get("paper_plan_valid") is True
     assert plan_swing.get("target_logic") is not None
     assert "T1" in plan_swing["target_logic"]
+    assert_targets_match_entry_stop(plan_swing)
 
     # Momentum
     analyses_mom = {
@@ -83,6 +96,7 @@ def test_regression_build_price_action_paper_plan_no_keyerror() -> None:
     assert plan_momentum.get("paper_plan_valid") is True
     assert plan_momentum.get("target_logic") is not None
     assert "T1" in plan_momentum["target_logic"]
+    assert_targets_match_entry_stop(plan_momentum)
 
 def test_regression_missing_target_logic_produces_stable_schema_error() -> None:
     # Mock calculate_trade_plan to return a plan missing "target_logic"
@@ -183,7 +197,7 @@ def test_regression_piramalfin_like_qualifying_plan_completions() -> None:
     # If the default sizing or parameters cause it to block, it must be a strategy block code, not TV_ERROR
     if plan.get("activation_allowed"):
         assert plan.get("paper_plan_valid") is True
-        assert plan.get("paper_plan_reason") == "VALID_2R_PLAN"
+        assert plan.get("paper_plan_reason") == "VALID_RR_PLAN"
         assert plan.get("target_logic") is not None
         assert "T1 at" in plan["target_logic"]
     else:

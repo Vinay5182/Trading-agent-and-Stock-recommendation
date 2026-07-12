@@ -28,6 +28,40 @@ TERMINAL_STATUSES = {
     "WON_T2",
     "WON_T3",
 }
+REALIZED_PNL_STATUSES = {
+    "COMPLETED",
+    "TARGET_HIT",
+    "T1_HIT",
+    "T2_HIT",
+    "T3_HIT",
+    "SL_HIT",
+    "STOPPED",
+    "EXITED",
+    "AMBIGUOUS",
+    # Legacy aliases already present in historical paper trade records.
+    "CLOSED",
+    "LOST_SL",
+    "STOP_HIT",
+    "STOPPED_AFTER_T1",
+    "TARGET_1_HIT",
+    "TARGET_1_HIT_FINAL",
+    "TARGET_2_HIT",
+    "TARGET_3_HIT",
+    "WON_T1",
+    "WON_T2",
+    "WON_T3",
+}
+WIN_LOSS_RATE_STATUSES = REALIZED_PNL_STATUSES - {"AMBIGUOUS"}
+UNREALIZED_PNL_STATUSES = {
+    "ACTIVE",
+    "PLANNED",
+    "NOT_TRIGGERED",
+    "WAITING",
+    "WAITING_FOR_ENTRY",
+    "T1_PARTIAL",
+    "T2_PARTIAL",
+    "EXPIRED",
+}
 TARGET_STATUSES = {
     "COMPLETED",
     "T1_HIT",
@@ -68,16 +102,47 @@ def trade_statuses(trade: dict) -> set[str]:
     }
 
 
+def analytics_statuses(record: dict) -> set[str]:
+    return {
+        status
+        for status in (
+            normalize_status(record.get("status")),
+            normalize_status(record.get("outcome_status")),
+            normalize_status(record.get("state")),
+            normalize_status(record.get("exit_reason")),
+        )
+        if status
+    }
+
+
 def is_completed_trade(trade: dict) -> bool:
     return bool(trade_statuses(trade) & TERMINAL_STATUSES)
 
 
 def is_ambiguous_trade(record: dict) -> bool:
-    return bool(record.get("ambiguous")) or "AMBIGUOUS" in trade_statuses(record) or normalize_status(record.get("exit_reason")) == "AMBIGUOUS"
+    return bool(record.get("ambiguous")) or "AMBIGUOUS" in analytics_statuses(record)
+
+
+def analytics_realized_pnl_record(record: dict) -> bool:
+    if analytics_pnl_value(record) is None:
+        return False
+    statuses = analytics_statuses(record)
+    if statuses & UNREALIZED_PNL_STATUSES and not statuses & REALIZED_PNL_STATUSES:
+        return False
+    if statuses:
+        return bool(statuses & REALIZED_PNL_STATUSES)
+    return analytics_pnl_value(record) is not None
 
 
 def analytics_eligible_record(record: dict) -> bool:
-    return not is_ambiguous_trade(record)
+    statuses = analytics_statuses(record)
+    if is_ambiguous_trade(record):
+        return False
+    if statuses & UNREALIZED_PNL_STATUSES and not statuses & WIN_LOSS_RATE_STATUSES:
+        return False
+    if statuses:
+        return bool(statuses & WIN_LOSS_RATE_STATUSES)
+    return analytics_pnl_value(record) is not None
 
 
 def number_or_none(value) -> float | None:
@@ -431,7 +496,7 @@ def analytics_summary(records: list[dict]) -> dict:
     total_loss = abs(sum(losing_pnl))
     return {
         "total_trades": len(eligible),
-        "ambiguous_count": len(records) - len(eligible),
+        "ambiguous_count": sum(1 for row in records if is_ambiguous_trade(row)),
         "win_rate": round((len(winners) / len(eligible) * 100) if eligible else 0.0, 2),
         "average_profit": round(mean(winners), 2) if winners else 0.0,
         "average_loss": round(mean(losers), 2) if losers else 0.0,
@@ -444,7 +509,7 @@ def analytics_summary(records: list[dict]) -> dict:
 def period_pnl(records: list[dict], period: str) -> dict:
     values = defaultdict(float)
     for record in records:
-        if not analytics_eligible_record(record):
+        if not analytics_realized_pnl_record(record):
             continue
         exit_dt = parse_datetime(record.get("exit_date"))
         if exit_dt is None:

@@ -10,17 +10,18 @@ import { aiDataCollectionChecklist, aiOutcomeEligibleRows, aiOutcomeSkippedRows,
 import { confirmationTimestampLabel } from "./timestampUtils";
 
 const NAV_ITEMS = [
-  { label: "Dashboard", icon: "◆" },
-  { label: "Swing Trading", icon: "↗" },
-  { label: "Momentum Trading", icon: "▲" },
-  { label: "Market Data", icon: "⌕" },
-  { label: "Paper Trades", icon: "▣" },
-  { label: "Settings", icon: "⚙" },
+  { label: "Dashboard", icon: "📊", group: "MAIN" },
+  { label: "Swing Trading", icon: "📈", group: "TRADING" },
+  { label: "Momentum Trading", icon: "🚀", group: "TRADING" },
+  { label: "Paper Trades", icon: "📜", group: "TRADING" },
+  { label: "Stock Detail", icon: "🔍", group: "TRADING" },
+  { label: "Market Data", icon: "🌍", group: "TRADING" },
+  { label: "Data Collection", icon: "🗂️", group: "DATA / AI" },
+  { label: "AI Dataset / Labels", icon: "🧠", group: "DATA / AI" },
+  { label: "System Health", icon: "🩺", group: "SYSTEM" },
+  { label: "Settings", icon: "⚙️", group: "SYSTEM" },
 ];
-
-const NAV_WITH_STOCK_DETAIL = NAV_ITEMS.some((item) => item.label === "Stock Detail")
-  ? NAV_ITEMS
-  : [...NAV_ITEMS.slice(0, 4), { label: "Stock Detail", icon: "S" }, ...NAV_ITEMS.slice(4)];
+const NAV_WITH_STOCK_DETAIL = NAV_ITEMS;
 
 const arr = (value, keys = []) => {
   if (Array.isArray(value)) return value;
@@ -125,6 +126,37 @@ function Debug({ data }) {
   return data ? <details className="debug"><summary>Last raw JSON</summary><pre>{JSON.stringify(data, null, 2)}</pre></details> : null;
 }
 const LONG_TEXT_COLUMN_PATTERN = /(reason|explanation|summary|json|comment|breakdown|warning|error|message|fields)/i;
+
+class PageErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidCatch(error, info) {
+    console.error(`page render failed: ${this.props.pageKey}`, error, info);
+  }
+
+  componentDidUpdate(prevProps) {
+    if (prevProps.pageKey !== this.props.pageKey && this.state.error) {
+      this.setState({ error: null });
+    }
+  }
+
+  render() {
+    if (!this.state.error) return this.props.children;
+    return (
+      <div className="errorPanel">
+        <strong>Page failed to render: {this.props.pageKey}</strong>
+        <p>{this.state.error?.message || String(this.state.error)}</p>
+      </div>
+    );
+  }
+}
 
 function MiniTable({ rows = [], columns = ["symbol", "score", "status"] }) {
   const safeRows = Array.isArray(rows) ? rows : [];
@@ -866,11 +898,12 @@ function SavedResultCard({ row, mode, onOpenStock }) {
   </div>;
 }
 
-function TvResultSummaryPanel({ title, rows, mode, loaded, onOpenStock }) {
+function TvResultSummaryPanel({ title, rows, mode, loaded, candidateCount: rawCandidateCount = 0, onOpenStock }) {
   const [openSection, setOpenSection] = useState(null);
   const confirmedStatuses = mode === "momentum" ? MOMENTUM_CONFIRMED_STATUSES : SWING_CONFIRMED_STATUSES;
   const waitWatchStatuses = mode === "momentum" ? MOMENTUM_WAIT_WATCH_STATUSES : SWING_WAIT_WATCH_STATUSES;
   const safeRows = Array.isArray(rows) ? rows : [];
+  const candidateCount = countValue(rawCandidateCount);
   const confirmedRows = safeRows.filter((row) => confirmedStatuses.has(savedStatus(row)));
   const waitWatchRows = safeRows.filter((row) => waitWatchStatuses.has(savedStatus(row)));
   const confirmedWatchRows = sortByTradeQuality([...confirmedRows, ...waitWatchRows]);
@@ -1091,6 +1124,7 @@ function SwingTrading({
   const [selectedSwingRow, setSelectedSwingRow] = useState(null);
   const resultRows = sortByTradeQuality(flattenMtfRows(latestSwingTvRows));
   const sortedSwingRows = [...(Array.isArray(swingRows) ? swingRows : [])].sort((a, b) => Number(b?.score || 0) - Number(a?.score || 0));
+  const swingCandidateCount = countValue(swingSummary?.swing_candidates_count ?? sortedSwingRows.length);
   const selectedRow = selectedSwingRow;
   const openSwingStock = (row) => {
     setSelectedSwingRow(row);
@@ -1144,7 +1178,7 @@ function SwingTrading({
       <SymbolFixWarnings rows={resultRows} />
       <WeeklyHistoryNotice rows={resultRows} />
     </>}
-    <TvResultSummaryPanel title="Saved / Latest Swing TV Results" rows={resultRows} mode="swing" loaded={swingTvRowsLoaded} onOpenStock={onOpenStock} />
+    <TvResultSummaryPanel title="Saved / Latest Swing TV Results" rows={resultRows} mode="swing" loaded={swingTvRowsLoaded} candidateCount={swingCandidateCount} onOpenStock={onOpenStock} />
   </div>;
 }
 
@@ -1173,6 +1207,7 @@ function MomentumTrading({
 }) {
   const [selectedMomentumRow, setSelectedMomentumRow] = useState(null);
   const sortedMomentumRows = [...(Array.isArray(momentumRows) ? momentumRows : [])].sort((a, b) => Number(b?.momentum_score || 0) - Number(a?.momentum_score || 0));
+  const momentumCandidateCount = countValue(momentumSummary?.momentum_candidates_count ?? sortedMomentumRows.length);
   const selectedRow = selectedMomentumRow;
   const resultRows = sortByTradeQuality(flattenMomentumMtfRows(latestMomentumTvRows));
   const openMomentumStock = (row) => {
@@ -1226,7 +1261,7 @@ function MomentumTrading({
     {momentumBatchResults.length > 0 && <>
       <SymbolFixWarnings rows={resultRows} />
     </>}
-    <TvResultSummaryPanel title="Saved / Latest Momentum TV Results" rows={resultRows} mode="momentum" loaded={momentumTvRowsLoaded} onOpenStock={onOpenStock} />
+    <TvResultSummaryPanel title="Saved / Latest Momentum TV Results" rows={resultRows} mode="momentum" loaded={momentumTvRowsLoaded} candidateCount={momentumCandidateCount} onOpenStock={onOpenStock} />
   </div>;
 }
 
@@ -1825,6 +1860,17 @@ const PAPER_TABLE_COLUMNS = [
   { key: "reserved_margin", label: "Reserved Margin", type: "margin" },
   { key: "setup_time", label: "Setup Time" },
 ];
+const PAPER_SORT_LABELS = {
+  "setup_time|desc": "Newest setup first",
+  "setup_time|asc": "Oldest setup first",
+  "pnl|desc": "P&L high to low",
+  "pnl|asc": "P&L low to high",
+  "t1|asc": "T1 low to high",
+  "t1|desc": "T1 high to low",
+  "symbol|asc": "Symbol A-Z",
+  "strategy|asc": "Strategy",
+  "status|asc": "Status",
+};
 const PAPER_TRADE_FILTERS = [
   { key: "waiting", label: "Waiting for Entry", groups: new Set(["waiting"]) },
   { key: "active", label: "Active Trades", groups: new Set(["active"]) },
@@ -1924,13 +1970,51 @@ function paperCellValue(row, column) {
   if (column.key === "target_3") return row?.target_3 ?? row?.t3;
   if (column.key === "pnl") {
     const statuses = paperStatusSet(row);
-    if (hasAnyPaperStatus(statuses, PAPER_EXPIRED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_COMPLETED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_STOPPED_STATUSES)) return row?.pnl_display ?? null;
+    if (hasAnyPaperStatus(statuses, PAPER_EXPIRED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_COMPLETED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_STOPPED_STATUSES)) return row?.pnl_display ?? row?.paper_pnl ?? row?.pnl ?? 0;
     return row?.pnl_display ?? row?.paper_pnl ?? row?.pnl;
   }
   if (column.key === "setup_time") return row?.setup_time ?? row?.created_at ?? row?.source_confirmation_created_at;
   if (column.key === "shares") return row;
   if (column.key === "reserved_margin") return row?.reserved_margin;
   return row?.[column.key];
+}
+function numericSortValue(value) {
+  const parsed = Number(String(value ?? "").replace(/,/g, ""));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+function paperSortValue(row, field) {
+  if (field === "strategy") return paperStrategyText(row);
+  if (field === "status") return paperDisplayStatus(row);
+  if (field === "symbol") return row?.symbol || row?.tradingview_symbol || row?.canonical_symbol || "";
+  if (field === "setup_time") return row?.setup_time ?? row?.created_at ?? row?.source_confirmation_created_at ?? "";
+  if (field === "pnl") return row?.paper_pnl ?? row?.pnl ?? row?.pnl_display ?? "";
+  if (field === "t1") return row?.target_1 ?? row?.t1 ?? "";
+  return paperCellValue(row, { key: field });
+}
+function comparePaperSortValues(a, b, field) {
+  if (field === "setup_time") {
+    const aTime = Date.parse(a);
+    const bTime = Date.parse(b);
+    const safeATime = Number.isFinite(aTime) ? aTime : 0;
+    const safeBTime = Number.isFinite(bTime) ? bTime : 0;
+    return safeATime - safeBTime;
+  }
+  const aNumber = numericSortValue(a);
+  const bNumber = numericSortValue(b);
+  if (aNumber !== null || bNumber !== null) return (aNumber ?? Number.NEGATIVE_INFINITY) - (bNumber ?? Number.NEGATIVE_INFINITY);
+  return String(a ?? "").localeCompare(String(b ?? ""), undefined, { numeric: true, sensitivity: "base" });
+}
+function sortPaperTrades(rows, sortField = "setup_time", sortDirection = "desc") {
+  const direction = sortDirection === "asc" ? 1 : -1;
+  return (Array.isArray(rows) ? rows : [])
+    .map((row, index) => ({ row, index }))
+    .sort((a, b) => {
+      const primary = comparePaperSortValues(paperSortValue(a.row, sortField), paperSortValue(b.row, sortField), sortField);
+      if (primary) return primary * direction;
+      const symbolCompare = comparePaperSortValues(paperSortValue(a.row, "symbol"), paperSortValue(b.row, "symbol"), "symbol");
+      return symbolCompare || a.index - b.index;
+    })
+    .map((entry) => entry.row);
 }
 function paperPnlClass(value) {
   const numeric = Number(value);
@@ -1939,6 +2023,322 @@ function paperPnlClass(value) {
 }
 function withPaperGroup(rows, group) {
   return (Array.isArray(rows) ? rows : []).map((trade) => ({ ...trade, paper_group: group }));
+}
+
+const PNL_CALENDAR_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const PNL_CALENDAR_WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const PNL_CALENDAR_REALIZED_GROUPS = new Set(["completed", "stopped", "ambiguous"]);
+const PNL_CALENDAR_EXTRA_REALIZED_STATUSES = new Set(["EXITED", "MANUAL_EXIT", "FORCED_EXIT"]);
+
+function parsePaperNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  const clean = String(value).replace(/[,₹%\s]/g, "");
+  if (!clean) return null;
+  const parsed = Number(clean);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+function getTradeRealizedPnl(trade) {
+  const candidates = [
+    trade?.realized_pnl,
+    trade?.paper_pnl,
+    trade?.total_pnl,
+    trade?.total_trade_pnl,
+    trade?.pnl,
+    trade?.pnl_display,
+  ];
+  for (const candidate of candidates) {
+    const parsed = parsePaperNumber(candidate);
+    if (parsed !== null) return parsed;
+  }
+  return null;
+}
+function parseTradeDate(value) {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isFinite(date.getTime()) ? date : null;
+}
+function getTradeExitDate(trade) {
+  const candidates = [
+    trade?.exit_date,
+    trade?.completed_at,
+    trade?.updated_at,
+    trade?.setup_date,
+    trade?.setup_time,
+    trade?.created_at,
+    trade?.source_confirmation_created_at,
+  ];
+  for (const candidate of candidates) {
+    const date = parseTradeDate(candidate);
+    if (date) return date;
+  }
+  return null;
+}
+function formatDateKey(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+function displayDate(date) {
+  return date.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+}
+function isAmbiguousPnlTrade(trade) {
+  return trade?.paper_group === "ambiguous" || hasAnyPaperStatus(paperStatusSet(trade), PAPER_AMBIGUOUS_STATUSES);
+}
+function isRealizedPnlTrade(trade) {
+  const statuses = paperStatusSet(trade);
+  const terminal = hasAnyPaperStatus(statuses, PAPER_COMPLETED_STATUSES)
+    || hasAnyPaperStatus(statuses, PAPER_STOPPED_STATUSES)
+    || hasAnyPaperStatus(statuses, PAPER_AMBIGUOUS_STATUSES)
+    || hasAnyPaperStatus(statuses, PNL_CALENDAR_EXTRA_REALIZED_STATUSES)
+    || PNL_CALENDAR_REALIZED_GROUPS.has(trade?.paper_group);
+  const unresolved = hasAnyPaperStatus(statuses, PAPER_WAITING_STATUSES)
+    || hasAnyPaperStatus(statuses, PAPER_ACTIVE_STATUSES)
+    || hasAnyPaperStatus(statuses, PAPER_PARTIAL_STATUSES);
+  const expiredOnly = hasAnyPaperStatus(statuses, PAPER_EXPIRED_STATUSES)
+    && !hasAnyPaperStatus(statuses, PAPER_COMPLETED_STATUSES)
+    && !hasAnyPaperStatus(statuses, PAPER_STOPPED_STATUSES)
+    && !hasAnyPaperStatus(statuses, PAPER_AMBIGUOUS_STATUSES);
+  return terminal && !unresolved && !expiredOnly;
+}
+function strategyBreakdownLabel(breakdown) {
+  const entries = Object.entries(breakdown || {}).filter(([, item]) => item.count > 0);
+  if (!entries.length) return "No strategy trades";
+  return entries.map(([strategy, item]) => `${strategy}: ${item.count} (${money(item.pnl)})`).join(", ");
+}
+function buildDailyPnlMap(trades, year, strategyFilter = "ALL") {
+  const dailyMap = new Map();
+  const cleanFilter = String(strategyFilter || "ALL").toUpperCase();
+  for (const trade of Array.isArray(trades) ? trades : []) {
+    if (!isRealizedPnlTrade(trade)) continue;
+    const strategy = paperStrategyText(trade);
+    if (cleanFilter !== "ALL" && !strategy.toUpperCase().includes(cleanFilter)) continue;
+    const pnl = getTradeRealizedPnl(trade);
+    const date = getTradeExitDate(trade);
+    if (pnl === null || !date || date.getFullYear() !== Number(year)) continue;
+    const dateKey = formatDateKey(date);
+    const day = dailyMap.get(dateKey) || {
+      date,
+      dateKey,
+      totalPnl: 0,
+      trades: 0,
+      wins: 0,
+      losses: 0,
+      ambiguous: 0,
+      bestTrade: null,
+      worstTrade: null,
+      strategyBreakdown: {},
+    };
+    day.totalPnl += pnl;
+    day.trades += 1;
+    if (pnl > 0) day.wins += 1;
+    if (pnl < 0) day.losses += 1;
+    if (isAmbiguousPnlTrade(trade)) day.ambiguous += 1;
+    const tradeSummary = { symbol: trade?.symbol || trade?.tradingview_symbol || "-", pnl };
+    if (!day.bestTrade || pnl > day.bestTrade.pnl) day.bestTrade = tradeSummary;
+    if (!day.worstTrade || pnl < day.worstTrade.pnl) day.worstTrade = tradeSummary;
+    const strategyEntry = day.strategyBreakdown[strategy] || { count: 0, pnl: 0 };
+    strategyEntry.count += 1;
+    strategyEntry.pnl += pnl;
+    day.strategyBreakdown[strategy] = strategyEntry;
+    dailyMap.set(dateKey, day);
+  }
+  return dailyMap;
+}
+function buildMonthlyPnlSummary(dailyMap, year) {
+  const months = PNL_CALENDAR_MONTHS.map((monthName, month) => ({
+    month,
+    monthName,
+    totalPnl: 0,
+    totalTrades: 0,
+    winningDays: 0,
+    losingDays: 0,
+    bestDay: null,
+    worstDay: null,
+  }));
+  for (const day of dailyMap.values()) {
+    const month = day.date.getMonth();
+    if (day.date.getFullYear() !== Number(year) || !months[month]) continue;
+    const item = months[month];
+    item.totalPnl += day.totalPnl;
+    item.totalTrades += day.trades;
+    if (day.totalPnl > 0) item.winningDays += 1;
+    if (day.totalPnl < 0) item.losingDays += 1;
+    if (!item.bestDay || day.totalPnl > item.bestDay.totalPnl) item.bestDay = day;
+    if (!item.worstDay || day.totalPnl < item.worstDay.totalPnl) item.worstDay = day;
+  }
+  return months;
+}
+function getPnlIntensityClass(value, maxAbsPnl) {
+  if (!Number.isFinite(value) || value === 0) return "pnlDayNeutral";
+  const ratio = Math.abs(value) / Math.max(Math.abs(maxAbsPnl || 0), 1);
+  const level = ratio >= 0.75 ? 4 : ratio >= 0.5 ? 3 : ratio >= 0.25 ? 2 : 1;
+  return value > 0 ? `pnlDayProfit${level}` : `pnlDayLoss${level}`;
+}
+function getTradeCountIntensityClass(count, maxCount) {
+  if (!Number.isFinite(count) || count <= 0) return "pnlDayEmpty";
+  const ratio = count / Math.max(maxCount || 0, 1);
+  const level = ratio >= 0.75 ? 4 : ratio >= 0.5 ? 3 : ratio >= 0.25 ? 2 : 1;
+  return `pnlDayCount${level}`;
+}
+function buildCalendarCells(year) {
+  const first = new Date(Number(year), 0, 1);
+  const start = new Date(first);
+  start.setDate(first.getDate() - first.getDay());
+  const last = new Date(Number(year), 11, 31);
+  const end = new Date(last);
+  end.setDate(last.getDate() + (6 - last.getDay()));
+  const cells = [];
+  const cursor = new Date(start);
+  while (cursor <= end) {
+    cells.push({
+      date: new Date(cursor),
+      dateKey: formatDateKey(cursor),
+      inYear: cursor.getFullYear() === Number(year),
+      week: Math.floor((cells.length || 0) / 7),
+      weekday: cursor.getDay(),
+    });
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return cells;
+}
+function buildMonthLabels(year, cells) {
+  return PNL_CALENDAR_MONTHS.map((monthName, month) => {
+    const firstKey = formatDateKey(new Date(Number(year), month, 1));
+    const nextKey = month < 11 ? formatDateKey(new Date(Number(year), month + 1, 1)) : null;
+    const firstCell = cells.find((cell) => cell.dateKey === firstKey);
+    const nextCell = nextKey ? cells.find((cell) => cell.dateKey === nextKey) : null;
+    const startWeek = firstCell?.week ?? 0;
+    const endWeek = nextCell?.week ?? (cells[cells.length - 1]?.week ?? startWeek) + 1;
+    return { monthName, startWeek, span: Math.max(1, endWeek - startWeek) };
+  });
+}
+function PnlCalendarCell({ cell, day, metric, maxAbsPnl, maxTradeCount }) {
+  const valueClass = day
+    ? metric === "count"
+      ? getTradeCountIntensityClass(day.trades, maxTradeCount)
+      : getPnlIntensityClass(day.totalPnl, maxAbsPnl)
+    : "pnlDayEmpty";
+  const className = [
+    "pnlDayCell",
+    valueClass,
+    cell.inYear ? "" : "pnlDayOutside",
+  ].filter(Boolean).join(" ");
+  const title = day
+    ? [
+      displayDate(day.date),
+      `P&L: ${money(day.totalPnl)}`,
+      `Trades: ${day.trades}`,
+      `Wins: ${day.wins}`,
+      `Losses: ${day.losses}`,
+      `Ambiguous: ${day.ambiguous}`,
+      `Strategy: ${strategyBreakdownLabel(day.strategyBreakdown)}`,
+      `Best: ${day.bestTrade?.symbol || "-"} ${money(day.bestTrade?.pnl ?? 0)}`,
+      `Worst: ${day.worstTrade?.symbol || "-"} ${money(day.worstTrade?.pnl ?? 0)}`,
+    ].join("\n")
+    : `${displayDate(cell.date)}\nNo closed paper trades`;
+  return (
+    <div
+      aria-label={title.replace(/\n/g, ". ")}
+      className={className}
+      role="gridcell"
+      style={{ gridColumn: cell.week + 1, gridRow: cell.weekday + 1 }}
+      title={title}
+    />
+  );
+}
+function MonthlyPnlSummary({ months }) {
+  const maxAbsPnl = Math.max(...months.map((month) => Math.abs(month.totalPnl)), 1);
+  return <div className="monthlyPnlGrid">
+    {months.map((month) => {
+      const tone = month.totalTrades === 0 ? "empty" : month.totalPnl > 0 ? "profit" : month.totalPnl < 0 ? "loss" : "flat";
+      const width = `${Math.max(4, Math.round((Math.abs(month.totalPnl) / maxAbsPnl) * 100))}%`;
+      const title = [
+        month.monthName,
+        `P&L: ${money(month.totalPnl)}`,
+        `Trades: ${month.totalTrades}`,
+        `Winning days: ${month.winningDays}`,
+        `Losing days: ${month.losingDays}`,
+        `Best day: ${month.bestDay ? `${displayDate(month.bestDay.date)} ${money(month.bestDay.totalPnl)}` : "-"}`,
+        `Worst day: ${month.worstDay ? `${displayDate(month.worstDay.date)} ${money(month.worstDay.totalPnl)}` : "-"}`,
+      ].join("\n");
+      return <div className={`monthlyPnlCard monthlyPnl-${tone}`} key={month.monthName} title={title}>
+        <span>{month.monthName}</span>
+        <strong>{money(month.totalPnl)}</strong>
+        <p>{month.totalTrades} trades</p>
+        <small>{month.winningDays} win days / {month.losingDays} loss days</small>
+        <div className="monthlyPnlBar"><i style={{ width }} /></div>
+      </div>;
+    })}
+  </div>;
+}
+function PnlCalendarHeatmap({ trades = [] }) {
+  const availableYears = useMemo(() => {
+    const years = new Set();
+    for (const trade of Array.isArray(trades) ? trades : []) {
+      if (!isRealizedPnlTrade(trade) || getTradeRealizedPnl(trade) === null) continue;
+      const date = getTradeExitDate(trade);
+      if (date) years.add(date.getFullYear());
+    }
+    return [...years].sort((a, b) => b - a);
+  }, [trades]);
+  const [manualYear, setManualYear] = useState("");
+  const [strategyFilter, setStrategyFilter] = useState("ALL");
+  const [metric, setMetric] = useState("pnl");
+  const selectedYear = Number(manualYear || availableYears[0] || new Date().getFullYear());
+  const yearOptions = availableYears.includes(selectedYear) ? availableYears : [selectedYear, ...availableYears];
+  const dailyMap = useMemo(() => buildDailyPnlMap(trades, selectedYear, strategyFilter), [trades, selectedYear, strategyFilter]);
+  const months = useMemo(() => buildMonthlyPnlSummary(dailyMap, selectedYear), [dailyMap, selectedYear]);
+  const cells = useMemo(() => buildCalendarCells(selectedYear), [selectedYear]);
+  const monthLabels = useMemo(() => buildMonthLabels(selectedYear, cells), [selectedYear, cells]);
+  const maxAbsPnl = Math.max(...[...dailyMap.values()].map((day) => Math.abs(day.totalPnl)), 1);
+  const maxTradeCount = Math.max(...[...dailyMap.values()].map((day) => day.trades), 1);
+  const gridStyle = { gridTemplateColumns: `repeat(${Math.max(...cells.map((cell) => cell.week), 0) + 1}, 12px)` };
+  const totalTrades = [...dailyMap.values()].reduce((sum, day) => sum + day.trades, 0);
+  const totalPnl = [...dailyMap.values()].reduce((sum, day) => sum + day.totalPnl, 0);
+
+  return <section className="card pnlCalendarPanel">
+    <div className="pnlCalendarHeader">
+      <div>
+        <span>analytics</span>
+        <h2>P&L Calendar</h2>
+        <p>Day-wise realized paper P&L</p>
+      </div>
+      <div className="pnlCalendarControls">
+        <label>Year<select value={selectedYear} onChange={(event) => setManualYear(event.target.value)}>
+          {yearOptions.map((year) => <option key={year} value={year}>{year}</option>)}
+        </select></label>
+        <label>Strategy<select value={strategyFilter} onChange={(event) => setStrategyFilter(event.target.value)}>
+          <option value="ALL">All</option>
+          <option value="SWING">Swing</option>
+          <option value="MOMENTUM">Momentum</option>
+        </select></label>
+        <div className="pnlMetricToggle" role="group" aria-label="P&L calendar metric">
+          <button className={metric === "pnl" ? "active" : ""} type="button" onClick={() => setMetric("pnl")}>P&L</button>
+          <button className={metric === "count" ? "active" : ""} type="button" onClick={() => setMetric("count")}>Trade Count</button>
+        </div>
+      </div>
+    </div>
+    <div className="pnlCalendarTotals">
+      <span>{totalTrades} closed trades</span>
+      <strong className={paperPnlClass(totalPnl)}>{money(totalPnl)}</strong>
+    </div>
+    <div className="pnlHeatmap" aria-label={`Daily realized paper P&L for ${selectedYear}`}>
+      <div className="pnlHeatmapScroll">
+        <div className="pnlMonthLabels" style={gridStyle}>
+          {monthLabels.map((month) => <span key={month.monthName} style={{ gridColumn: `${month.startWeek + 1} / span ${month.span}` }}>{month.monthName}</span>)}
+        </div>
+        <div className="pnlHeatmapBody">
+          <div className="pnlWeekdayLabels">{PNL_CALENDAR_WEEKDAYS.map((day) => <span key={day}>{day}</span>)}</div>
+          <div className="pnlHeatmapGrid" role="grid" style={gridStyle}>
+            {cells.map((cell) => <PnlCalendarCell key={cell.dateKey} cell={cell} day={dailyMap.get(cell.dateKey)} metric={metric} maxAbsPnl={maxAbsPnl} maxTradeCount={maxTradeCount} />)}
+          </div>
+        </div>
+      </div>
+    </div>
+    <MonthlyPnlSummary months={months} />
+  </section>;
 }
 function PaperTradeTable({ rows, loading, emptyMessage }) {
   const safeRows = Array.isArray(rows) ? rows : [];
@@ -2003,6 +2403,7 @@ function PaperTrades({ openTrades, history, summary, liveStatus }) {
   const stoppedTrades = withPaperGroup(arr(history, ["sl_hit"]), "stopped");
   const ambiguousTrades = withPaperGroup(arr(history, ["ambiguous"]), "ambiguous");
   const expiredTrades = withPaperGroup(arr(history, ["expired_not_triggered"]), "expired");
+  const calendarTrades = dedupePaperTrades([...completedTrades, ...stoppedTrades, ...ambiguousTrades]);
   const allRows = dedupePaperTrades([...waitingTrades, ...activeTrades, ...completedTrades, ...stoppedTrades, ...ambiguousTrades, ...expiredTrades]);
   const selectedFilter = PAPER_TRADE_FILTERS.find((filter) => filter.key === activeTradeFilter) || PAPER_TRADE_FILTERS[0];
   const tabRows = selectedFilter.groups ? allRows.filter((trade) => selectedFilter.groups.has(trade.paper_group)) : allRows;
@@ -2026,6 +2427,7 @@ function PaperTrades({ openTrades, history, summary, liveStatus }) {
         <StatCard label="Target Hit" value={targetHitCount} />
         <StatCard label="SL Hit" value={slHitCount} tone="red" />
       </div>
+      <PnlCalendarHeatmap trades={calendarTrades} />
       <div className="card paperTableCard">
         <div className="paperTradeToolbar">
           <div className="paperFilterButtons" role="group" aria-label="Paper trade status filter">
@@ -2111,6 +2513,52 @@ function Settings({ settings, health, runtimeInfo, tvRuntimeStatus, tvAttachable
       </div>
     </Card>
     <Card title="TradingView Desktop Reminder"><p className="muted">Keep TradingView Desktop running with debug port 9222, logged in, and one chart tab open. Attach that chart here before running TV confirmation.</p></Card>
+  </div>;
+}
+
+function DataCollectionPage({ collectionStatus, summary }) {
+  return <div className="pageStack">
+    <div className="topHeader"><div><h2>Data Collection</h2><p>Read-only data collection status</p></div></div>
+    <div className="pageContent pageStack">
+      <Card title="Data Collection Pipeline" eyebrow="read-only tracking">
+        <div className="datasetTrackingReminder">This page tracks data collection only. It does not generate predictions.</div>
+        <div className="statsGrid compact aiDatasetBreakdowns">
+          <StatCard label="Total Paper Trades" value={collectionStatus?.total_paper_trades ?? "--"} />
+          <StatCard label="Terminal Paper Trades" value={collectionStatus?.terminal_paper_trades ?? "--"} />
+          <StatCard label="Waiting Paper Trades" value={collectionStatus?.waiting_paper_trades ?? "--"} />
+          <StatCard label="Open Paper Trades" value={collectionStatus?.open_paper_trades ?? "--"} />
+        </div>
+        <div className="datasetTrackingReminder" style={{ marginTop: '15px' }}>
+          Terminal trades missing AI snapshots: {collectionStatus?.terminal_trades_without_ai_snapshot_symbols?.join(", ") || "none"}
+        </div>
+      </Card>
+      <Card title="Historical Market Data" eyebrow="read-only coverage">
+        <div className="statsGrid compact">
+          <StatCard label="OHLCV Checkpoint" value="Tracking active" tone="green" />
+          <StatCard label="Candidates Scored" value="Available" tone="green" />
+        </div>
+      </Card>
+    </div>
+  </div>;
+}
+
+function AiDatasetPage({ summary, snapshots, outcomePreview, filters, onFiltersChange, onRefresh, loading, errors }) {
+  return <div className="pageStack">
+    <div className="topHeader"><div><h2>AI Dataset / Labels</h2><p>Read-only dataset readiness</p></div></div>
+    <div className="pageContent pageStack">
+      <AiDatasetSummary summary={summary} snapshots={snapshots} outcomePreview={outcomePreview} filters={filters} onFiltersChange={onFiltersChange} onRefresh={onRefresh} loading={loading} errors={errors} />
+    </div>
+  </div>;
+}
+
+function SystemHealthPage({ health, tvRuntimeStatus, schedulerStatus, runs }) {
+  return <div className="pageStack">
+    <div className="topHeader"><div><h2>System Health</h2><p>Backend API, TV, and Automation Status</p></div></div>
+    <div className="pageContent pageStack">
+      <DashboardHealthPanel health={health} tradingViewStatus={tvRuntimeStatus} schedulerStatus={schedulerStatus} />
+      <PaperAutomationStatus scheduler={schedulerStatus} />
+      <PaperUpdateRunHistory runs={runs} />
+    </div>
   </div>;
 }
 
@@ -3281,20 +3729,37 @@ export default function App() {
     if (activePage === "Stock Detail") return <StockDetailPage search={search} stockMarketData={stockMarketData} stockSwingPrecheck={stockSwingPrecheck} stockMomentumPrecheck={stockMomentumPrecheck} stockSwingTvResult={stockSwingTvResult} stockMomentumTvResult={stockMomentumTvResult} stockSavedSwingResult={stockSavedSwingResult} stockSavedMomentumResult={stockSavedMomentumResult} latestSwingTvRows={latestSwingTvRows} latestMomentumTvRows={latestMomentumTvRows} stockSwingTimeframes={stockSwingTimeframes} setStockSwingTimeframes={setStockSwingTimeframes} stockMomentumTimeframes={stockMomentumTimeframes} setStockMomentumTimeframes={setStockMomentumTimeframes} onLoadStockMarket={handlers.stockMarketData} onSwingPrecheck={handlers.stockSwingPrecheck} onMomentumPrecheck={handlers.stockMomentumPrecheck} onStockSwingTvConfirm={handlers.stockSwingTvConfirm} onStockMomentumTvConfirm={handlers.stockMomentumTvConfirm} loading={!!loading} />;
     if (activePage === "Paper Trades") return <PaperTrades openTrades={paperOpenTrades} history={paperHistory} summary={summary} liveStatus={paperLiveStatus} />;
     if (activePage === "Settings") return <Settings settings={settings} health={health} runtimeInfo={systemRuntimeInfo} tvRuntimeStatus={tvRuntimeStatus} tvAttachableTabs={tvAttachableTabs} onRefreshTvTabs={handlers.tvRefreshTabs} onAttachTvTab={handlers.tvAttachTab} onDetachTvTab={handlers.tvDetachTab} loading={!!loading} />;
+    if (activePage === "Data Collection") return <DataCollectionPage collectionStatus={aiDataCollectionStatus} summary={aiDatasetSummary} />;
+    if (activePage === "AI Dataset / Labels") return <AiDatasetPage summary={aiDatasetSummary} snapshots={filteredAiFeatureSnapshots} outcomePreview={filteredAiOutcomePreview} filters={aiDatasetFilters} onFiltersChange={setAiDatasetFilters} onRefresh={handlers.aiDatasetSummary} loading={loading === "AI dataset summary"} errors={aiDatasetErrors} />;
+    if (activePage === "System Health") return <SystemHealthPage health={health} tvRuntimeStatus={tvRuntimeStatus} schedulerStatus={paperUpdateScheduler} runs={paperUpdateRuns} />;
+
     return <Dashboard summary={summary} scoreSummary={scoreSummary} swingSummary={swingSummary} momentumSummary={momentumSummary} dashboardEquity={dashboardEquity} health={health} tvRuntimeStatus={tvRuntimeStatus} aiDatasetSummary={aiDatasetSummary} aiFeatureSnapshots={filteredAiFeatureSnapshots} aiOutcomePreview={filteredAiOutcomePreview} aiDataCollectionStatus={aiDataCollectionStatus} aiDatasetFilters={aiDatasetFilters} aiDatasetErrors={aiDatasetErrors} dashboardErrors={dashboardErrors} paperUpdateProgress={paperUpdateProgress} paperUpdateRuns={paperUpdateRuns} paperUpdateLock={paperUpdateLock} paperUpdateScheduler={paperUpdateScheduler} onSummary={handlers.loadSummary} onDryRun={handlers.dryRun} onSaveRun={handlers.saveRun} onAiDatasetRefresh={handlers.aiDatasetSummary} onAiDatasetFiltersChange={setAiDatasetFilters} aiDatasetLoading={loading === "AI dataset summary"} loading={!!loading} />;
   }, [activePage, settings, health, systemRuntimeInfo, summary, scoreSummary, swingSummary, momentumSummary, dashboardEquity, tvRuntimeStatus, tvRuntimeLastUpdatedAt, tvAttachableTabs, aiDatasetSummary, filteredAiFeatureSnapshots, filteredAiOutcomePreview, aiDataCollectionStatus, aiDatasetFilters, aiDatasetErrors, dashboardErrors, paperUpdateProgress, paperUpdateRuns, paperUpdateLock, paperUpdateScheduler, swingRows, latestSwingTvRows, swingTvRowsLoaded, swingBatchResults, swingBatchProgress, swingBatchError, swingBatchStopRequested, swingBatchStopMessage, swingCandidatesStale, momentumRows, momentumCandidatesStale, latestMomentumTvRows, momentumTvRowsLoaded, momentumBatchResults, momentumBatchProgress, momentumBatchError, momentumBatchStopRequested, momentumBatchStopMessage, stockMarketData, stockSwingPrecheck, stockMomentumPrecheck, stockSwingTvResult, stockMomentumTvResult, stockSavedSwingResult, stockSavedMomentumResult, stockSwingTimeframes, stockMomentumTimeframes, search, tv, tvResult, marketLoadResult, marketProgress, scoreRunResult, marketDataNeedsScore, paperOpenTrades, paperHistory, paperLiveStatus, loading, lastResponse]);
 
   const tvBadge = tradingViewBadge(tvRuntimeStatus);
 
   return <div className="appShell">
-    <aside className="sidebar"><div className="brand"><div className="brandMark">TA</div><div><h1>Trading Agent</h1><p>Paper Terminal</p></div></div><div className="navSeparator">Workspace</div><nav>{NAV_WITH_STOCK_DETAIL.map((item) => <button className={activePage === item.label ? "navItem active" : "navItem"} key={item.label} onClick={() => setActivePage(item.label)}><span>{item.icon}</span>{item.label}</button>)}</nav><div className="sidebarFooter"><Badge tone="yellow">PAPER ONLY</Badge><p>No live trading. No broker orders.</p></div></aside>
+    <aside className="sidebar"><div className="brand"><div className="brandMark">TA</div><div><h1>Trading Agent</h1><p>Paper Terminal</p></div></div><nav>
+      {["MAIN", "TRADING", "DATA / AI", "SYSTEM"].map(groupName => (
+        <React.Fragment key={groupName}>
+          <div className="navSeparator">{groupName}</div>
+          {NAV_WITH_STOCK_DETAIL.filter(item => item.group === groupName).map((item) => (
+            <button className={activePage === item.label ? "navItem active" : "navItem"} key={item.label} onClick={() => setActivePage(item.label)}><span>{item.icon}</span>{item.label}</button>
+          ))}
+        </React.Fragment>
+      ))}
+    </nav><div className="sidebarFooter"><Badge tone="yellow">PAPER ONLY</Badge><p>No live trading. No broker orders.</p></div></aside>
     <div className="mainArea">
       <header className="topHeader"><div><h2>{activePage}</h2><p>API base: {API_BASE}</p></div><input className="searchInput" value={search} onChange={(e) => { setSearch(e.target.value); if (e.target.value.trim()) setActivePage("Stock Detail"); }} placeholder="Search NSE/BSE symbols..." /><div className="statusBadges"><Badge tone={health.online ? "green" : "red"}>Market API {health.status}</Badge><Badge tone={tvBadge.tone}>{tvBadge.label}</Badge><Badge tone="yellow">Paper Mode</Badge></div></header>
       <section className="modeBanner"><strong>PAPER MODE / NO LIVE ORDERS</strong><span>Simulated signals and paper trade plans only.</span></section>
       {loading && <div className="noticePanel">Loading {loading}...</div>}
       {notice && <div className="warningText appNotice">{notice}</div>}
       {error && <div className="errorPanel">{error}</div>}
-      <main className="pageContent">{page}</main>
+      <main className="pageContent">
+        <PageErrorBoundary key={activePage} pageKey={activePage}>
+          {page}
+        </PageErrorBoundary>
+      </main>
     </div>
   </div>;
 }

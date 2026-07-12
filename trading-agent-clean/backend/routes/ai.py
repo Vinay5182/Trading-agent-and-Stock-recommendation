@@ -847,7 +847,7 @@ async def _build_candidate_feature_snapshots(db, strategy: str, limit: int, time
                 paper_trade,
                 snapshot_time=snapshot_time,
                 timeframe=timeframe,
-                strict_linking=True,
+                strict_linking=False,
             )
         except ValueError:
             continue
@@ -958,7 +958,7 @@ async def _build_paper_trade_backfill_snapshots(
                 paper_trade,
                 snapshot_time=str(snapshot_time),
                 timeframe=trade_timeframe,
-                strict_linking=True,
+                strict_linking=False,
             )
         except ValueError:
             continue

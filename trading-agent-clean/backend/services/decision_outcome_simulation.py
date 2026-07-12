@@ -2,6 +2,8 @@ import math
 from datetime import datetime, UTC
 from typing import Any, Mapping
 
+from services.risk_reward_targets import calculate_r_multiple_targets
+
 SIMULATION_PROFILE = "baseline_long_atr_1r2r_v1"
 SIMULATION_VERSION = "1.0.0"
 
@@ -52,10 +54,7 @@ def simulate_event_outcome(event: Mapping[str, Any], future_candles: list[dict[s
         target_source = "source_targets"
     else:
         if entry_price is not None and stop_loss is not None:
-            risk_per_share = entry_price - stop_loss
-            target_1 = entry_price + 1 * risk_per_share
-            target_2 = entry_price + 2 * risk_per_share
-            target_3 = entry_price + 3 * risk_per_share
+            target_1, target_2, target_3 = calculate_r_multiple_targets(entry_price, stop_loss)
             target_source = "baseline_1r_2r_3r"
         else:
             target_1 = None

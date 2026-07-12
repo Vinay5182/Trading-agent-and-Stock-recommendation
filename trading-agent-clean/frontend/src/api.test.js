@@ -354,6 +354,26 @@ test("Paper Trades is live without manual load or update buttons", () => {
   assert.equal(paperTradesSource.includes(["Update Paper", "Trades"].join(" ")), false);
 });
 
+test("Paper Trades P&L calendar includes ambiguous realized trades without date gating", () => {
+  const source = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+  const calendarGroupsStart = source.indexOf("const PNL_CALENDAR_REALIZED_GROUPS");
+  const calendarGroupsSource = source.slice(calendarGroupsStart, calendarGroupsStart + 160);
+  const dailyMapStart = source.indexOf("function buildDailyPnlMap");
+  const dailyMapEnd = source.indexOf("function buildMonthlyPnlSummary", dailyMapStart);
+  const dailyMapSource = source.slice(dailyMapStart, dailyMapEnd);
+  const paperStart = source.indexOf("function PaperTrades");
+  const paperEnd = source.indexOf("function Settings", paperStart);
+  const paperTradesSource = source.slice(paperStart, paperEnd);
+
+  assert.ok(calendarGroupsSource.includes("\"ambiguous\""));
+  assert.ok(dailyMapSource.includes("isRealizedPnlTrade(trade)"));
+  assert.ok(dailyMapSource.includes("day.ambiguous += 1"));
+  assert.equal(dailyMapSource.includes("Date.now()"), false);
+  assert.equal(dailyMapSource.toLowerCase().includes("today"), false);
+  assert.ok(paperTradesSource.includes("const ambiguousTrades = withPaperGroup(arr(history, [\"ambiguous\"]), \"ambiguous\");"));
+  assert.ok(paperTradesSource.includes("const calendarTrades = dedupePaperTrades([...completedTrades, ...stoppedTrades, ...ambiguousTrades]);"));
+});
+
 test("stock detail requests cancel stale responses and abort on unmount", () => {
   const source = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
 

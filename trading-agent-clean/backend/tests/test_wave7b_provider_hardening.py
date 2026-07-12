@@ -240,10 +240,21 @@ def test_r047_momentum_deduplication(monkeypatch):
             raise StopAsyncIteration
 
     mock_db = MagicMock()
-    mock_db.momentum_tv_confirmations.find = lambda *a, **k: FakeCursor([
+    confirmations_data = [
         {"symbol": "RELIANCE", "tradingview_symbol": "NSE:RELIANCE", "index_name": "NIFTY_50", "timeframes_hash": "H1", "updated_at": "2026-06-29T10:00:00"},
         {"symbol": "RELIANCE", "tradingview_symbol": "NSE:RELIANCE", "index_name": "NIFTY_50", "timeframes_hash": "H1", "updated_at": "2026-06-29T09:00:00"},
-    ])
+    ]
+    candidates_data = [
+        {"symbol": "RELIANCE", "canonical_symbol": "RELIANCE", "tradingview_symbol": "NSE:RELIANCE", "momentum_candidate": True, "momentum_score": 80, "updated_at": "2026-06-29T08:00:00"},
+    ]
+    mock_db.momentum_tv_confirmations.find = lambda *a, **k: FakeCursor(confirmations_data)
+    mock_db.scored_candidates.find = lambda *a, **k: FakeCursor(candidates_data)
+    # tv_saved_results.py uses db[collection_name] (dict access), not db.collection_name
+    mock_db.__getitem__ = lambda self, name: (
+        mock_db.momentum_tv_confirmations if name == "momentum_tv_confirmations"
+        else mock_db.scored_candidates if name == "scored_candidates"
+        else MagicMock()
+    )
 
     monkeypatch.setattr("routes.momentum.get_database", lambda: mock_db)
 

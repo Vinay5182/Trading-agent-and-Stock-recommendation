@@ -3,9 +3,9 @@ from math import floor
 
 from database import get_database
 from services.trade_journal import (
-    analytics_eligible_record,
     analytics_pnl_value,
     analytics_profit_percent_value,
+    analytics_realized_pnl_record,
     build_trade_analytics,
     is_ambiguous_trade,
     load_trade_journal,
@@ -314,8 +314,8 @@ async def get_paper_equity() -> dict:
     trades = [trade async for trade in cursor]
     journal_records = await load_trade_journal(db, 5000)
     analytics = build_trade_analytics(journal_records)
-    eligible_records = [record for record in journal_records if analytics_eligible_record(record)]
-    realized_pnl = sum(analytics_pnl_value(record) or 0.0 for record in eligible_records)
+    realized_records = [record for record in journal_records if analytics_realized_pnl_record(record)]
+    realized_pnl = sum(analytics_pnl_value(record) or 0.0 for record in realized_records)
     settled_balance = STARTING_VIRTUAL_BALANCE + realized_pnl
 
     open_trades = [trade for trade in trades if is_genuine_open_trade(trade)]
@@ -372,7 +372,7 @@ async def get_paper_equity() -> dict:
 
     capital_returned_from_latest_exits = sum(r["cash_returned_on_final_exit"] for r in recent_completed_rows)
 
-    equity_curve, drawdown_percent = _equity_curve(eligible_records)
+    equity_curve, drawdown_percent = _equity_curve(realized_records)
     open_positions = _open_position_rows(open_trades, settled_balance)
 
     latest_fields = (

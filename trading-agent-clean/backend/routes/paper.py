@@ -32,6 +32,7 @@ from services.tradingview_manager import tradingview_manager
 from services.trade_journal import (
     analytics_eligible_record,
     analytics_pnl_value,
+    analytics_realized_pnl_record,
     get_trade_analytics,
     is_completed_trade,
     journal_completed_trade,
@@ -1041,10 +1042,17 @@ def paper_api_row(trade: dict, market_map: dict | None = None) -> dict:
     price_warning = None
 
     if canceled_or_expired:
-        current_price = None
+        if market_map:
+            price_val, updated_at, source, price_warn = resolve_fresh_quote(trade, market_map)
+            current_price = price_val
+            price_updated_at = updated_at
+            price_source = source
+            price_warning = price_warn
+        else:
+            current_price = None
+            price_updated_at = trade.get("status_updated_at") or trade.get("updated_at")
+            price_source = "not_triggered_or_expired"
         exit_price = None
-        price_updated_at = trade.get("status_updated_at") or trade.get("updated_at")
-        price_source = "not_triggered_or_expired"
     elif status in {"WAITING_FOR_ENTRY", "ACTIVE", "T1_PARTIAL", "T2_PARTIAL"}:
         if market_map:
             price_val, updated_at, source, price_warn = resolve_fresh_quote(trade, market_map)
@@ -1062,6 +1070,12 @@ def paper_api_row(trade: dict, market_map: dict | None = None) -> dict:
     return {
         "paper_trade_id": str(trade.get("_id")) if trade.get("_id") is not None else trade.get("paper_trade_id"),
         "setup_id": trade.get("setup_id"),
+        "setup_date": trade.get("setup_date"),
+        "source_trade_date": trade.get("source_trade_date"),
+        "source_candle_at": trade.get("source_candle_at"),
+        "tv_confirmed_at": trade.get("tv_confirmed_at"),
+        "source_confirmation_created_at": trade.get("source_confirmation_created_at"),
+        "source_confirmation_updated_at": trade.get("source_confirmation_updated_at"),
         "symbol": trade.get("symbol"),
         "tradingview_symbol": trade.get("tradingview_symbol"),
         "strategy": strategy_label_for_trade(trade),
@@ -1888,7 +1902,16 @@ def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: fl
         "updated_at": now,
         "source": "tradingview",
     }
-    for field in ("source_confirmation_id", "source_collection", "source_confirmation_created_at", "setup_date"):
+    for field in (
+        "source_confirmation_id",
+        "source_collection",
+        "source_confirmation_created_at",
+        "source_confirmation_updated_at",
+        "source_candle_at",
+        "source_trade_date",
+        "setup_date",
+        "tv_confirmed_at",
+    ):
         if signal.get(field) not in (None, ""):
             plan[field] = signal[field]
     return apply_setup_identity(plan)
@@ -3784,8 +3807,9 @@ async def get_paper_summary() -> dict:
     waiting = [trade for trade in trades if is_waiting_trade(trade)]
     active = [trade for trade in trades if is_open_trade(trade)]
     closed = [trade for trade in trades if is_terminal_trade(trade)]
+    realized_closed = [trade for trade in closed if analytics_realized_pnl_record(trade)]
     eligible_closed = [trade for trade in closed if analytics_eligible_record(trade)]
-    pnl_trades = active + eligible_closed
+    pnl_trades = active + realized_closed
     total_pnl = sum(analytics_pnl_value(trade) or 0 for trade in pnl_trades)
     winning = [trade for trade in eligible_closed if (analytics_pnl_value(trade) or 0) > 0]
     losing = [trade for trade in eligible_closed if (analytics_pnl_value(trade) or 0) < 0]

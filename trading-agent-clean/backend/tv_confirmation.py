@@ -2,6 +2,7 @@ import time
 from datetime import datetime, timezone
 
 from config import settings
+from services.risk_reward_targets import TARGET_R_MULTIPLES, calculate_r_multiple_targets
 from tv_client import (
     TradingViewClient,
     normalize_timeframe,
@@ -25,6 +26,10 @@ def _round(value, digits: int = 4):
     if number is None:
         return None
     return round(number, digits)
+
+
+def _target_ladder_text(prefix: str = "entry +") -> str:
+    return "; ".join(f"T{idx} = {prefix} {int(multiple)}R" for idx, multiple in enumerate(TARGET_R_MULTIPLES, start=1))
 
 
 def _candle_time_value(candle: dict | None):
@@ -1009,12 +1014,12 @@ def _paper_wait_setup(strategy: str, tv_status: str, analyses: dict, reason: str
             "trigger_condition": f"Wait for bullish rejection or {trigger_frame} close above the trigger candle high.",
             "entry_condition": "No immediate entry while setup is in watch/wait state.",
             "stop_loss_logic": "Planned SL goes below the pullback swing low/support zone with ATR buffer when trigger forms.",
-            "target_logic": "After trigger, T1 is minimum 2R, T2 is 3R, T3 is 4R or nearest higher resistance.",
+            "target_logic": "After trigger, T1 is 1R, T2 is 2R, T3 is 3R or nearest higher resistance.",
             "invalidation_condition": "Avoid if pullback breaks support, fake breakout risk turns HIGH, or candle safety fails.",
             "next_action_for_paper_trade": "WAIT_FOR_TRIGGER",
             "entry_readiness": "WAIT_PULLBACK" if "PULLBACK" in tv_status else "WAIT_RETEST",
             "planned_stop_loss_logic": "Below pullback swing low/support zone with ATR buffer.",
-            "planned_targets_after_trigger": "T1 = entry + 2R; T2 = entry + 3R; T3 = entry + 4R or nearest higher resistance.",
+            "planned_targets_after_trigger": f"{_target_ladder_text()} or nearest higher resistance.",
         }
     )
     if not plan["entry_zone"]:
@@ -1042,11 +1047,9 @@ def _paper_wait_setup(strategy: str, tv_status: str, analyses: dict, reason: str
         )
         return plan
 
-    projected_t1 = projected_entry + (2 * projected_risk)
-    projected_t2 = projected_entry + (3 * projected_risk)
-    projected_t3 = projected_entry + (4 * projected_risk)
+    projected_t1, projected_t2, projected_t3 = calculate_r_multiple_targets(projected_entry, projected_stop)
     nearest_resistance = _paper_nearest_resistance(projected_entry, analyses)
-    blocked_by_resistance = nearest_resistance is not None and nearest_resistance < projected_t1
+    blocked_by_resistance = nearest_resistance is not None and nearest_resistance < projected_t2
     plan.update(
         {
             "projected_entry_price": _round(projected_entry),
@@ -1055,11 +1058,11 @@ def _paper_wait_setup(strategy: str, tv_status: str, analyses: dict, reason: str
             "projected_target_2": _round(projected_t2),
             "projected_target_3": _round(projected_t3),
             "projected_risk_per_share": _round(projected_risk),
-            "projected_rr_1": 2.0,
-            "projected_rr_2": 3.0,
-            "projected_rr_3": 4.0,
+            "projected_rr_1": TARGET_R_MULTIPLES[0],
+            "projected_rr_2": TARGET_R_MULTIPLES[1],
+            "projected_rr_3": TARGET_R_MULTIPLES[2],
             "projected_plan_valid": not blocked_by_resistance,
-            "projected_plan_reason": "PROJECTED_2R_BLOCKED_BY_RESISTANCE" if blocked_by_resistance else "PROJECTED_WAIT_PLAN_AFTER_TRIGGER",
+            "projected_plan_reason": "PROJECTED_TARGET_BLOCKED_BY_RESISTANCE" if blocked_by_resistance else "PROJECTED_WAIT_PLAN_AFTER_TRIGGER",
             "fallback_buffer_used": fallback_buffer_used,
         }
     )
@@ -1333,7 +1336,7 @@ def build_price_action_paper_plan(
         "paper_rr_2": plan_res["t2_final_rr"],
         "paper_rr_3": plan_res["t3_final_rr"],
         "paper_plan_valid": True,
-        "paper_plan_reason": "VALID_2R_PLAN",
+        "paper_plan_reason": "VALID_RR_PLAN",
         "entry_zone": _price_zone_text(entry_high, plan_res["entry_price"]),
         "pullback_zone": _price_zone_text(support, plan_res["final_stop_loss"]),
         "trigger_condition": f"{entry_frame or '1H'} close or buy-stop trigger above {_round(entry_high)}.",
@@ -1344,7 +1347,7 @@ def build_price_action_paper_plan(
         "next_action_for_paper_trade": "PAPER_PLAN_READY",
         "entry_readiness": "READY",
         "planned_stop_loss_logic": "Below pullback/retest swing low with ATR buffer.",
-        "planned_targets_after_trigger": "T1 = entry + 2R; T2 = entry + 3R; T3 = entry + 4R or nearest higher resistance.",
+        "planned_targets_after_trigger": f"{_target_ladder_text()} or nearest higher resistance.",
         "target_1_adjusted_to_resistance": resistance_blocks_2r,
         **plan_res,
     }
@@ -1612,11 +1615,12 @@ def confirm_swing_from_candles(candles: list[dict], candidate: dict, timeframe: 
         stop_candidates.append(entry_price - (1.5 * atr14))
     stop_loss = max(stop_candidates) if stop_candidates else None
     risk = entry_price - stop_loss if stop_loss is not None else None
-    target_1 = entry_price + (2 * risk) if risk and risk > 0 else None
-    target_2 = entry_price + (3 * risk) if risk and risk > 0 else None
+    target_1, target_2, target_3 = calculate_r_multiple_targets(entry_price, stop_loss) if risk and risk > 0 else (None, None, None)
     risk_reward_1 = (target_1 - entry_price) / risk if target_1 is not None and risk and risk > 0 else None
+    risk_reward_2 = (target_2 - entry_price) / risk if target_2 is not None and risk and risk > 0 else None
+    confirmation_rr = risk_reward_2
     risk_percent = (risk / entry_price) * 100 if risk and entry_price > 0 else None
-    rr_quality = _risk_reward_quality(risk_reward_1, risk_percent)
+    rr_quality = _risk_reward_quality(confirmation_rr, risk_percent)
 
     fell_below_breakout_level = last_close < prior_high_20
     if breakout and (volume_strength is None or volume_strength < 1.0 or fell_below_breakout_level):
@@ -1632,7 +1636,7 @@ def confirm_swing_from_candles(candles: list[dict], candidate: dict, timeframe: 
     last_body = abs(last["close"] - last["open"])
     huge_extended_move = (atr14 is not None and last_range > 2.5 * atr14) or (last_body / last_close) > 0.06
     far_above_ema20 = ema20 is not None and ema20 > 0 and ((last_close - ema20) / ema20) > 0.08
-    weak_rr = risk_reward_1 is None or risk_reward_1 < 2.2 or rr_quality in {"WEAK", "INVALID"}
+    weak_rr = confirmation_rr is None or confirmation_rr < 2.2 or rr_quality in {"WEAK", "INVALID"}
     near_resistance = resistance > 0 and last_close >= resistance * 0.98
     if huge_extended_move and far_above_ema20 and weak_rr:
         retail_trap_risk = "HIGH"
@@ -1649,7 +1653,7 @@ def confirm_swing_from_candles(candles: list[dict], candidate: dict, timeframe: 
             1 if retest_zone or breakout else 0,
             1 if last_candle_signal in {"BULLISH_STRONG_CLOSE", "BULLISH_CLOSE"} else 0,
             1 if close_position_in_range >= 0.5 or _near_level(last["low"], support, 0.03) else 0,
-            1 if risk_reward_1 is not None and risk_reward_1 >= 2.0 else 0,
+            1 if confirmation_rr is not None and confirmation_rr >= 2.0 else 0,
             1 if no_resistance_overhead else 0,
             1 if breakout or retest_zone else 0,
             1 if volume_strength is not None and volume_strength >= 1.0 else 0,
@@ -1660,7 +1664,7 @@ def confirm_swing_from_candles(candles: list[dict], candidate: dict, timeframe: 
             1 if direction == "BULLISH" and ema20 is not None and ema50 is not None and ema20 >= ema50 else 0,
             1 if close_position_in_range >= 0.55 or breakout or retest_zone else 0,
             1 if retest_zone or (fake_breakout_risk == "LOW" and retail_trap_risk == "LOW") else 0,
-            1 if risk_reward_1 is not None and risk_reward_1 >= 2.0 else 0,
+            1 if confirmation_rr is not None and confirmation_rr >= 2.0 else 0,
         ]
     )
 
@@ -1718,7 +1722,7 @@ def confirm_swing_from_candles(candles: list[dict], candidate: dict, timeframe: 
         hard_blockers.append("DIRECTION_NOT_BULLISH")
     if not valid_trade_plan:
         hard_blockers.append("INVALID_ENTRY_STOP_TARGET")
-    if risk_reward_1 is None or risk_reward_1 < 2.0:
+    if confirmation_rr is None or confirmation_rr < 2.0:
         hard_blockers.append("RISK_REWARD_BELOW_2")
     if fake_breakout_risk == "HIGH":
         hard_blockers.append("FAKE_BREAKOUT_RISK_HIGH")
@@ -1735,8 +1739,8 @@ def confirm_swing_from_candles(candles: list[dict], candidate: dict, timeframe: 
     elif (
         confidence_score >= 70
         and direction == "BULLISH"
-        and risk_reward_1 is not None
-        and risk_reward_1 >= 2.0
+        and confirmation_rr is not None
+        and confirmation_rr >= 2.0
         and fake_breakout_risk != "HIGH"
         and retail_trap_risk != "HIGH"
         and valid_trade_plan
@@ -1770,7 +1774,7 @@ def confirm_swing_from_candles(candles: list[dict], candidate: dict, timeframe: 
     }
     swing_explanation = (
         f"{tv_status}: {direction} setup on {timeframe}; "
-        f"confidence {round(confidence_score, 2)}, RR {round(risk_reward_1, 2) if risk_reward_1 is not None else None}, "
+        f"confidence {round(confidence_score, 2)}, RR {round(confirmation_rr, 2) if confirmation_rr is not None else None}, "
         f"fake breakout risk {fake_breakout_risk}, retail trap risk {retail_trap_risk}."
     )
     paper_plan = build_price_action_paper_plan_from_candles(
@@ -2064,24 +2068,31 @@ def _mtf_trade_plan(daily: dict | None) -> dict:
         stop_candidates.append(entry_price - (1.5 * atr14))
     stop_loss = max(stop_candidates) if stop_candidates else None
     risk = entry_price - stop_loss if entry_price is not None and stop_loss is not None else None
-    target_1 = entry_price + (2 * risk) if risk and risk > 0 else None
-    target_2 = entry_price + (3 * risk) if risk and risk > 0 else None
+    target_1, target_2, target_3 = calculate_r_multiple_targets(entry_price, stop_loss) if risk and risk > 0 else (None, None, None)
     risk_reward_1 = (target_1 - entry_price) / risk if target_1 is not None and risk and risk > 0 else None
+    risk_reward_2 = (target_2 - entry_price) / risk if target_2 is not None and risk and risk > 0 else None
+    risk_reward_3 = (target_3 - entry_price) / risk if target_3 is not None and risk and risk > 0 else None
+    confirmation_rr = risk_reward_2
     risk_percent = (risk / entry_price) * 100 if risk and entry_price and entry_price > 0 else None
     valid_trade_plan = (
         entry_price is not None
         and stop_loss is not None
         and target_1 is not None
         and target_2 is not None
-        and stop_loss < entry_price < target_1 < target_2
+        and target_3 is not None
+        and stop_loss < entry_price < target_1 < target_2 < target_3
     )
     return {
         "entry_price": _round(entry_price),
         "stop_loss": _round(stop_loss),
         "target_1": _round(target_1),
         "target_2": _round(target_2),
+        "target_3": _round(target_3),
         "risk_reward_1": _round(risk_reward_1),
-        "rr_quality": _risk_reward_quality(risk_reward_1, risk_percent),
+        "risk_reward_2": _round(risk_reward_2),
+        "risk_reward_3": _round(risk_reward_3),
+        "confirmation_risk_reward": _round(confirmation_rr),
+        "rr_quality": _risk_reward_quality(confirmation_rr, risk_percent),
         "valid_trade_plan": valid_trade_plan,
     }
 
@@ -2108,7 +2119,8 @@ def _mtf_risks(daily: dict | None, plan: dict) -> dict:
     extended_from_ema20 = ema20 is not None and ema20 > 0 and last_close is not None and ((last_close - ema20) / ema20) > 0.08
     broad_daily_range = atr14 is not None and range_width is not None and range_width > 4 * atr14
     near_resistance = recent_high is not None and last_close is not None and last_close >= recent_high * 0.98
-    weak_rr = plan.get("risk_reward_1") is None or plan.get("risk_reward_1") < 2.2 or plan.get("rr_quality") in {"WEAK", "INVALID"}
+    confirmation_rr = plan.get("confirmation_risk_reward")
+    weak_rr = confirmation_rr is None or confirmation_rr < 2.2 or plan.get("rr_quality") in {"WEAK", "INVALID"}
     if extended_from_ema20 and broad_daily_range and weak_rr:
         retail_trap_risk = "HIGH"
     elif near_resistance and weak_rr:
@@ -2621,7 +2633,7 @@ def confirm_swing_symbol_timeframes(
         risks = _mtf_risks(daily, plan)
         fake_breakout_risk = risks["fake_breakout_risk"]
         retail_trap_risk = risks["retail_trap_risk"]
-        risk_reward_1 = plan.get("risk_reward_1")
+        risk_reward_1 = plan.get("confirmation_risk_reward")
         valid_trade_plan = plan.get("valid_trade_plan")
 
         weekly_bias_score = 20 if weekly_bias == "BULLISH" or single_timeframe_mode else 10 if weekly_bias in {"NEUTRAL", "INSUFFICIENT_HISTORY"} else 0

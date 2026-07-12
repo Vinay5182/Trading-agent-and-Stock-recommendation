@@ -154,19 +154,19 @@ def test_dashboard_uses_journal_realized_pnl_and_open_margin_formulas(monkeypatc
     assert result["starting_virtual_balance"] == 250000.0
     assert result["starting_virtual_capital"] == 250000.0
     assert result["starting_virtual_capital"] == result["starting_virtual_balance"]
-    assert result["realized_pnl"] == 210.0
-    assert result["current_virtual_balance"] == 250210.0
+    assert result["realized_pnl"] == 1209.0
+    assert result["current_virtual_balance"] == 251209.0
     assert result["effective_exposure"] == 14000.0
     assert result["open_margin_used"] == 10000.0
-    assert result["available_margin"] == 240210.0
-    assert result["max_buying_power"] == 625525.0
-    assert result["available_buying_power"] == 600525.0
+    assert result["available_margin"] == 241209.0
+    assert result["max_buying_power"] == 628022.5
+    assert result["available_buying_power"] == 603022.5
     assert result["broker_funded"] == 4000.0
-    assert result["buying_power_usage_percent"] == 4.0
+    assert result["buying_power_usage_percent"] == 3.98
     assert result["unrealized_pnl"] == 1200.0
-    assert result["total_pnl"] == 1410.0
-    assert result["virtual_return_percent"] == 0.56
-    assert result["equity_curve"][-1]["value"] == 250210.0
+    assert result["total_pnl"] == 2409.0
+    assert result["virtual_return_percent"] == 0.96
+    assert result["equity_curve"][-1]["value"] == 251209.0
     assert result["current_virtual_balance"] == result["starting_virtual_balance"] + result["realized_pnl"]
     assert result["total_pnl"] == result["realized_pnl"] + result["unrealized_pnl"]
     assert result["virtual_return_percent"] == round(result["total_pnl"] / result["starting_virtual_balance"] * 100, 2)
@@ -188,7 +188,7 @@ def test_dashboard_uses_journal_realized_pnl_and_open_margin_formulas(monkeypatc
     assert result["win_rate_percent"] == 50.0
     assert result["profit_factor"] == 3.1
     assert result["average_rr"] == 1.5
-    assert result["monthly_pnl_rows"] == [{"month": "2026-06", "pnl": 210.0}]
+    assert result["monthly_pnl_rows"] == [{"month": "2026-06", "pnl": 1209.0}]
     open_row = next(row for row in result["open_position_exposure"] if row["symbol"] == "OPEN")
     assert open_row["effective_exposure"] == 10000.0
     assert open_row["actual_trade_capital"] == 5000.0
@@ -235,6 +235,66 @@ def test_dashboard_empty_data_returns_zero_metrics(monkeypatch) -> None:
         "sl_hit": 0,
         "ambiguous": 0,
     }
+
+
+def test_dashboard_includes_old_ambiguous_realized_pnl_without_win_rate(monkeypatch) -> None:
+    journal_win = {
+        "symbol": "WIN",
+        "strategy_type": "Swing",
+        "exit_reason": "T3_HIT",
+        "profit_percent": 10.0,
+        "total_trade_pnl": 100.0,
+        "exit_date": "2026-06-16T10:00:00",
+    }
+    old_ambiguous_profit = {
+        "symbol": "OLDAMBPROFIT",
+        "strategy_type": "Swing",
+        "exit_reason": "AMBIGUOUS",
+        "status": "AMBIGUOUS",
+        "outcome_status": "AMBIGUOUS",
+        "ambiguous": True,
+        "total_trade_pnl": 500.0,
+        "profit_percent": 500.0,
+        "exit_date": "2024-01-05T10:00:00",
+    }
+    old_ambiguous_loss = {
+        "symbol": "OLDAMBLOSS",
+        "strategy_type": "Momentum",
+        "exit_reason": "AMBIGUOUS",
+        "status": "AMBIGUOUS",
+        "outcome_status": "AMBIGUOUS",
+        "ambiguous": True,
+        "total_trade_pnl": -300.0,
+        "profit_percent": -300.0,
+        "exit_date": "2024-01-06T10:00:00",
+    }
+    fake_db = type(
+        "FakeDb",
+        (),
+        {
+            "paper_trades": FakeCollection(
+                [
+                    {"symbol": "WAIT", "paper_only": True, "status": "WAITING_FOR_ENTRY", "paper_pnl": 999.0},
+                    {"symbol": "ACTIVE", "paper_only": True, "status": "ACTIVE", "paper_pnl": 777.0},
+                    {"symbol": "AMB", "paper_only": True, "status": "AMBIGUOUS", "outcome_status": "AMBIGUOUS"},
+                ]
+            ),
+            "trade_journal": FakeCollection([journal_win, old_ambiguous_profit, old_ambiguous_loss]),
+        },
+    )()
+    monkeypatch.setattr(dashboard, "get_database", lambda: fake_db)
+
+    result = asyncio.run(dashboard.get_paper_equity())
+
+    assert result["realized_pnl"] == 300.0
+    assert result["current_virtual_balance"] == 250300.0
+    assert result["monthly_pnl_rows"] == [
+        {"month": "2024-01", "pnl": 200.0},
+        {"month": "2026-06", "pnl": 100.0},
+    ]
+    assert result["ambiguous_count"] == 1
+    assert result["win_rate_percent"] == 100.0
+    assert result["profit_factor"] == 100.0
 
 
 def test_dashboard_has_no_stale_virtual_balance_defaults() -> None:

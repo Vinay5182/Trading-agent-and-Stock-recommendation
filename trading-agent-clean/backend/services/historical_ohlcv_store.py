@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import anyio
 import asyncio
 import hashlib
 import inspect
@@ -669,7 +670,9 @@ def verify_historical_plan_hash(plan: Mapping[str, Any]) -> str:
 async def _call_fetcher(fetcher: Any, **kwargs: Any) -> dict[str, Any]:
     if inspect.iscoroutinefunction(fetcher):
         return await fetcher(**kwargs)
-    return await asyncio.to_thread(fetcher, **kwargs)
+    return await anyio.to_thread.run_sync(
+        lambda: fetcher(**kwargs)
+    )
 
 
 async def build_historical_backfill_plan(

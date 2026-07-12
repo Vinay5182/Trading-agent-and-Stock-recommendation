@@ -153,12 +153,12 @@ def trade_ready_row(
         "paper_plan_valid": True,
         "paper_entry_price": 100.0,
         "paper_stop_loss": 90.0,
-        "paper_target_1": 120.0,
-        "paper_target_2": 130.0,
-        "paper_target_3": 140.0,
-        "paper_rr_1": 2.0,
-        "paper_rr_2": 3.0,
-        "paper_rr_3": 4.0,
+        "paper_target_1": 110.0,
+        "paper_target_2": 120.0,
+        "paper_target_3": 130.0,
+        "paper_rr_1": 1.0,
+        "paper_rr_2": 2.0,
+        "paper_rr_3": 3.0,
         "previous_low": previous_low,
         "next_action_for_paper_trade": "PAPER_PLAN_READY",
     }
@@ -273,6 +273,18 @@ class FakeTradingViewClient:
 
 
 def test_sync_adds_trade_ready_once_and_protects_active_and_completed() -> None:
+    active_trade = {
+        **existing_trade("ACTIVE", "ACTIVE"),
+        "target_1": 120.0,
+        "target_2": 130.0,
+        "target_3": 140.0,
+    }
+    completed_trade = {
+        **existing_trade("DONE", "SL_HIT"),
+        "target_1": 120.0,
+        "target_2": 130.0,
+        "target_3": 140.0,
+    }
     db = FakeDb(
         swing_rows=[
             trade_ready_row("NEW"),
@@ -280,7 +292,7 @@ def test_sync_adds_trade_ready_once_and_protects_active_and_completed() -> None:
             trade_ready_row("DONE"),
             trade_ready_row("WATCH", grade="B"),
         ],
-        trades=[existing_trade("ACTIVE", "ACTIVE"), existing_trade("DONE", "SL_HIT")],
+        trades=[active_trade, completed_trade],
     )
 
     first = asyncio.run(sync_trade_ready(db_override=db))
@@ -293,9 +305,28 @@ def test_sync_adds_trade_ready_once_and_protects_active_and_completed() -> None:
     assert new_trades[0]["initial_stop_loss"] == 91.0
     assert new_trades[0]["current_stop_loss"] == 91.0
     assert new_trades[0]["stop_loss"] == 91.0
+    assert new_trades[0]["target_1"] == 109.0
+    assert new_trades[0]["target_2"] == 118.0
+    assert new_trades[0]["target_3"] == 127.0
+    assert new_trades[0]["risk_per_share"] == 9.0
+    assert new_trades[0]["paper_risk_per_share"] == 9.0
+    assert new_trades[0]["paper_target_1"] == 109.0
+    assert new_trades[0]["paper_target_2"] == 118.0
+    assert new_trades[0]["paper_target_3"] == 127.0
+    assert new_trades[0]["risk_reward_1"] == 1.0
+    assert new_trades[0]["risk_reward_2"] == 2.0
+    assert new_trades[0]["risk_reward_3"] == 3.0
     assert not any(row["symbol"] == "WATCH" for row in db.paper_trades.rows)
-    assert next(row for row in db.paper_trades.rows if row["symbol"] == "ACTIVE")["status"] == "ACTIVE"
-    assert next(row for row in db.paper_trades.rows if row["symbol"] == "DONE")["status"] == "SL_HIT"
+    preserved_active = next(row for row in db.paper_trades.rows if row["symbol"] == "ACTIVE")
+    preserved_done = next(row for row in db.paper_trades.rows if row["symbol"] == "DONE")
+    assert preserved_active["status"] == "ACTIVE"
+    assert preserved_done["status"] == "SL_HIT"
+    assert preserved_active["target_1"] == 120.0
+    assert preserved_active["target_2"] == 130.0
+    assert preserved_active["target_3"] == 140.0
+    assert preserved_done["target_1"] == 120.0
+    assert preserved_done["target_2"] == 130.0
+    assert preserved_done["target_3"] == 140.0
     assert first["paper_trades_upserted"] == 1
     assert first["completed_outcomes_protected"] == 1
     assert first["duplicates_prevented"] == 2
@@ -330,6 +361,146 @@ def test_sync_setup_id_prevents_duplicate_across_statuses() -> None:
     assert result["existing_trades_protected"] == 1
     assert len([row for row in db.paper_trades.rows if row["symbol"] == "DUP"]) == 1
     assert next(row for row in db.paper_trades.rows if row["symbol"] == "DUP")["status"] == "ACTIVE"
+
+
+def test_sync_creates_new_daily_trade_when_saved_confirmation_id_is_reused() -> None:
+    confirmation = {
+        **trade_ready_row("DAILY"),
+        "_id": "confirmation-daily",
+        "created_at": "2026-06-18T06:49:50.060000",
+        "updated_at": "2026-06-18T09:30:00Z",
+        "confirmed_at": "2026-06-18T09:30:00Z",
+        "source_candle_at": "2026-06-18T09:15:00Z",
+    }
+    db = FakeDb(swing_rows=[confirmation])
+
+    first = asyncio.run(sync_trade_ready(db_override=db))
+    db.swing_tv_confirmations.rows[0].update(
+        {
+            "updated_at": "2026-07-10T17:18:48.137824Z",
+            "confirmed_at": "2026-07-10T17:18:48.137824Z",
+            "source_candle_at": "2026-07-10T09:45:00Z",
+        }
+    )
+    second = asyncio.run(sync_trade_ready(db_override=db))
+
+    trades = sorted(
+        [row for row in db.paper_trades.rows if row["symbol"] == "DAILY"],
+        key=lambda row: row["setup_date"],
+    )
+    assert first["paper_trades_upserted"] == 1
+    assert second["paper_trades_upserted"] == 1
+    assert len(trades) == 2
+    assert [row["setup_date"] for row in trades] == ["2026-06-18", "2026-07-10"]
+    assert trades[0]["source_confirmation_id"] == trades[1]["source_confirmation_id"] == "confirmation-daily"
+    assert trades[0]["setup_id"] != trades[1]["setup_id"]
+    assert trades[1]["created_at"] == "2026-07-10T17:18:48.137824Z"
+    assert trades[1]["source_confirmation_created_at"] == "2026-06-18T06:49:50.060000"
+    assert trades[1]["source_confirmation_updated_at"] == "2026-07-10T17:18:48.137824Z"
+    assert trades[1]["source_trade_date"] == "2026-07-10"
+    api_row = paper.paper_api_row(trades[1])
+    assert api_row["setup_date"] == "2026-07-10"
+    assert api_row["source_trade_date"] == "2026-07-10"
+    assert api_row["tv_confirmed_at"] == "2026-07-10T17:18:48.137824Z"
+
+
+def test_sync_does_not_duplicate_same_day_saved_confirmation() -> None:
+    confirmation = {
+        **trade_ready_row("SAMEDAY"),
+        "_id": "confirmation-sameday",
+        "created_at": "2026-06-18T06:49:50.060000",
+        "updated_at": "2026-07-10T17:18:48.137824Z",
+        "confirmed_at": "2026-07-10T17:18:48.137824Z",
+        "source_candle_at": "2026-07-10T09:45:00Z",
+    }
+    db = FakeDb(swing_rows=[confirmation])
+
+    first = asyncio.run(sync_trade_ready(db_override=db))
+    second = asyncio.run(sync_trade_ready(db_override=db))
+
+    trades = [row for row in db.paper_trades.rows if row["symbol"] == "SAMEDAY"]
+    assert first["paper_trades_upserted"] == 1
+    assert second["paper_trades_upserted"] == 0
+    assert len(trades) == 1
+    assert trades[0]["setup_date"] == "2026-07-10"
+    assert trades[0]["created_at"] == "2026-07-10T17:18:48.137824Z"
+
+
+def test_sync_protects_existing_same_day_v1_trade() -> None:
+    existing_v1 = {
+        **existing_trade("V1TODAY", "WAITING_FOR_ENTRY"),
+        "setup_id": "paper_setup:v1:legacy-today",
+        "canonical_setup_id": "paper_setup:v1:legacy-today",
+        "source_confirmation_id": "confirmation-v1today",
+        "source_collection": "swing_tv_confirmations",
+        "setup_date": "2026-07-10",
+        "created_at": "2026-07-10T17:18:48.137824Z",
+    }
+    confirmation = {
+        **trade_ready_row("V1TODAY"),
+        "_id": "confirmation-v1today",
+        "created_at": "2026-06-18T06:49:50.060000",
+        "updated_at": "2026-07-10T17:18:48.137824Z",
+        "confirmed_at": "2026-07-10T17:18:48.137824Z",
+        "source_candle_at": "2026-07-10T09:45:00Z",
+    }
+    db = FakeDb(swing_rows=[confirmation], trades=[existing_v1])
+
+    result = asyncio.run(sync_trade_ready(db_override=db))
+
+    trades = [row for row in db.paper_trades.rows if row["symbol"] == "V1TODAY"]
+    assert result["paper_trades_upserted"] == 0
+    assert result["existing_trades_protected"] == 1
+    assert len(trades) == 1
+    assert trades[0]["setup_id"] == "paper_setup:v1:legacy-today"
+
+
+def test_sync_does_not_let_old_legacy_row_block_new_setup_date() -> None:
+    legacy_trade = {
+        **existing_trade("ROLLOVER", "WAITING_FOR_ENTRY"),
+        "created_at": "2026-06-18T06:49:50.060000",
+        "updated_at": "2026-06-18T09:30:00Z",
+    }
+    confirmation = {
+        **trade_ready_row("ROLLOVER"),
+        "_id": "confirmation-rollover",
+        "created_at": "2026-06-18T06:49:50.060000",
+        "updated_at": "2026-07-10T17:18:48.137824Z",
+        "confirmed_at": "2026-07-10T17:18:48.137824Z",
+        "source_candle_at": "2026-07-10T09:45:00Z",
+    }
+    db = FakeDb(swing_rows=[confirmation], trades=[legacy_trade])
+
+    result = asyncio.run(sync_trade_ready(db_override=db))
+
+    trades = [row for row in db.paper_trades.rows if row["symbol"] == "ROLLOVER"]
+    new_trade = next(row for row in trades if row.get("setup_date") == "2026-07-10")
+    old_trade = next(row for row in trades if row["_id"] == "ROLLOVER-id")
+    assert result["paper_trades_upserted"] == 1
+    assert len(trades) == 2
+    assert old_trade.get("setup_id") is None
+    assert old_trade["created_at"] == "2026-06-18T06:49:50.060000"
+    assert new_trade["source_confirmation_id"] == "confirmation-rollover"
+    assert new_trade["setup_date"] == "2026-07-10"
+
+
+def test_sync_preserves_existing_waiting_targets_until_rebuild_path() -> None:
+    waiting = {
+        **existing_trade("WAITOLD", "WAITING_FOR_ENTRY"),
+        "target_1": 120.0,
+        "target_2": 130.0,
+        "target_3": 140.0,
+    }
+    db = FakeDb(swing_rows=[trade_ready_row("WAITOLD")], trades=[waiting])
+
+    result = asyncio.run(sync_trade_ready(db_override=db))
+
+    row = next(row for row in db.paper_trades.rows if row["symbol"] == "WAITOLD")
+    assert result["paper_trades_upserted"] == 0
+    assert row["status"] == "WAITING_FOR_ENTRY"
+    assert row["target_1"] == 120.0
+    assert row["target_2"] == 130.0
+    assert row["target_3"] == 140.0
 
 
 def test_setup_id_migration_keeps_most_advanced_duplicate_and_preserves_history() -> None:

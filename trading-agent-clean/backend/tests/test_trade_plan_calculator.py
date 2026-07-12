@@ -2,7 +2,48 @@ from __future__ import annotations
 
 import pytest
 from services.trade_plan_calculator import calculate_trade_plan, tick_round
+from services.risk_reward_targets import TARGET_R_MULTIPLES, calculate_r_multiple_targets
 from config import settings
+
+
+def test_long_targets_use_1r_2r_3r_ladder() -> None:
+    targets = calculate_r_multiple_targets(100.0, 90.0)
+
+    assert TARGET_R_MULTIPLES == (1.0, 2.0, 3.0)
+    assert targets == [110.0, 120.0, 130.0]
+    assert targets != [120.0, 130.0, 140.0]
+
+
+def test_trade_plan_raw_targets_no_longer_use_old_2r_3r_4r_ladder() -> None:
+    plan = calculate_trade_plan(
+        strategy_type="swing",
+        side="BUY",
+        entry_reference_high=99.9,
+        entry_atr=2.0,
+        structure_swing_low=102.0,
+        structure_swing_low_timeframe="1D",
+        atr_4h=2.0,
+        atr_daily=4.0,
+        daily_ema20=None,
+        daily_ema50=None,
+        nearest_weekly_support=None,
+        confirmed_resistance_zones=[],
+        current_balance=1000000.0,
+        available_margin=1000000.0,
+        combined_open_risk=0.0,
+        setup_grade="A+",
+        allow_sl_override=True,
+        previous_day_low=90.0,
+    )
+
+    assert plan["entry_price"] == 100.0
+    assert plan["final_stop_loss"] == 90.0
+    assert plan["risk_per_share"] == 10.0
+    assert plan["raw_targets"] == [110.0, 120.0, 130.0]
+    assert plan["raw_targets"] != [120.0, 130.0, 140.0]
+    assert plan["t1_final_rr"] == pytest.approx(1.0)
+    assert plan["t2_final_rr"] == pytest.approx(2.0)
+    assert plan["t3_final_rr"] == pytest.approx(3.0)
 
 
 def test_momentum_sl_formula() -> None:
@@ -395,7 +436,7 @@ def test_numeric_examples() -> None:
     assert p_c["final_stop_loss"] == 92.0
     assert p_c["stop_loss_overridden"] is True
     assert p_c["risk_per_share"] == 8.0
-    assert p_c["raw_targets"] == [116.0, 124.0, 132.0]
+    assert p_c["raw_targets"] == [108.0, 116.0, 124.0]
     assert p_c["quantity_by_risk"] == 625
     assert p_c["final_quantity"] == 625
 
@@ -411,8 +452,8 @@ def test_numeric_examples() -> None:
 
     zones_d = [
         {"level": 104.0, "source": "Z_D", "timeframe": "1D"},
-        {"level": 117.0, "source": "Z_T2", "timeframe": "1D"},
-        {"level": 121.0, "source": "Z_T3", "timeframe": "1D"},
+        {"level": 111.0, "source": "Z_T2", "timeframe": "1D"},
+        {"level": 116.0, "source": "Z_T3", "timeframe": "1D"},
     ]
 
     with patch('services.trade_plan_calculator.settings', mock_s):
@@ -421,7 +462,7 @@ def test_numeric_examples() -> None:
             side="BUY",
             entry_reference_high=99.9,
             entry_atr=2.0,
-            structure_swing_low=102.0,  # SL = 95, risk = 5, T1 raw = 110
+            structure_swing_low=102.0,  # SL = 95, risk = 5, T1 raw = 105
             structure_swing_low_timeframe="1D",
             atr_4h=2.0,
             atr_daily=4.0,
@@ -435,7 +476,7 @@ def test_numeric_examples() -> None:
             setup_grade="A+",
         )
 
-    assert p_d["t1_target_raw"] == 110.0
+    assert p_d["t1_target_raw"] == 105.0
     assert p_d["t1_target_final"] == 104.0
     assert p_d["t1_final_rr"] == 0.8
     assert p_d["t1_confidence"] == "HIGH"

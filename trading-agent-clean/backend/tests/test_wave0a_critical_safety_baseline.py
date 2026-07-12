@@ -488,7 +488,7 @@ def test_paper_journal_get_reads_existing_rows_with_limit_without_intent(monkeyp
     assert_no_writes(db)
 
 
-def test_paper_analytics_uses_existing_journal_records_and_excludes_ambiguous(monkeypatch):
+def test_paper_analytics_uses_existing_journal_records_and_counts_ambiguous_pnl(monkeypatch):
     db = isolated_read_db()
     db.trade_journal = ReadOnlyCollection(
         [
@@ -537,7 +537,7 @@ def test_paper_analytics_uses_existing_journal_records_and_excludes_ambiguous(mo
     assert analytics["ambiguous_count"] == 1
     assert analytics["win_rate"] == 50.0
     assert analytics["profit_factor"] == 3.0
-    assert analytics["monthly_pnl"] == {"2026-06": 200.0}
+    assert analytics["monthly_pnl"] == {"2026-06": 10199.0}
     assert_no_writes(db)
 
 

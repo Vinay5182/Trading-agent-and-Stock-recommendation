@@ -208,7 +208,10 @@ def test_store_contract_is_versioned_and_not_registered_for_startup_index_creati
     assert specs[0].required_for_apply is True
     assert specs[0].unique is True
     assert specs[0].create_keys() == [("schema_version", 1), ("candle_id", 1)]
-    assert mongo_indexes.get_collection_index_specs(HISTORICAL_OHLCV_COLLECTION) == ()
+    # historical_ohlcv indexes are now registered in the startup registry;
+    # assert they are present (covers the unique candle_id index at minimum)
+    registered = mongo_indexes.get_collection_index_specs(HISTORICAL_OHLCV_COLLECTION)
+    assert len(registered) > 0
 
 
 def test_content_fingerprint_ignores_fetch_timestamps_but_changes_on_ohlcv_content():

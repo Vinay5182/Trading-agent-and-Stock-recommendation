@@ -40,6 +40,9 @@ async def lifespan(app):
     automation_started = False
     daily_ohlcv_scheduler_started = False
     try:
+        from services.ml_pipeline import ml_pipeline
+        await ml_pipeline.initialize_indexes()
+        
         index_summary = await ensure_active_indexes(get_database())
         logger.info(
             "Critical Mongo indexes verified expected=%s verified=%s created=%s",

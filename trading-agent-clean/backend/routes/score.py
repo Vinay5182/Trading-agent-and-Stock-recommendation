@@ -16,6 +16,8 @@ from services.pipeline_run_lock import (
     pipeline_error_response,
     run_with_pipeline_lock,
 )
+import asyncio
+from services.ml_pipeline import ml_pipeline
 
 
 router = APIRouter()
@@ -185,6 +187,12 @@ async def _run_score_real(db, clean_index: str, lease=None) -> dict:
             both_candidates_count += 1
         if document.get("swing_status") == "SWING_INVALID_DATA" or document.get("momentum_status") == "MOMENTUM_INVALID_DATA":
             invalid_count += 1
+            
+        # --- ML DATA ACQUISITION HOOK (PHASE 2.2A) ---
+        if document.get("swing_candidate") or document.get("momentum_candidate"):
+            asyncio.create_task(ml_pipeline.record_candidate_setup(document))
+        # ---------------------------------------------
+            
         operations.append(
             UpdateOne(
                 {

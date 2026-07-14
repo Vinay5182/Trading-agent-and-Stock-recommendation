@@ -67,8 +67,8 @@ def test_position_sizing_grades_and_caps() -> None:
         entry_price=100.0,
         stop_loss=90.0,
         grade="A+",
-        current_balance=250000.0,
-        available_margin=250000.0,
+        current_balance=settings.STARTING_VIRTUAL_BALANCE,
+        available_margin=settings.STARTING_VIRTUAL_BALANCE,
         open_margin=0.0,
         combined_open_risk=0.0
     )
@@ -82,8 +82,8 @@ def test_position_sizing_grades_and_caps() -> None:
         entry_price=100.0,
         stop_loss=90.0,
         grade="A",
-        current_balance=250000.0,
-        available_margin=250000.0,
+        current_balance=settings.STARTING_VIRTUAL_BALANCE,
+        available_margin=settings.STARTING_VIRTUAL_BALANCE,
         open_margin=0.0,
         combined_open_risk=0.0
     )
@@ -95,8 +95,8 @@ def test_position_sizing_grades_and_caps() -> None:
         entry_price=100.0,
         stop_loss=90.0,
         grade="B",
-        current_balance=250000.0,
-        available_margin=250000.0,
+        current_balance=settings.STARTING_VIRTUAL_BALANCE,
+        available_margin=settings.STARTING_VIRTUAL_BALANCE,
         open_margin=0.0,
         combined_open_risk=0.0
     )
@@ -108,8 +108,8 @@ def test_position_sizing_grades_and_caps() -> None:
         entry_price=100.0,
         stop_loss=90.0,
         grade="C",
-        current_balance=250000.0,
-        available_margin=250000.0,
+        current_balance=settings.STARTING_VIRTUAL_BALANCE,
+        available_margin=settings.STARTING_VIRTUAL_BALANCE,
         open_margin=0.0,
         combined_open_risk=0.0
     )
@@ -123,8 +123,8 @@ def test_invalid_sizing_parameters() -> None:
         entry_price=100.0,
         stop_loss=100.0,
         grade="A+",
-        current_balance=250000.0,
-        available_margin=250000.0,
+        current_balance=settings.STARTING_VIRTUAL_BALANCE,
+        available_margin=settings.STARTING_VIRTUAL_BALANCE,
         open_margin=0.0,
         combined_open_risk=0.0
     )
@@ -136,7 +136,7 @@ def test_invalid_sizing_parameters() -> None:
         entry_price=100.0,
         stop_loss=90.0,
         grade="A+",
-        current_balance=250000.0,
+        current_balance=settings.STARTING_VIRTUAL_BALANCE,
         available_margin=0.0,
         open_margin=0.0,
         combined_open_risk=0.0
@@ -185,7 +185,7 @@ def test_portfolio_limits() -> None:
         entry_price=100.0,
         stop_loss=90.0,
         grade="A+",
-        current_balance=250000.0,
+        current_balance=settings.STARTING_VIRTUAL_BALANCE,
         available_margin=4000.0, # Less than 5000 required margin
         open_margin=0.0,
         combined_open_risk=0.0
@@ -198,7 +198,7 @@ def test_portfolio_limits() -> None:
         entry_price=100.0,
         stop_loss=90.0,
         grade="A+",
-        current_balance=250000.0,
+        current_balance=settings.STARTING_VIRTUAL_BALANCE,
         available_margin=52000.0,
         open_margin=198000.0,
         combined_open_risk=0.0
@@ -211,7 +211,7 @@ def test_portfolio_limits() -> None:
         entry_price=100.0,
         stop_loss=90.0,
         grade="A+",
-        current_balance=250000.0,
+        current_balance=settings.STARTING_VIRTUAL_BALANCE,
         available_margin=50000.0,
         open_margin=0.0,
         combined_open_risk=12000.0
@@ -229,7 +229,7 @@ def test_new_accounting_requirements() -> None:
         balance, realized = await get_current_virtual_balance_and_pnl(db)
         open_margin, open_risk = await get_portfolio_totals(db)
 
-        assert balance == 250000.0
+        assert balance == settings.STARTING_VIRTUAL_BALANCE
         assert realized == 0.0
         assert open_margin == 0.0
 
@@ -273,7 +273,7 @@ def test_new_accounting_requirements() -> None:
         open_margin_entry, open_risk_entry = await get_portfolio_totals(db)
         available_cash_entry = balance_entry - open_margin_entry
 
-        assert balance_entry == 250000.0 # Settled balance unchanged
+        assert balance_entry == settings.STARTING_VIRTUAL_BALANCE # Settled balance unchanged
         assert open_margin_entry == 5000.0 # Reserved margin is now 5000
         assert available_cash_entry == 245000.0 # Available cash decreased by 5000
 
@@ -369,7 +369,7 @@ def test_new_accounting_requirements() -> None:
         open_margin_full, _ = await get_portfolio_totals(db)
         available_cash_full = balance_full - open_margin_full
 
-        assert balance_full == 249410.0 # 250000 - 590
+        assert balance_full == 249410.0 # settings.STARTING_VIRTUAL_BALANCE - 590
         assert open_margin_full == 0.0
         assert available_cash_full == 249410.0
 
@@ -439,7 +439,7 @@ def test_dashboard_formulas_and_field_mappings() -> None:
         assert "capital_returned_from_latest_exits" in data
 
         # Verify values & formulas
-        assert data["starting_virtual_capital"] == 250000.0
+        assert data["starting_virtual_capital"] == settings.STARTING_VIRTUAL_BALANCE
         assert data["settled_balance"] == 250300.0
         assert data["reserved_margin"] == 5000.0
         assert data["available_cash"] == 245300.0
@@ -557,13 +557,13 @@ def test_released_principal_does_not_change_balance() -> None:
         _, db = await clean_db()
         # Verify balance starts at ₹2,50,000
         balance, pnl = await get_current_virtual_balance_and_pnl(db)
-        assert balance == 250000.0
+        assert balance == settings.STARTING_VIRTUAL_BALANCE
         assert pnl == 0.0
 
         # Simulate releasing margin by completing a trade (no journal entry yet)
-        # Verify get_current_virtual_balance_and_pnl still returns 250000.0
+        # Verify get_current_virtual_balance_and_pnl still returns settings.STARTING_VIRTUAL_BALANCE
         balance2, pnl2 = await get_current_virtual_balance_and_pnl(db)
-        assert balance2 == 250000.0
+        assert balance2 == settings.STARTING_VIRTUAL_BALANCE
 
     asyncio.run(run_async())
 
@@ -666,7 +666,7 @@ def test_expired_trade_excluded_from_analytics() -> None:
 
         # Retrieve virtual balance: should be ₹2,50,000 with 0 realized P&L
         balance, realized_pnl = await get_current_virtual_balance_and_pnl(db)
-        assert balance == 250000.0
+        assert balance == settings.STARTING_VIRTUAL_BALANCE
         assert realized_pnl == 0.0
 
     asyncio.run(run_async())
@@ -762,8 +762,8 @@ def test_dynamic_sizing_capital_base() -> None:
         entry_price=100.0,
         stop_loss=90.0,
         grade="A+",
-        current_balance=250000.0,
-        available_margin=250000.0,
+        current_balance=settings.STARTING_VIRTUAL_BALANCE,
+        available_margin=settings.STARTING_VIRTUAL_BALANCE,
         open_margin=0.0,
         combined_open_risk=0.0
     )
@@ -776,8 +776,8 @@ def test_dynamic_sizing_capital_base() -> None:
         entry_price=100.0,
         stop_loss=90.0,
         grade="A+",
-        current_balance=500000.0,
-        available_margin=500000.0,
+        current_balance=settings.STARTING_VIRTUAL_BALANCE,
+        available_margin=settings.STARTING_VIRTUAL_BALANCE,
         open_margin=0.0,
         combined_open_risk=0.0
     )

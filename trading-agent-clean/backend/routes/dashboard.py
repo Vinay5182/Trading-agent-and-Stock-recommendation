@@ -12,14 +12,10 @@ from services.trade_journal import (
     number_or_none,
 )
 from services.capital_accounting import is_genuine_open_trade, trade_open_margin_used, trade_open_sl_risk
-from config import GENUINE_OPEN_STATUSES
-
+from config import settings, GENUINE_OPEN_STATUSES
 
 router = APIRouter()
-STARTING_VIRTUAL_BALANCE = 250000.0
-MINIMUM_TRADE_CAPITAL = 5000.0
-LEVERAGE = 2.5
-WAITING_STATUSES = {"PLANNED", "NOT_TRIGGERED", "WAITING", "WAITING_FOR_ENTRY"}
+WAITING_STATUSES = {"PLANNED", "NOT_TRIGGERED", "WAITING", "WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL"}
 T1_PARTIAL_STATUS = "T1_PARTIAL"
 T2_PARTIAL_STATUS = "T2_PARTIAL"
 PARTIAL_STATUSES = {s for s in GENUINE_OPEN_STATUSES if s != "ACTIVE"}
@@ -163,8 +159,8 @@ def _trade_quantity(trade: dict) -> float:
 def _trade_margin(exposure: float) -> float:
     if exposure <= 0:
         return 0.0
-    leveraged_margin = exposure / LEVERAGE if LEVERAGE else exposure
-    return max(MINIMUM_TRADE_CAPITAL, leveraged_margin)
+    leveraged_margin = exposure / settings.LEVERAGE if settings.LEVERAGE else exposure
+    return max(settings.MINIMUM_ENTRY_MARGIN, leveraged_margin)
 
 
 def _open_trade_exposure(trade: dict) -> float:
@@ -189,7 +185,7 @@ def _open_trade_unrealized_pnl(trade: dict) -> float:
 
 def _paper_quantity(trade: dict) -> int:
     entry_price = _first_number(trade.get("entry_price"), trade.get("entry"), trade.get("paper_entry_price"))
-    exposure = _open_trade_exposure(trade) or (MINIMUM_TRADE_CAPITAL * LEVERAGE)
+    exposure = _open_trade_exposure(trade) or (settings.MINIMUM_ENTRY_MARGIN * settings.LEVERAGE)
     return floor(exposure / entry_price) if entry_price and entry_price > 0 else 0
 
 
@@ -238,8 +234,8 @@ def _open_position_rows(open_trades: list[dict], current_balance: float) -> list
 
 
 def _equity_curve(records: list[dict]) -> tuple[list[dict], float]:
-    equity = STARTING_VIRTUAL_BALANCE
-    peak = STARTING_VIRTUAL_BALANCE
+    equity = settings.STARTING_VIRTUAL_BALANCE
+    peak = settings.STARTING_VIRTUAL_BALANCE
     max_drawdown = 0.0
     points = [
         {
@@ -316,7 +312,7 @@ async def get_paper_equity() -> dict:
     analytics = build_trade_analytics(journal_records)
     realized_records = [record for record in journal_records if analytics_realized_pnl_record(record)]
     realized_pnl = sum(analytics_pnl_value(record) or 0.0 for record in realized_records)
-    settled_balance = STARTING_VIRTUAL_BALANCE + realized_pnl
+    settled_balance = settings.STARTING_VIRTUAL_BALANCE + realized_pnl
 
     open_trades = [trade for trade in trades if is_genuine_open_trade(trade)]
     active_count = sum(1 for trade in trades if _is_active_trade(trade))
@@ -331,8 +327,8 @@ async def get_paper_equity() -> dict:
     reserved_margin = sum(trade_open_margin_used(trade) for trade in open_trades)
     combined_open_risk = sum(trade_open_sl_risk(trade) for trade in open_trades)
     available_cash = settled_balance - reserved_margin
-    max_buying_power = settled_balance * LEVERAGE
-    available_buying_power = available_cash * LEVERAGE
+    max_buying_power = settled_balance * settings.LEVERAGE
+    available_buying_power = available_cash * settings.LEVERAGE
     broker_funded = effective_exposure - reserved_margin
     usage_percent = (reserved_margin / settled_balance * 100) if settled_balance else 0.0
     unrealized_pnl = sum(_open_trade_unrealized_pnl(trade) for trade in open_trades)
@@ -392,8 +388,8 @@ async def get_paper_equity() -> dict:
     )
     latest = list(reversed(sorted(trades, key=lambda trade: str(trade.get("updated_at") or trade.get("created_at") or ""))))
     return {
-        "starting_virtual_capital": _round(STARTING_VIRTUAL_BALANCE),
-        "starting_virtual_balance": _round(STARTING_VIRTUAL_BALANCE),
+        "starting_virtual_capital": _round(settings.STARTING_VIRTUAL_BALANCE),
+        "starting_virtual_balance": _round(settings.STARTING_VIRTUAL_BALANCE),
         "settled_balance": _round(settled_balance),
         "current_virtual_balance": _round(settled_balance), # backward compatibility
         "reserved_margin": _round(reserved_margin),
@@ -413,14 +409,14 @@ async def get_paper_equity() -> dict:
         "total_margin_released": _round(total_margin_released),
         "capital_returned_from_latest_exits": _round(capital_returned_from_latest_exits),
 
-        "minimum_trade_capital": _round(MINIMUM_TRADE_CAPITAL),
-        "leverage": LEVERAGE,
+        "minimum_trade_capital": _round(settings.MINIMUM_ENTRY_MARGIN),
+        "leverage": settings.LEVERAGE,
         "combined_open_risk": _round(combined_open_risk),
         "max_buying_power": _round(max_buying_power),
         "available_buying_power": _round(available_buying_power),
         "buying_power_usage_percent": _round(usage_percent),
         "total_pnl": _round(total_pnl),
-        "virtual_return_percent": _round((total_pnl / STARTING_VIRTUAL_BALANCE * 100) if STARTING_VIRTUAL_BALANCE else 0.0),
+        "virtual_return_percent": _round((total_pnl / settings.STARTING_VIRTUAL_BALANCE * 100) if settings.STARTING_VIRTUAL_BALANCE else 0.0),
         "drawdown_percent": drawdown_percent,
         "win_rate_percent": analytics["win_rate"],
         "profit_factor": analytics["profit_factor"],
@@ -453,7 +449,7 @@ async def get_paper_equity() -> dict:
             "broker_funded_exposure": "open_exposure - reserved_margin",
         },
         "virtual_balance": _round(settled_balance),
-        "trade_capital": _round(MINIMUM_TRADE_CAPITAL),
+        "trade_capital": _round(settings.MINIMUM_ENTRY_MARGIN),
         "cumulative_pnl": _round(total_pnl),
         "cumulative_rr": analytics["average_rr"],
         "completed_trades": completed_count,
@@ -463,7 +459,7 @@ async def get_paper_equity() -> dict:
         "latest_trades": [
             {
                 **{field: trade.get(field) for field in latest_fields},
-                "planned_capital": _round(MINIMUM_TRADE_CAPITAL),
+                "planned_capital": _round(settings.MINIMUM_ENTRY_MARGIN),
                 "effective_exposure": _round(_open_trade_exposure(trade)),
                 "paper_quantity": _paper_quantity(trade),
                 "leveraged_pnl": _round(_open_trade_unrealized_pnl(trade)),

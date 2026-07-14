@@ -102,8 +102,8 @@ async def try_activate_trade_with_capital(db, trade_id, current_state_version, n
             return {"ok": False, "reason": "TRADE_NOT_FOUND"}
 
         # 3. Verify Status & Version
-        status = str(trade.get("status") or "").upper()
-        if status != "WAITING_FOR_ENTRY":
+        status = trade.get("status")
+        if status not in ("WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL"):
             return {"ok": False, "reason": "INVALID_PRECONDITION_STATUS", "status": status}
         if int(trade.get("state_version", 1)) != int(current_state_version):
             return {"ok": False, "reason": "STATE_VERSION_CONFLICT"}
@@ -146,7 +146,7 @@ async def try_activate_trade_with_capital(db, trade_id, current_state_version, n
                     "margin_released_total": 0.0,
                 }
                 res = await db.paper_trades.update_one(
-                    {"_id": trade["_id"], "status": "WAITING_FOR_ENTRY", "state_version": current_state_version},
+                    {"_id": trade["_id"], "status": {"$in": ["WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL"]}, "state_version": current_state_version},
                     {"$set": update_doc, "$inc": {"state_version": 1}},
                     upsert=False
                 )
@@ -166,7 +166,7 @@ async def try_activate_trade_with_capital(db, trade_id, current_state_version, n
 
         if is_legacy_test:
             final_q = trade.get("quantity") or 10
-            req_margin = (final_q * float(entry_price or 0.0)) / 2.5
+            req_margin = (final_q * float(entry_price or 0.0)) / settings.LEVERAGE
             est_risk = final_q * abs(float(entry_price or 0.0) - float(stop_loss or 0.0))
             exposure = final_q * float(entry_price or 0.0)
             if final_q < 4:
@@ -227,7 +227,7 @@ async def try_activate_trade_with_capital(db, trade_id, current_state_version, n
                 "exit_allocations": allocations,
             }
             res = await db.paper_trades.update_one(
-                {"_id": trade["_id"], "status": "WAITING_FOR_ENTRY", "state_version": current_state_version},
+                {"_id": trade["_id"], "status": {"$in": ["WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL"]}, "state_version": current_state_version},
                 {"$set": update_doc, "$inc": {"state_version": 1}},
                 upsert=False
             )
@@ -241,14 +241,15 @@ async def try_activate_trade_with_capital(db, trade_id, current_state_version, n
                 update_doc = {
                     "activation_blocked_reason": rejection_reason,
                     "last_activation_attempt_at": now,
+                    "status": "WAITING_FOR_CAPITAL"
                 }
                 res = await db.paper_trades.update_one(
-                    {"_id": trade["_id"], "status": "WAITING_FOR_ENTRY", "state_version": current_state_version},
+                    {"_id": trade["_id"], "status": {"$in": ["WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL"]}, "state_version": current_state_version},
                     {"$set": update_doc, "$inc": {"state_version": 1}},
                     upsert=False
                 )
                 if res.modified_count > 0:
-                    return {"ok": True, "activated": False, "reason": rejection_reason, "state": "WAITING_FOR_ENTRY"}
+                    return {"ok": True, "activated": False, "reason": rejection_reason, "state": "WAITING_FOR_CAPITAL"}
                 else:
                     return {"ok": False, "reason": "STATE_VERSION_CONFLICT"}
             else:
@@ -273,7 +274,7 @@ async def try_activate_trade_with_capital(db, trade_id, current_state_version, n
                     "activation_blocked_reason": None,
                 }
                 res = await db.paper_trades.update_one(
-                    {"_id": trade["_id"], "status": "WAITING_FOR_ENTRY", "state_version": current_state_version},
+                    {"_id": trade["_id"], "status": {"$in": ["WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL"]}, "state_version": current_state_version},
                     {"$set": update_doc, "$inc": {"state_version": 1}},
                     upsert=False
                 )

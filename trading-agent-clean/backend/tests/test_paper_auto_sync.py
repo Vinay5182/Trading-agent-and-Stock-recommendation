@@ -1,3 +1,4 @@
+from config import settings
 import asyncio
 import sys
 from pathlib import Path
@@ -605,8 +606,8 @@ def test_build_paper_plans_concurrent_calls_create_one_logical_trade(monkeypatch
 
     async def run_twice():
         return await asyncio.gather(
-            paper.build_paper_plans(limit=1, timeframe="1D", save=True, paper_capital=500000, risk_percent=1, signal_type="SWING_TV_CONFIRMED"),
-            paper.build_paper_plans(limit=1, timeframe="1D", save=True, paper_capital=500000, risk_percent=1, signal_type="SWING_TV_CONFIRMED"),
+            paper.build_paper_plans(limit=1, timeframe="1D", save=True, paper_capital=settings.STARTING_VIRTUAL_BALANCE, risk_percent=1, signal_type="SWING_TV_CONFIRMED"),
+            paper.build_paper_plans(limit=1, timeframe="1D", save=True, paper_capital=settings.STARTING_VIRTUAL_BALANCE, risk_percent=1, signal_type="SWING_TV_CONFIRMED"),
         )
 
     responses = asyncio.run(run_twice())
@@ -627,7 +628,7 @@ def test_paper_ai_gate_is_advisory_by_default_and_preserves_prediction(monkeypat
     feature_names = ["rule_score", "trend_score", "momentum_score", "volume_score", "risk_score"]
     signal = paper_signal_row("ADVISORY")
     signal.update({name: index + 1 for index, name in enumerate(feature_names)})
-    plan = paper.build_plan_from_candles(signal, build_plan_candles(), 500000, 1)
+    plan = paper.build_plan_from_candles(signal, build_plan_candles(), settings.STARTING_VIRTUAL_BALANCE, 1)
     settings_override = {**vars(paper.settings), "PAPER_AI_HARD_GATE_ENABLED": False}
     monkeypatch.setattr(paper, "settings", SimpleNamespace(**settings_override))
     monkeypatch.setattr(ml_predict, "_loaded_meta", {"features": feature_names})
@@ -663,7 +664,7 @@ def test_paper_ai_gate_can_hard_reject_only_when_enabled_and_ready(monkeypatch) 
     feature_names = ["rule_score", "trend_score", "momentum_score", "volume_score", "risk_score"]
     signal = paper_signal_row("HARDGATE")
     signal.update({name: index + 1 for index, name in enumerate(feature_names)})
-    plan = paper.build_plan_from_candles(signal, build_plan_candles(), 500000, 1)
+    plan = paper.build_plan_from_candles(signal, build_plan_candles(), settings.STARTING_VIRTUAL_BALANCE, 1)
     settings_override = {**vars(paper.settings), "PAPER_AI_HARD_GATE_ENABLED": True}
     monkeypatch.setattr(paper, "settings", SimpleNamespace(**settings_override))
     monkeypatch.setattr(ml_predict, "_loaded_meta", {"features": feature_names})
@@ -687,7 +688,7 @@ def test_missing_ai_features_do_not_block_paper_trade_when_hard_gate_off(monkeyp
     feature_names = ["rule_score", "trend_score", "momentum_score", "volume_score", "risk_score"]
     signal = paper_signal_row("MISSINGAI")
     signal["rule_score"] = None
-    plan = paper.build_plan_from_candles(signal, build_plan_candles(), 500000, 1)
+    plan = paper.build_plan_from_candles(signal, build_plan_candles(), settings.STARTING_VIRTUAL_BALANCE, 1)
     settings_override = {**vars(paper.settings), "PAPER_AI_HARD_GATE_ENABLED": False}
     monkeypatch.setattr(paper, "settings", SimpleNamespace(**settings_override))
     monkeypatch.setattr(ml_predict, "_loaded_meta", {"features": feature_names})
@@ -708,7 +709,7 @@ def test_missing_ai_features_do_not_block_paper_trade_when_hard_gate_off(monkeyp
 
 def test_upsert_paper_plans_concurrent_calls_create_one_logical_trade(monkeypatch) -> None:
     signal = paper_signal_row("UPSERT")
-    plan = paper.build_plan_from_candles(signal, build_plan_candles(), 500000, 1)
+    plan = paper.build_plan_from_candles(signal, build_plan_candles(), settings.STARTING_VIRTUAL_BALANCE, 1)
     db = FakeDb()
     monkeypatch.setattr(paper, "get_database", lambda: db)
 
@@ -729,7 +730,7 @@ def test_upsert_paper_plans_concurrent_calls_create_one_logical_trade(monkeypatc
 
 def test_terminal_trade_cannot_be_reset_by_plan_builder(monkeypatch) -> None:
     signal = paper_signal_row("TERMINAL", source_id="terminal-confirmation")
-    waiting_plan = paper.build_plan_from_candles(signal, build_plan_candles(), 500000, 1)
+    waiting_plan = paper.build_plan_from_candles(signal, build_plan_candles(), settings.STARTING_VIRTUAL_BALANCE, 1)
     completed_trade = apply_setup_identity(
         {
             **waiting_plan,

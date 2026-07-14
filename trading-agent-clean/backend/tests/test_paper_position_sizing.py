@@ -1,4 +1,5 @@
 from __future__ import annotations
+from config import settings
 
 import sys
 from pathlib import Path
@@ -18,8 +19,8 @@ def test_emmvee_like_case():
         entry_price=356.95,
         stop_loss=330.25,
         grade="A",
-        current_balance=250000.0,
-        available_margin=250000.0,
+        current_balance=settings.STARTING_VIRTUAL_BALANCE,
+        available_margin=settings.STARTING_VIRTUAL_BALANCE,
         open_margin=0.0,
         combined_open_risk=0.0,
         paper_mode=True

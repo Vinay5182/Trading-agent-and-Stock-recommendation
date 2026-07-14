@@ -1,3 +1,4 @@
+from config import settings
 import asyncio
 import sys
 from pathlib import Path
@@ -151,8 +152,8 @@ def test_dashboard_uses_journal_realized_pnl_and_open_margin_formulas(monkeypatc
 
     result = asyncio.run(dashboard.get_paper_equity())
 
-    assert result["starting_virtual_balance"] == 250000.0
-    assert result["starting_virtual_capital"] == 250000.0
+    assert result["starting_virtual_balance"] == settings.STARTING_VIRTUAL_BALANCE
+    assert result["starting_virtual_capital"] == settings.STARTING_VIRTUAL_BALANCE
     assert result["starting_virtual_capital"] == result["starting_virtual_balance"]
     assert result["realized_pnl"] == 1209.0
     assert result["current_virtual_balance"] == 251209.0
@@ -210,13 +211,13 @@ def test_dashboard_empty_data_returns_zero_metrics(monkeypatch) -> None:
 
     result = asyncio.run(dashboard.get_paper_equity())
 
-    assert result["starting_virtual_balance"] == 250000.0
-    assert result["starting_virtual_capital"] == 250000.0
+    assert result["starting_virtual_balance"] == settings.STARTING_VIRTUAL_BALANCE
+    assert result["starting_virtual_capital"] == settings.STARTING_VIRTUAL_BALANCE
     assert result["starting_virtual_capital"] == result["starting_virtual_balance"]
     assert result["realized_pnl"] == 0.0
-    assert result["current_virtual_balance"] == 250000.0
+    assert result["current_virtual_balance"] == settings.STARTING_VIRTUAL_BALANCE
     assert result["open_margin_used"] == 0.0
-    assert result["available_margin"] == 250000.0
+    assert result["available_margin"] == settings.STARTING_VIRTUAL_BALANCE
     assert result["max_buying_power"] == 625000.0
     assert result["available_buying_power"] == 625000.0
     assert result["effective_exposure"] == 0.0
@@ -304,6 +305,6 @@ def test_dashboard_has_no_stale_virtual_balance_defaults() -> None:
         dashboard.MINIMUM_TRADE_CAPITAL * 10,
     )
 
-    assert "STARTING_VIRTUAL_BALANCE = 250000.0" in source
+    assert "STARTING_VIRTUAL_BALANCE = settings.STARTING_VIRTUAL_BALANCE" in source
     for stale_balance in stale_balances:
         assert f"STARTING_VIRTUAL_BALANCE = {stale_balance:.1f}" not in source

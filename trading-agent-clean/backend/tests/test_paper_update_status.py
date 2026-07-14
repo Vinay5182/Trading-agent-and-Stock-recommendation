@@ -1,3 +1,4 @@
+from config import settings
 import asyncio
 import sys
 from pathlib import Path
@@ -127,7 +128,7 @@ def test_build_plan_stores_initial_and_current_stop_from_previous_day_low() -> N
         "paper_target_3": 140.0,
     }
 
-    plan = paper.build_plan_from_candles(signal, candles, 500000, 1)
+    plan = paper.build_plan_from_candles(signal, candles, settings.STARTING_VIRTUAL_BALANCE, 1)
 
     assert plan is not None
     assert plan["stop_loss"] == 99.0

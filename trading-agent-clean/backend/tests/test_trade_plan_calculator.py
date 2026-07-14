@@ -28,8 +28,8 @@ def test_trade_plan_raw_targets_no_longer_use_old_2r_3r_4r_ladder() -> None:
         daily_ema50=None,
         nearest_weekly_support=None,
         confirmed_resistance_zones=[],
-        current_balance=1000000.0,
-        available_margin=1000000.0,
+        current_balance=settings.STARTING_VIRTUAL_BALANCE,
+        available_margin=settings.STARTING_VIRTUAL_BALANCE,
         combined_open_risk=0.0,
         setup_grade="A+",
         allow_sl_override=True,
@@ -132,7 +132,7 @@ def test_sl_independence_from_sizing() -> None:
         "setup_grade": "A+",
     }
     p1 = calculate_trade_plan(current_balance=100000.0, available_margin=100000.0, combined_open_risk=0.0, **args)
-    p2 = calculate_trade_plan(current_balance=250000.0, available_margin=5000.0, combined_open_risk=0.0, **args)
+    p2 = calculate_trade_plan(current_balance=settings.STARTING_VIRTUAL_BALANCE, available_margin=5000.0, combined_open_risk=0.0, **args)
 
     assert p1["technical_stop_loss"] == p2["technical_stop_loss"]
     assert p1["final_stop_loss"] == p2["final_stop_loss"]
@@ -195,8 +195,8 @@ def test_sl_above_entry_blocks() -> None:
         daily_ema50=None,
         nearest_weekly_support=None,
         confirmed_resistance_zones=[],
-        current_balance=1000000.0,
-        available_margin=1000000.0,
+        current_balance=settings.STARTING_VIRTUAL_BALANCE,
+        available_margin=settings.STARTING_VIRTUAL_BALANCE,
         combined_open_risk=0.0,
         setup_grade="A+",
     )
@@ -218,8 +218,8 @@ def test_ema_cross_checks() -> None:
         daily_ema50=None,
         nearest_weekly_support=None,
         confirmed_resistance_zones=[],
-        current_balance=1000000.0,
-        available_margin=1000000.0,
+        current_balance=settings.STARTING_VIRTUAL_BALANCE,
+        available_margin=settings.STARTING_VIRTUAL_BALANCE,
         combined_open_risk=0.0,
         setup_grade="A+",
     )
@@ -238,8 +238,8 @@ def test_ema_cross_checks() -> None:
         daily_ema50=None,
         nearest_weekly_support=95.0,  # 95 - 85 = 10.0 > max_dist (1.5 * 4.0 = 6.0)
         confirmed_resistance_zones=[],
-        current_balance=1000000.0,
-        available_margin=1000000.0,
+        current_balance=settings.STARTING_VIRTUAL_BALANCE,
+        available_margin=settings.STARTING_VIRTUAL_BALANCE,
         combined_open_risk=0.0,
         setup_grade="A+",
     )
@@ -265,8 +265,8 @@ def test_raw_targets_and_resistance_adjustments() -> None:
         daily_ema50=None,
         nearest_weekly_support=None,
         confirmed_resistance_zones=zones,
-        current_balance=1000000.0,
-        available_margin=1000000.0,
+        current_balance=settings.STARTING_VIRTUAL_BALANCE,
+        available_margin=settings.STARTING_VIRTUAL_BALANCE,
         combined_open_risk=0.0,
         setup_grade="A+",
     )
@@ -291,8 +291,8 @@ def test_target_failures() -> None:
         daily_ema50=None,
         nearest_weekly_support=None,
         confirmed_resistance_zones=zones_dup,
-        current_balance=1000000.0,
-        available_margin=1000000.0,
+        current_balance=settings.STARTING_VIRTUAL_BALANCE,
+        available_margin=settings.STARTING_VIRTUAL_BALANCE,
         combined_open_risk=0.0,
         setup_grade="A+",
     )
@@ -313,8 +313,8 @@ def test_position_sizing_rules() -> None:
         daily_ema50=None,
         nearest_weekly_support=None,
         confirmed_resistance_zones=[],
-        current_balance=500000.0,  # 500k balance -> risk budget = 2500
-        available_margin=500000.0,
+        current_balance=settings.STARTING_VIRTUAL_BALANCE,  # 500k balance -> risk budget = 2500
+        available_margin=settings.STARTING_VIRTUAL_BALANCE,
         combined_open_risk=0.0,
         setup_grade="A+",
     )
@@ -337,8 +337,8 @@ def test_allocation_math() -> None:
         daily_ema50=None,
         nearest_weekly_support=None,
         confirmed_resistance_zones=[],
-        current_balance=1000000.0,  # 1M balance -> risk budget = 5000
-        available_margin=1000000.0,
+        current_balance=settings.STARTING_VIRTUAL_BALANCE,  # 1M balance -> risk budget = 5000
+        available_margin=settings.STARTING_VIRTUAL_BALANCE,
         combined_open_risk=0.0,
         setup_grade="A+",
     )
@@ -425,8 +425,8 @@ def test_numeric_examples() -> None:
         daily_ema50=None,
         nearest_weekly_support=None,
         confirmed_resistance_zones=[],
-        current_balance=1000000.0,
-        available_margin=1000000.0,
+        current_balance=settings.STARTING_VIRTUAL_BALANCE,
+        available_margin=settings.STARTING_VIRTUAL_BALANCE,
         combined_open_risk=0.0,
         setup_grade="A+",
         allow_sl_override=True,
@@ -470,8 +470,8 @@ def test_numeric_examples() -> None:
             daily_ema50=None,
             nearest_weekly_support=None,
             confirmed_resistance_zones=zones_d,
-            current_balance=1000000.0,
-            available_margin=1000000.0,
+            current_balance=settings.STARTING_VIRTUAL_BALANCE,
+            available_margin=settings.STARTING_VIRTUAL_BALANCE,
             combined_open_risk=0.0,
             setup_grade="A+",
         )

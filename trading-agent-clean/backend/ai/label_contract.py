@@ -228,7 +228,7 @@ def build_deterministic_label(
     status = trade.get("status") or trade.get("outcome_status") or journal.get("status") or journal.get("outcome_status") or "WAITING_FOR_ENTRY"
     status = str(status).upper()
 
-    is_entered = status not in {"WAITING_FOR_ENTRY", "PLANNED", "NOT_TRIGGERED"}
+    is_entered = status not in {"WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL", "PLANNED", "NOT_TRIGGERED"}
 
     # Entry validation
     entry_price = _numeric_or_none(
@@ -412,7 +412,7 @@ def build_deterministic_label(
         label_state = LABEL_STATE_EXCLUDED
         _append_once(errors, "LABEL_EXCLUDED_AMBIGUOUS")
     elif not is_terminal:
-        if status in {"WAITING_FOR_ENTRY", "PLANNED", "NOT_TRIGGERED"}:
+        if status in {"WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "PLANNED", "NOT_TRIGGERED"}:
             outcome_class = OUTCOME_CLASS_NO_ENTRY
             label_state = LABEL_STATE_EXCLUDED
             _append_once(errors, "ENTRY_NOT_TRIGGERED")

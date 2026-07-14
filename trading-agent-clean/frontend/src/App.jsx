@@ -1877,7 +1877,7 @@ const PAPER_TRADE_FILTERS = [
   { key: "completed", label: "Completed / Stopped", groups: new Set(["completed", "stopped", "ambiguous", "expired"]) },
   { key: "all", label: "All Trades", groups: null },
 ];
-const PAPER_WAITING_STATUSES = new Set(["PLANNED", "NOT_TRIGGERED", "WAITING", "WAITING_FOR_ENTRY"]);
+const PAPER_WAITING_STATUSES = new Set(["PLANNED", "NOT_TRIGGERED", "WAITING", "WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL"]);
 const PAPER_PARTIAL_STATUSES = new Set(["T1_PARTIAL", "T2_PARTIAL"]);
 const PAPER_ACTIVE_STATUSES = new Set(["ACTIVE"]);
 const PAPER_COMPLETED_STATUSES = new Set(["T3_HIT", "TARGET_3_HIT", "COMPLETED", "TARGET_HIT", "TARGET_1_HIT", "TARGET_1_HIT_FINAL", "TARGET_2_HIT", "T1_HIT", "T2_HIT", "WON_T1", "WON_T2", "WON_T3"]);

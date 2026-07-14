@@ -1,4 +1,5 @@
 from __future__ import annotations
+from config import settings
 
 import sys
 from pathlib import Path
@@ -38,8 +39,8 @@ def test_regression_v2_result_always_includes_target_logic() -> None:
         daily_ema50=None,
         nearest_weekly_support=None,
         confirmed_resistance_zones=[],
-        current_balance=1000000.0,
-        available_margin=1000000.0,
+        current_balance=settings.STARTING_VIRTUAL_BALANCE,
+        available_margin=settings.STARTING_VIRTUAL_BALANCE,
         combined_open_risk=0.0,
         setup_grade="A+",
     )

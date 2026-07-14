@@ -1,3 +1,4 @@
+from config import settings
 import asyncio
 import logging
 from datetime import datetime, timezone
@@ -259,8 +260,8 @@ def _paper_docs_from_saved_row(row: dict, source_signal_type: str, source_collec
         entry_price=entry or 0.0,
         stop_loss=stop or 0.0,
         grade=grade,
-        current_balance=250000.0,
-        available_margin=250000.0,
+        current_balance=settings.STARTING_VIRTUAL_BALANCE,
+        available_margin=settings.STARTING_VIRTUAL_BALANCE,
         open_margin=0.0,
         combined_open_risk=0.0,
         paper_mode=True,

@@ -42,7 +42,7 @@ def calculate_trade_plan(
     available_margin: float,
     combined_open_risk: float,
     setup_grade: str,
-    leverage: float = 2.5,
+    leverage: float = settings.LEVERAGE,
     tick_size: float = 0.05,
     allow_sl_override: bool = False,
     previous_day_low: float | None = None,

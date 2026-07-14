@@ -69,7 +69,9 @@ def log_lifecycle_system_error_sync(plan: dict, code: str, msg: str):
         pass
 logger = logging.getLogger("uvicorn.error")
 WAITING_FOR_ENTRY_STATUS = "WAITING_FOR_ENTRY"
-WAITING_STATUSES = {"NOT_TRIGGERED", "PLANNED", "WAITING", WAITING_FOR_ENTRY_STATUS}
+ENTRY_TRIGGERED_STATUS = "ENTRY_TRIGGERED"
+WAITING_FOR_CAPITAL_STATUS = "WAITING_FOR_CAPITAL"
+WAITING_STATUSES = {"NOT_TRIGGERED", "PLANNED", "WAITING", WAITING_FOR_ENTRY_STATUS, ENTRY_TRIGGERED_STATUS, WAITING_FOR_CAPITAL_STATUS}
 CANCELED_STATUSES = {"EXPIRED", "NOT_TRIGGERED"}
 T1_PARTIAL_STATUS = "T1_PARTIAL"
 T2_PARTIAL_STATUS = "T2_PARTIAL"
@@ -857,6 +859,8 @@ def ui_status_for_trade(trade: dict) -> str:
     statuses = trade_statuses(trade)
     if statuses & WAITING_STATUSES or trade.get("entry_triggered") is False:
         if not statuses & (ACTIVE_STATUSES | TERMINAL_STATUSES):
+            if ENTRY_TRIGGERED_STATUS in statuses:
+                return "Entry Triggered (Waiting for Margin)"
             return "Waiting for Entry"
     if statuses & {T1_PARTIAL_STATUS, T2_PARTIAL_STATUS}:
         return "Partial"
@@ -998,7 +1002,7 @@ def paper_api_row(trade: dict, market_map: dict | None = None) -> dict:
     planned_quantity = int(planned_q) if planned_q is not None else None
 
     # 2. Bought & Open quantity & Reserved Margin & P&L
-    if status == "WAITING_FOR_ENTRY" or canceled_or_expired:
+    if status in ("WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL") or canceled_or_expired:
         bought_quantity = 0
         open_quantity = 0
         reserved_margin = 0.0
@@ -1030,7 +1034,7 @@ def paper_api_row(trade: dict, market_map: dict | None = None) -> dict:
     integrity_warnings = []
     if planned_quantity is None and not canceled_or_expired:
         integrity_warnings.append("UNRESOLVED_PLANNED_QUANTITY")
-    if status != "WAITING_FOR_ENTRY" and not canceled_or_expired and bought_quantity is None:
+    if status not in ("WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL") and not canceled_or_expired and bought_quantity is None:
         integrity_warnings.append("UNRESOLVED_BOUGHT_QUANTITY")
     integrity_warning = integrity_warnings[0] if integrity_warnings else None
 
@@ -1053,7 +1057,7 @@ def paper_api_row(trade: dict, market_map: dict | None = None) -> dict:
             price_updated_at = trade.get("status_updated_at") or trade.get("updated_at")
             price_source = "not_triggered_or_expired"
         exit_price = None
-    elif status in {"WAITING_FOR_ENTRY", "ACTIVE", "T1_PARTIAL", "T2_PARTIAL"}:
+    elif status in {"WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL", "ACTIVE", "T1_PARTIAL", "T2_PARTIAL"}:
         if market_map:
             price_val, updated_at, source, price_warn = resolve_fresh_quote(trade, market_map)
             current_price = price_val
@@ -1728,7 +1732,7 @@ def proposed_update_reason(plan: dict, update: dict) -> str:
     return f"STATUS_CHANGE_{current_status}_TO_{proposed_status}" if proposed_status != current_status else "NO_STATUS_CHANGE"
 
 
-def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: float = 250000.0, risk_percent: float = 1.0) -> dict | None:
+def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: float = settings.STARTING_VIRTUAL_BALANCE, risk_percent: float = 1.0) -> dict | None:
     if len(candles) < 10:
         return None
     signal_has_paper_plan = "paper_plan_valid" in signal
@@ -1779,7 +1783,7 @@ def extract_resistance_zones_from_candles(candles: list[dict]) -> list[dict]:
     return zones
 
 
-def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: float = 250000.0, risk_percent: float = 1.0) -> dict | None:
+def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: float = settings.STARTING_VIRTUAL_BALANCE, risk_percent: float = 1.0) -> dict | None:
     if len(candles) < 10:
         return None
     signal_has_paper_plan = "paper_plan_valid" in signal
@@ -2198,8 +2202,8 @@ def update_plan_status(
     plan: dict,
     latest: dict,
     *,
-    current_balance: float = 250000.0,
-    available_margin: float = 250000.0,
+    current_balance: float = settings.STARTING_VIRTUAL_BALANCE,
+    available_margin: float = settings.STARTING_VIRTUAL_BALANCE,
     open_margin: float = 0.0,
     combined_open_risk: float = 0.0,
 ) -> dict:
@@ -2221,8 +2225,8 @@ def _update_plan_status_raw(
     plan: dict,
     latest: dict,
     *,
-    current_balance: float = 250000.0,
-    available_margin: float = 250000.0,
+    current_balance: float = settings.STARTING_VIRTUAL_BALANCE,
+    available_margin: float = settings.STARTING_VIRTUAL_BALANCE,
     open_margin: float = 0.0,
     combined_open_risk: float = 0.0,
 ) -> dict:
@@ -2230,6 +2234,8 @@ def _update_plan_status_raw(
         return {}
     if is_terminal_trade(plan):
         return {}
+    
+    status = normalize_status(plan.get("status"))
 
     latest_high = latest["high"]
     latest_low = latest["low"]
@@ -2251,8 +2257,51 @@ def _update_plan_status_raw(
         else:
             return ambiguity_update(plan, latest, touched, ambiguity_reason, resolution_attempt, now)
 
-    if logic_status == WAITING_FOR_ENTRY_STATUS and (forced_event == "entry" or (forced_event is None and latest_high >= plan["entry_price"])):
+    if status == WAITING_FOR_CAPITAL_STATUS:
+        # Validity Option D: Structural & Time Expiration
+        v_stop = number_or_none(plan.get("stop_loss"))
+        v_target = number_or_none(plan.get("target_1"))
+        v_invalid = False
+        v_reason = None
+
+        if v_stop is not None and latest_low <= v_stop:
+            v_invalid = True
+            v_reason = "STOP_LOSS_HIT_BEFORE_ENTRY"
+        elif v_target is not None and latest_high >= v_target:
+            v_invalid = True
+            v_reason = "TARGET_HIT_BEFORE_ENTRY"
+        else:
+            triggered_at = plan.get("entry_triggered_at")
+            if triggered_at:
+                try:
+                    import dateutil.parser
+                    t_dt = dateutil.parser.isoparse(triggered_at)
+                    now_dt = dateutil.parser.isoparse(now).replace(tzinfo=None)
+                    if (now_dt - t_dt.replace(tzinfo=None)).days >= 3:
+                        v_invalid = True
+                        v_reason = "ALPHA_DECAY_TIME_EXCEEDED"
+                except Exception:
+                    pass
+
+        if v_invalid:
+                return {
+                    "latest_close": latest_close,
+                    "latest_high": latest_high,
+                    "latest_low": latest_low,
+                    "last_checked_at": now,
+                    "updated_at": now,
+                    "status": "EXPIRED",
+                    "outcome_status": "EXPIRED",
+                    "state": "EXPIRED",
+                    "status_updated_at": now,
+                    "exit_reason": v_reason,
+                    "capital_rejection_reason": v_reason,
+                    "activation_blocked_reason": v_reason,
+                }
+
+    if logic_status in (WAITING_FOR_ENTRY_STATUS, WAITING_FOR_CAPITAL_STATUS) and (forced_event == "entry" or (forced_event is None and latest_high >= plan["entry_price"])):
         from services.position_sizing import calculate_proposed_sizing
+
         grade = plan.get("trade_quality_grade") or plan.get("grade")
 
         import os
@@ -2261,7 +2310,7 @@ def _update_plan_status_raw(
 
         if is_legacy_test:
             final_q = plan.get("quantity") or 10
-            req_margin = (final_q * float(plan["entry_price"])) / 2.5
+            req_margin = (final_q * float(plan["entry_price"])) / settings.LEVERAGE
             est_risk = final_q * abs(float(plan["entry_price"]) - float(effective_stop_loss))
             exposure = final_q * float(plan["entry_price"])
             if final_q < 4:
@@ -2349,18 +2398,20 @@ def _update_plan_status_raw(
                     "block_code": rejection_reason,
                     "block_message": "Version 2 exit allocations are missing or invalid.",
                 }
-            elif rejection_reason in {"INSUFFICIENT_MARGIN", "PORTFOLIO_MARGIN_LIMIT_EXCEEDED", "PORTFOLIO_RISK_LIMIT_EXCEEDED", "INVALID_BALANCE"}:
+            elif rejection_reason in {"INSUFFICIENT_MARGIN", "INSUFFICIENT_AVAILABLE_MARGIN", "PORTFOLIO_MARGIN_LIMIT_EXCEEDED", "PORTFOLIO_RISK_LIMIT_EXCEEDED", "INVALID_BALANCE"}:
                 return {
                     "latest_close": latest_close,
                     "latest_high": latest_high,
                     "latest_low": latest_low,
                     "last_checked_at": now,
                     "updated_at": now,
-                    "status": "WAITING_FOR_ENTRY",
-                    "outcome_status": "WAITING_FOR_ENTRY",
-                    "state": "WAITING_FOR_ENTRY",
+                    "status": WAITING_FOR_CAPITAL_STATUS,
+                    "outcome_status": WAITING_FOR_CAPITAL_STATUS,
+                    "state": WAITING_FOR_CAPITAL_STATUS,
                     "activation_blocked_reason": rejection_reason,
                     "last_activation_attempt_at": now,
+                    "entry_triggered": True,
+                    "entry_triggered_at": plan.get("entry_triggered_at") or now,
                 }
             else:
                 return {
@@ -2390,8 +2441,8 @@ def _update_plan_status_raw(
                 }
 
 
-    if logic_status == WAITING_FOR_ENTRY_STATUS:
-        if status == WAITING_FOR_ENTRY_STATUS and outcome_status == WAITING_FOR_ENTRY_STATUS and not stop_loss_update:
+    if logic_status in (WAITING_FOR_ENTRY_STATUS, WAITING_FOR_CAPITAL_STATUS):
+        if status == logic_status and outcome_status == logic_status and not stop_loss_update:
             return {}
         return {
             "latest_close": latest_close,
@@ -2400,10 +2451,10 @@ def _update_plan_status_raw(
             "last_checked_at": now,
             "updated_at": now,
             **stop_loss_update,
-            "status": WAITING_FOR_ENTRY_STATUS,
-            "outcome_status": WAITING_FOR_ENTRY_STATUS,
+            "status": logic_status,
+            "outcome_status": logic_status,
             "status_updated_at": now,
-            "entry_triggered": False,
+            "entry_triggered": logic_status == WAITING_FOR_CAPITAL_STATUS,
         }
 
     management_update = {**stop_loss_update}
@@ -3528,7 +3579,7 @@ async def approve_paper_trade_update(
             original_status = str(original_trade.get("status") or "").upper()
             proposed_status = str(proposed_update.get("status") or "").upper()
             try:
-                if original_status == "WAITING_FOR_ENTRY" and proposed_status in ("ACTIVE", "EXPIRED"):
+                if original_status in ("WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL") and proposed_status in ("ACTIVE", "EXPIRED"):
                     current_state_version = int(original_trade.get("state_version", 1))
                     activation_result = await try_activate_trade_with_capital(
                         db,
@@ -3819,7 +3870,7 @@ async def get_paper_summary() -> dict:
         "waiting_for_entry": len(waiting),
         "planned": sum(1 for trade in trades if normalize_status(trade.get("status")) == "PLANNED"),
         "not_triggered": sum(1 for trade in trades if normalize_status(trade.get("status")) == "NOT_TRIGGERED"),
-        "waiting_for_entry_status": sum(1 for trade in trades if normalize_status(trade.get("status")) == WAITING_FOR_ENTRY_STATUS),
+        "waiting_for_entry_status": sum(1 for trade in trades if normalize_status(trade.get("status")) in ("WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL")),
         "active": sum(1 for trade in trades if normalize_status(trade.get("status")) == "ACTIVE"),
         "target_1_hit": sum(1 for trade in trades if normalize_status(trade.get("status")) == "TARGET_1_HIT"),
         "target_2_hit": sum(1 for trade in trades if normalize_status(trade.get("status")) == "TARGET_2_HIT"),
@@ -3943,7 +3994,12 @@ async def fetch_trade_market_latest(db, trade: dict) -> tuple[dict | None, dict 
     await record_paper_market_snapshots(db, trade, market_row)
     snapshot_latest = await paper_market_latest_row(db, trade)
     if is_waiting_trade(trade):
-        return market_row, snapshot_latest
+        # Use accumulated snapshots as the primary source (they carry the full
+        # post-setup high/low history).  Fall back to the live market_data row
+        # when no snapshots exist yet — this covers the window between trade
+        # creation and the first snapshot being written, preventing a newly
+        # created WAITING trade from being silently skipped as DATA_INSUFFICIENT.
+        return market_row, snapshot_latest or market_data_latest_row(market_row, trade)
     return market_row, market_data_latest_row(market_row, trade) or snapshot_latest
 
 
@@ -4006,7 +4062,7 @@ async def audit_and_fix_waiting_trades(db, *, apply: bool = False, limit: int = 
             if apply and should_update:
                 original_status = str(trade.get("status") or "").upper()
                 proposed_status = str(update.get("status") or "").upper()
-                if original_status == "WAITING_FOR_ENTRY" and proposed_status in ("ACTIVE", "EXPIRED"):
+                if original_status in ("WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL") and proposed_status in ("ACTIVE", "EXPIRED"):
                     current_state_version = int(trade.get("state_version", 1))
                     activation_result = await try_activate_trade_with_capital(
                         db,
@@ -4231,7 +4287,7 @@ async def run_automatic_outcome_update(
         }
 
     async with PAPER_AUTO_OUTCOME_LOCK:
-        db = db_override or get_database()
+        db = db_override if db_override is not None else get_database()
         run_id = f"auto-outcome-{uuid4().hex}"
         if dry_run:
             lock_result = {"acquired": True}
@@ -4255,9 +4311,13 @@ async def run_automatic_outcome_update(
         errors = []
         results = []
         try:
+            current_balance, realized_pnl = await get_current_virtual_balance_and_pnl(db)
+            open_margin, combined_open_risk = await get_portfolio_totals(db)
+            available_margin = current_balance - open_margin
+
             cursor = db.paper_trades.find(
                 {"paper_only": True, "status": {"$in": TRACKABLE_STATUSES}},
-            ).sort("updated_at", -1).limit(limit)
+            )
             async for trade in cursor:
                 if is_terminal_trade(trade):
                     completed_protected += 1
@@ -4274,7 +4334,14 @@ async def run_automatic_outcome_update(
                             }
                         )
                         continue
-                    update = update_plan_status(trade, latest)
+                    update = update_plan_status(
+                        trade,
+                        latest,
+                        current_balance=current_balance,
+                        available_margin=available_margin,
+                        open_margin=open_margin,
+                        combined_open_risk=combined_open_risk,
+                    )
                     if not update:
                         results.append({"symbol": trade.get("symbol"), "updated": False, "reason": "NO_STATUS_CHANGE"})
                         continue
@@ -4284,7 +4351,7 @@ async def run_automatic_outcome_update(
                     if dry_run:
                         modified = 1
                     else:
-                        if original_status == "WAITING_FOR_ENTRY" and proposed_status in ("ACTIVE", "EXPIRED"):
+                        if original_status in ("WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL") and proposed_status in ("ACTIVE", "EXPIRED"):
                             current_state_version = int(trade.get("state_version", 1))
                             activation_result = await try_activate_trade_with_capital(
                                 db,

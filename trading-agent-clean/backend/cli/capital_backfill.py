@@ -147,7 +147,7 @@ async def build_field_level_preview(db, *, limit: int | None = None) -> dict:
             else:
                 skipped += 1
 
-        elif status == "WAITING_FOR_ENTRY":
+        elif status in ("WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL"):
             # Waiting trade backfill: proposed sizing + zero reserved
             if not entry or not sl:
                 # If levels are missing, skip or use defaults

@@ -104,7 +104,7 @@ async def build_reconciliation_preview(db, *, limit: int | None = None) -> dict:
         qty = trade.get("quantity") or trade.get("original_quantity") or 0
 
         # Precedence 1: MANUAL_REVIEW_REQUIRED
-        if (status in GENUINE_OPEN_STATUSES or status == "WAITING_FOR_ENTRY") and (entry_price is None or stop_loss is None or float(entry_price) <= 0.0 or float(stop_loss) <= 0.0):
+        if (status in GENUINE_OPEN_STATUSES or status in ("WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL")) and (entry_price is None or stop_loss is None or float(entry_price) <= 0.0 or float(stop_loss) <= 0.0):
             categories["MANUAL_REVIEW_REQUIRED"].append(trade_id)
             continue
 
@@ -165,11 +165,11 @@ async def build_reconciliation_preview(db, *, limit: int | None = None) -> dict:
                 continue
 
         # Precedence 5: SMALL_QUANTITY_INVALID_ALLOCATION
-        if status in GENUINE_OPEN_STATUSES or status == "WAITING_FOR_ENTRY":
+        if status in GENUINE_OPEN_STATUSES or status in ("WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL"):
             allocations = exit_allocations_for_trade(trade)
             if qty < 4 or not allocations.get("valid"):
                 categories["SMALL_QUANTITY_INVALID_ALLOCATION"].append(trade_id)
-                if status in GENUINE_OPEN_STATUSES or status == "WAITING_FOR_ENTRY":
+                if status in GENUINE_OPEN_STATUSES or status in ("WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL"):
                     update_doc = {
                         "status": "EXPIRED",
                         "outcome_status": "EXPIRED",
@@ -226,7 +226,7 @@ async def build_reconciliation_preview(db, *, limit: int | None = None) -> dict:
                     eligibility_fields=RECONCILIATION_PRECONDITION_FIELDS,
                 ))
                 continue
-        elif status not in {"WAITING_FOR_ENTRY"} and (trade.get("margin_remaining", 0.0) > 0.0 or trade.get("open_sl_risk", 0.0) > 0.0):
+        elif status not in {"WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL"} and (trade.get("margin_remaining", 0.0) > 0.0 or trade.get("open_sl_risk", 0.0) > 0.0):
             categories["ACCOUNTING_MISMATCH"].append(trade_id)
             update_doc = {
                 "margin_remaining": 0.0,
@@ -264,7 +264,7 @@ async def build_reconciliation_preview(db, *, limit: int | None = None) -> dict:
                 continue
 
         # Precedence 8: SAFE
-        if status in GENUINE_OPEN_STATUSES or status == "WAITING_FOR_ENTRY":
+        if status in GENUINE_OPEN_STATUSES or status in ("WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL"):
             categories["SAFE"].append(trade_id)
 
     plan = build_preview_plan(

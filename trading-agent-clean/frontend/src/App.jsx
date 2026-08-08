@@ -1923,6 +1923,7 @@ function hasAnyPaperStatus(statuses, candidates) {
   return false;
 }
 function paperDisplayStatus(trade) {
+  if (trade?.status === "INVALIDATED_STALE" || trade?.invalidated_reason) return "Invalidated";
   const statuses = paperStatusSet(trade);
   if (hasAnyPaperStatus(statuses, PAPER_EXPIRED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_ACTIVE_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_PARTIAL_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_COMPLETED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_STOPPED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_AMBIGUOUS_STATUSES)) return "Expired / Not Triggered";
   if (hasAnyPaperStatus(statuses, PAPER_WAITING_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_ACTIVE_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_PARTIAL_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_COMPLETED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_STOPPED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_AMBIGUOUS_STATUSES)) return "Waiting for Entry";
@@ -1935,6 +1936,7 @@ function paperDisplayStatus(trade) {
 }
 function paperStatusToneFromLabel(status) {
   const label = String(status || "").toLowerCase();
+  if (label.includes("invalidated")) return "gray";
   if (label.includes("stopped") || label.includes("sl")) return "red";
   if (label.includes("expired") || label.includes("not triggered")) return "gray";
   if (label.includes("waiting") || label.includes("partial") || label.includes("ambiguous")) return "yellow";
@@ -1969,6 +1971,7 @@ function paperCellValue(row, column) {
   if (column.key === "target_2") return row?.target_2 ?? row?.t2;
   if (column.key === "target_3") return row?.target_3 ?? row?.t3;
   if (column.key === "pnl") {
+    if (row?.status === "INVALIDATED_STALE" || row?.invalidated_reason) return 0;
     const statuses = paperStatusSet(row);
     if (hasAnyPaperStatus(statuses, PAPER_EXPIRED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_COMPLETED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_STOPPED_STATUSES)) return row?.pnl_display ?? row?.paper_pnl ?? row?.pnl ?? 0;
     return row?.pnl_display ?? row?.paper_pnl ?? row?.pnl;

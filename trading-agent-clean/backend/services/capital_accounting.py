@@ -51,13 +51,34 @@ def trade_open_sl_risk(trade: dict) -> float:
         return abs(float(entry) - float(sl)) * float(q)
     return 0.0
 
+from services.trade_journal import (
+    analytics_pnl_value,
+    analytics_realized_pnl_record,
+    is_invalidated_trade,
+    load_trade_journal,
+)
+
+
 async def get_current_virtual_balance_and_pnl(db) -> tuple[float, float]:
     """
-    Returns (current_virtual_balance, realized_pnl) from trade journal.
+    Returns (current_virtual_balance, realized_pnl) from trade journal and paper_trades.
     """
     journal_records = await load_trade_journal(db, 5000)
     realized_records = [record for record in journal_records if analytics_realized_pnl_record(record)]
-    realized_pnl = sum(analytics_pnl_value(record) or 0.0 for record in realized_records)
+    journal_realized = sum(analytics_pnl_value(record) or 0.0 for record in realized_records)
+    
+    cursor = db.paper_trades.find({"paper_only": True})
+    trades = [t async for t in cursor]
+    journal_pt_ids = {str(rec.get("paper_trade_id") or rec.get("_id")) for rec in realized_records}
+    journal_symbols = {str(rec.get("symbol")) for rec in realized_records if rec.get("symbol")}
+    
+    paper_realized = sum(
+        float(t.get("realized_pnl") or 0.0)
+        for t in trades
+        if str(t.get("_id")) not in journal_pt_ids and str(t.get("symbol") or t.get("canonical_symbol")) not in journal_symbols and not is_invalidated_trade(t)
+    )
+    
+    realized_pnl = journal_realized + paper_realized
     current_balance = settings.STARTING_VIRTUAL_BALANCE + realized_pnl
     return current_balance, realized_pnl
 

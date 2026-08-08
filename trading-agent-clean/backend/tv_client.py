@@ -1107,11 +1107,15 @@ def managed_tradingview_url() -> str:
 
 
 def extract_symbol_from_url(url: str) -> str | None:
-    marker = "symbol="
-    if marker not in url:
+    try:
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+        if "symbol" in params and params["symbol"]:
+            return params["symbol"][0]
         return None
-    value = url.split(marker, 1)[1].split("&", 1)[0]
-    return unquote(value).replace("%3A", ":")
+    except Exception:
+        return None
 
 
 def normalize_symbol(value: object) -> str | None:
@@ -1146,10 +1150,8 @@ def normalize_symbol(value: object) -> str | None:
                 exchange = p_upper
                 break
 
-    symbol = symbol.strip().upper()
-    for suffix in (".NS", ".BO"):
-        if symbol.endswith(suffix):
-            symbol = symbol[:-len(suffix)]
+    from utils.symbol_utils import normalize_symbol as base_normalize
+    symbol = base_normalize(exchange or "NSE", symbol)
 
     if exchange:
         return f"{exchange}:{symbol}"

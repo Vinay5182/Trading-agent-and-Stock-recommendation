@@ -1,3 +1,36 @@
+"""
+TradingView Confirmation Pipeline & Lifecycle Architecture
+
+`tv_status` represents the FINAL lifecycle state of the TradingView confirmation pipeline.
+It is NOT merely the raw TradingView chart verdict.
+
+The TradingView confirmation pipeline executes the following 5-step evaluation sequence:
+  1. Technical Chart Analysis: Extraction of 1W, 1D, 4H, and 1H candle data via CDP.
+  2. Multi-Timeframe (MTF) Validation: Alignment check across higher and lower timeframes.
+  3. Trade Plan Construction: Entry, stop loss, and target level calculations.
+  4. Risk & Target Validation: Evaluation of fake breakouts, retail traps, R:R >= 2.0, and target structure collisions.
+  5. Final Lifecycle Determination (`apply_trade_quality`): Synchronization of macro status (`tv_status`) with micro readiness and plan validity.
+
+Canonical `tv_status` Values & Meanings:
+  - `CONFIRMED_SIGNAL`: Swing strategy setup with confirmed MTF alignment, valid trade plan, and clean risk profile.
+  - `MOMENTUM_CONFIRMED`: Momentum strategy setup with confirmed momentum alignment, valid trade plan, and clean risk profile.
+  - `WAIT_FOR_RETEST`: Valid swing setup technically, awaiting price retest trigger before trade activation.
+  - `WAIT_FOR_PULLBACK`: Valid momentum setup technically, awaiting price pullback trigger before trade activation.
+  - `REJECTED`: Setup rejected due to unaligned MTF structure, high risk flags, or downstream plan validation / target structure collision.
+  - `TECHNICAL_FAILED`: Infrastructure failure (CDP attachment timeout, symbol mismatch, timeframe mismatch, missing candles, or schema error).
+
+Non-Lossy `REJECTED` State Semantics:
+  A `REJECTED` status indicates that the pipeline will NOT allow a trade execution.
+  The exact underlying cause of rejection is fully preserved in auxiliary fields:
+    - `avoid_reason`: Specific cause (e.g. 'TARGET_STRUCTURE_COLLISION', 'RISK_REWARD_BELOW_2', 'FAKE_BREAKOUT_RISK_HIGH', 'MTF_ALIGNMENT_WEAK')
+    - `paper_plan_reason`: Specific block code from trade plan calculator
+    - `trade_quality_grade`: Grade assigned by quality classifier ('NO_TRADE', 'C', 'B', 'A', 'A_PLUS')
+    - `confidence_score`: MTF technical score (0-100)
+    - `timeframe_analysis`: Full technical candle indicators and swing levels across timeframes
+
+Therefore, synchronizing `tv_status` to `REJECTED` when downstream plan validation fails does NOT lose analytical information.
+"""
+
 import time
 from datetime import datetime, timezone
 
@@ -748,9 +781,14 @@ def _quality_payload(grade: str, score: int, reason: str, avoid_reason: str | No
     }
 
 
+def _get_max_rr(row: dict) -> float:
+    rr_vals = [_to_float(row.get(f"paper_rr_{i}")) for i in (1, 2, 3)]
+    return max([r for r in rr_vals if r is not None], default=0.0)
+
+
 def _classify_swing_trade_quality(row: dict) -> dict:
     status = _upper(row.get("tv_status"))
-    rr1 = _to_float(row.get("paper_rr_1"))
+    max_rr = _get_max_rr(row)
     paper_valid = row.get("paper_plan_valid") is True
     fake_high = _risk_is_high(row, "fake_breakout_risk")
     trap_high = _risk_is_high(row, "retail_trap_risk")
@@ -765,18 +803,18 @@ def _classify_swing_trade_quality(row: dict) -> dict:
         return _quality_payload("B", 65, "WATCH_ONLY: setup is interesting but trigger is not ready.", "WATCH_ONLY - wait setup, not trade allowed.")
     if not paper_valid:
         return _quality_payload("NO_TRADE", 0, "No trade quality: plan is failed or not valid.", row.get("paper_plan_reason") or row.get("reason"))
-    if fake_high or trap_high or (rr1 is not None and rr1 < 2):
+    if fake_high or trap_high or max_rr < 2:
         return _quality_payload("NO_TRADE", 0, "No trade quality: hard risk or RR blocker.", "HIGH risk or RR below 2.")
-    if status == "CONFIRMED_SIGNAL" and paper_valid and rr1 is not None and rr1 >= 2.2 and _upper(row.get("fake_breakout_risk")) == "LOW" and _upper(row.get("retail_trap_risk")) in {"LOW", "MEDIUM"} and entry_ready and candles_clean and mtf_clean:
+    if status == "CONFIRMED_SIGNAL" and paper_valid and max_rr >= 2.2 and _upper(row.get("fake_breakout_risk")) == "LOW" and _upper(row.get("retail_trap_risk")) in {"LOW", "MEDIUM"} and entry_ready and candles_clean and mtf_clean:
         return _quality_payload("A_PLUS", 95, "A+ swing setup: clean confirmed plan, RR above 2.2, low fake-breakout risk, and clean MTF/candle checks.")
-    if status == "CONFIRMED_SIGNAL" and paper_valid and rr1 is not None and rr1 >= 2.0 and not fake_high and not trap_high and candles_clean:
+    if status == "CONFIRMED_SIGNAL" and paper_valid and max_rr >= 2.0 and not fake_high and not trap_high and candles_clean:
         return _quality_payload("A", 85, "A swing setup: confirmed paper plan with RR at or above 2 and no HIGH risk flags.")
     return _quality_payload("C", 45, "C swing setup: caution risk, weak entry quality, or RR/MTF quality is not clean.", "Not an A/A+ setup.")
 
 
 def _classify_momentum_trade_quality(row: dict) -> dict:
     status = _upper(row.get("tv_status"))
-    rr1 = _to_float(row.get("paper_rr_1"))
+    max_rr = _get_max_rr(row)
     paper_valid = row.get("paper_plan_valid") is True
     fake_high = _risk_is_high(row, "fake_breakout_risk")
     overextended_high = _risk_is_high(row, "overextended_risk")
@@ -791,16 +829,30 @@ def _classify_momentum_trade_quality(row: dict) -> dict:
         return _quality_payload("B", 65, "WATCH_ONLY: strong setup but trigger is not ready.", "WATCH_ONLY - wait setup, not trade allowed.")
     if not paper_valid:
         return _quality_payload("NO_TRADE", 0, "No trade quality: plan is failed or not valid.", row.get("paper_plan_reason") or row.get("reason"))
-    if trap_status == "DANGER" or fake_high or overextended_high or (rr1 is not None and rr1 < 2):
+    if trap_status == "DANGER" or fake_high or overextended_high or max_rr < 2:
         return _quality_payload("NO_TRADE", 0, "No trade quality: hard momentum risk or RR blocker.", "DANGER trap, HIGH risk, or RR below 2.")
-    if status == "MOMENTUM_CONFIRMED" and paper_valid and rr1 is not None and rr1 >= 2.2 and not fake_high and not overextended_high and trap_status == "CLEAN" and entry_quality == "READY" and volume_confirmation == "STRONG" and candles_clean:
+    if status == "MOMENTUM_CONFIRMED" and paper_valid and max_rr >= 2.2 and not fake_high and not overextended_high and trap_status == "CLEAN" and entry_quality == "READY" and volume_confirmation == "STRONG" and candles_clean:
         return _quality_payload("A_PLUS", 95, "A+ momentum setup: clean confirmed plan, RR above 2.2, CLEAN trap status, READY entry, and STRONG volume.")
-    if status == "MOMENTUM_CONFIRMED" and paper_valid and rr1 is not None and rr1 >= 2.0 and trap_status in {"CLEAN", "CAUTION"} and not fake_high and not overextended_high and volume_confirmation in {"STRONG", "OK"}:
+    if status == "MOMENTUM_CONFIRMED" and paper_valid and max_rr >= 2.0 and trap_status in {"CLEAN", "CAUTION"} and not fake_high and not overextended_high and volume_confirmation in {"STRONG", "OK"}:
         return _quality_payload("A", 85, "A momentum setup: confirmed paper plan with RR at or above 2 and no HIGH risk flags.")
     return _quality_payload("C", 45, "C momentum setup: caution setup, late entry, trap caution, or volume is not strong.", "Not an A/A+ setup.")
 
 
 def apply_trade_quality(row: dict, strategy: str) -> dict:
+    """
+    Applies trade quality classification and synchronizes final lifecycle status.
+
+    Lifecycle Synchronization:
+    - If trade quality classification or trade plan validation determines grade == 'NO_TRADE'
+      (due to TARGET_STRUCTURE_COLLISION, RISK_REWARD_BELOW_2, hard risk flags, etc.),
+      the candidate's macro lifecycle tv_status is synchronized to 'REJECTED'.
+    - This eliminates internal contradictions (e.g. tv_status == 'CONFIRMED_SIGNAL' with
+      entry_readiness == 'NO_TRADE').
+    - Exact rejection rationale is non-lossy and preserved in:
+        avoid_reason, paper_plan_reason, trade_quality_grade, confidence_score.
+    - Computes explicit boolean trade_allowed = True only when tv_status is confirmed,
+      entry_readiness is READY, paper_plan_valid is True, and grade is A or A+.
+    """
     enriched = dict(row)
     if strategy == "momentum":
         enriched["entry_quality"] = enriched.get("entry_quality") or _momentum_entry_quality(enriched)
@@ -808,6 +860,28 @@ def apply_trade_quality(row: dict, strategy: str) -> dict:
         enriched.update(_classify_momentum_trade_quality(enriched))
     else:
         enriched.update(_classify_swing_trade_quality(enriched))
+
+    # Synchronize lifecycle states when trade quality grade is NO_TRADE
+    grade = enriched.get("trade_quality_grade")
+    tv_status = _upper(enriched.get("tv_status"))
+
+    if grade == "NO_TRADE" and tv_status not in FAILED_PAPER_STATUSES:
+        enriched["tv_status"] = "REJECTED"
+        enriched["tv_confirmed"] = False
+        enriched["entry_readiness"] = "NO_TRADE"
+        if not enriched.get("avoid_reason"):
+            enriched["avoid_reason"] = enriched.get("quality_reason") or "NO_TRADE"
+
+    readiness = _upper(enriched.get("entry_readiness"))
+    paper_valid = enriched.get("paper_plan_valid") is True
+    is_confirmed_status = _upper(enriched.get("tv_status")) in {"CONFIRMED_SIGNAL", "MOMENTUM_CONFIRMED"}
+
+    enriched["trade_allowed"] = bool(
+        is_confirmed_status
+        and readiness in {"READY", ""}
+        and paper_valid
+        and grade in {"A_PLUS", "A"}
+    )
     return enriched
 
 
@@ -1214,21 +1288,12 @@ def build_price_action_paper_plan(
 ) -> dict:
     analyses = analyses or {}
     risk_context = risk_context or {}
-    if tv_status in FAILED_PAPER_STATUSES:
+    if tv_status == "TECHNICAL_FAILED" and not analyses:
         return _empty_paper_trade_plan(tv_status or "NO_TRADE")
-    if tv_status in WAIT_PAPER_STATUSES:
-        return _paper_wait_setup(strategy, tv_status, analyses, tv_status)
-    expected_status = "MOMENTUM_CONFIRMED" if strategy == "momentum" else "CONFIRMED_SIGNAL"
-    if tv_status != expected_status:
-        return _empty_paper_trade_plan("NO_CONFIRMED_PAPER_SETUP")
+
     if not _paper_candles_clean(analyses, candle_integrity_summary):
         return _empty_paper_trade_plan("CANDLES_NOT_CLEAN")
-    if risk_context.get("fake_breakout_risk") == "HIGH":
-        return _empty_paper_trade_plan("FAKE_BREAKOUT_RISK_HIGH")
-    if strategy != "momentum" and risk_context.get("retail_trap_risk") == "HIGH":
-        return _empty_paper_trade_plan("RETAIL_TRAP_RISK_HIGH")
-    if strategy != "momentum" and risk_context.get("trap_status") == "DANGER" and risk_context.get("paper_mode") != "CAUTION_ONLY":
-        return _empty_paper_trade_plan("TRAP_DANGER")
+
     entry_frame, entry_analysis = _paper_entry_source(strategy, analyses)
     daily = analyses.get("1D") or entry_analysis or {}
     entry_high = _to_float((entry_analysis or {}).get("last_high")) or _to_float((entry_analysis or {}).get("recent_high_20"))
@@ -1302,6 +1367,16 @@ def build_price_action_paper_plan(
         plan_reason = plan_res.get("block_code") or "PLAN_BLOCKED"
         empty_plan = _empty_paper_trade_plan(plan_reason)
         empty_plan.update(plan_res)
+        if plan_res.get("entry_price") is not None:
+            empty_plan["paper_entry_price"] = plan_res.get("entry_price")
+            empty_plan["paper_stop_loss"] = plan_res.get("final_stop_loss") or plan_res.get("stop_loss")
+            empty_plan["paper_target_1"] = plan_res.get("t1_target_final") or plan_res.get("target_1")
+            empty_plan["paper_target_2"] = plan_res.get("t2_target_final") or plan_res.get("target_2")
+            empty_plan["paper_target_3"] = plan_res.get("t3_target_final") or plan_res.get("target_3")
+            empty_plan["paper_risk_per_share"] = plan_res.get("risk_per_share")
+            empty_plan["paper_rr_1"] = plan_res.get("t1_final_rr") or plan_res.get("risk_reward_1")
+            empty_plan["paper_rr_2"] = plan_res.get("t2_final_rr")
+            empty_plan["paper_rr_3"] = plan_res.get("t3_final_rr")
         return empty_plan
 
     # Schema validation for V2 results
@@ -1320,6 +1395,26 @@ def build_price_action_paper_plan(
         return empty_plan
 
 
+    expected_status = "MOMENTUM_CONFIRMED" if strategy == "momentum" else "CONFIRMED_SIGNAL"
+    is_confirmed = (tv_status == expected_status)
+    fake_breakout_high = (risk_context.get("fake_breakout_risk") == "HIGH")
+    retail_trap_high = (strategy != "momentum" and risk_context.get("retail_trap_risk") == "HIGH")
+    trap_danger = (strategy != "momentum" and risk_context.get("trap_status") == "DANGER" and risk_context.get("paper_mode") != "CAUTION_ONLY")
+
+    is_paper_valid = is_confirmed and not (fake_breakout_high or retail_trap_high or trap_danger)
+
+    if not is_paper_valid:
+        if fake_breakout_high:
+            paper_reason = "FAKE_BREAKOUT_RISK_HIGH"
+        elif retail_trap_high:
+            paper_reason = "RETAIL_TRAP_RISK_HIGH"
+        elif trap_danger:
+            paper_reason = "TRAP_DANGER"
+        else:
+            paper_reason = tv_status or "NO_CONFIRMED_PAPER_SETUP"
+    else:
+        paper_reason = "VALID_RR_PLAN"
+
     entry_text = "momentum confirmation candle" if strategy == "momentum" else "price-action confirmation candle"
     stop_text = support_label or "latest swing low/support"
     target_text = plan_res["target_logic"]
@@ -1335,8 +1430,8 @@ def build_price_action_paper_plan(
         "paper_rr_1": plan_res["t1_final_rr"],
         "paper_rr_2": plan_res["t2_final_rr"],
         "paper_rr_3": plan_res["t3_final_rr"],
-        "paper_plan_valid": True,
-        "paper_plan_reason": "VALID_RR_PLAN",
+        "paper_plan_valid": is_paper_valid,
+        "paper_plan_reason": paper_reason,
         "entry_zone": _price_zone_text(entry_high, plan_res["entry_price"]),
         "pullback_zone": _price_zone_text(support, plan_res["final_stop_loss"]),
         "trigger_condition": f"{entry_frame or '1H'} close or buy-stop trigger above {_round(entry_high)}.",
@@ -1344,8 +1439,8 @@ def build_price_action_paper_plan(
         "stop_loss_logic": f"SL below {stop_text} with ATR buffer when available.",
         "target_logic": target_text,
         "invalidation_condition": "Invalidate on close below stop/support, HIGH fake breakout risk, DANGER trap, or failed candle safety.",
-        "next_action_for_paper_trade": "PAPER_PLAN_READY",
-        "entry_readiness": "READY",
+        "next_action_for_paper_trade": "PAPER_PLAN_READY" if is_paper_valid else "NO_PAPER_TRADE",
+        "entry_readiness": "READY" if is_paper_valid else ("WAIT" if tv_status in WAIT_PAPER_STATUSES else "NO_TRADE"),
         "planned_stop_loss_logic": "Below pullback/retest swing low with ATR buffer.",
         "planned_targets_after_trigger": f"{_target_ladder_text()} or nearest higher resistance.",
         "target_1_adjusted_to_resistance": resistance_blocks_2r,
@@ -2354,6 +2449,30 @@ def _fetch_swing_timeframe_with_validation(
             last_error_message = "GAP_VALIDATION_FAILED"
             continue
 
+        # Cross-Timeframe Session Synchronization Validation
+        # Verify current timeframe's latest candle session matches or reaches the higher timeframe's session
+        if previous_debug and second:
+            prev_last_time = previous_debug.get("last_candle_time")
+            prev_ts = previous_debug.get("latest_candle_timestamp")
+            curr_ts = int(_candle_time_seconds(_candle_time_value(second[-1]))) if second else None
+
+            def _extract_session_date(val, ts_val):
+                if val and isinstance(val, str) and len(val) >= 10:
+                    return val[:10]
+                if ts_val is not None:
+                    from datetime import datetime, timezone
+                    return datetime.fromtimestamp(ts_val, tz=timezone.utc).strftime("%Y-%m-%d")
+                return None
+
+            prev_date = _extract_session_date(prev_last_time, prev_ts)
+            curr_date = _extract_session_date(second[-1].get("time") if second else None, curr_ts)
+
+            if prev_date and curr_date and curr_date < prev_date:
+                last_error_stage = "TV_CANDLE_STALE"
+                last_error_message = f"SESSION_MISMATCH: {timeframe} session ({curr_date}) lags behind higher timeframe session ({prev_date})"
+                client.sleep(0.2, f"timeframe:{timeframe}:stale_ts_wait")
+                continue
+
         # If we reach here, everything is successful!
         elapsed_ms = int((time.monotonic() - start_time) * 1000)
         latest_ts = int(_candle_time_seconds(_candle_time_value(second[-1]))) if second else None
@@ -2411,6 +2530,8 @@ def _fetch_swing_timeframe_with_validation(
         "attempts": attempts,
         "candles_received": len(fallback_candles),
         "latest_candle_timestamp": latest_ts,
+        "expected_timestamp": int(time.time()),
+        "rejection_reason": f"TV_CANDLE_STALE:{timeframe}:latest_ts={latest_ts}" if last_error_stage == "TV_CANDLE_STALE" else last_error_message,
         "error_stage": last_error_stage,
         "error_message": last_error_message,
     })
@@ -2496,6 +2617,17 @@ def confirm_swing_symbol_timeframes(
         for timeframe in timeframes:
             try:
                 candles, debug = _fetch_swing_timeframe_with_validation(client, timeframe, previous_debug, previous_timeframe)
+                
+                # --- HISTORICAL MARKET DATA LAYER ---
+                try:
+                    from services.market_data_service import save_candles
+                    print(f"[TRACE] tv_confirmation calling save_candles for Swing {timeframe}...")
+                    save_candles(requested_symbol or symbol_meta.get("symbol") or symbol, timeframe, candles, source="TradingView")
+                except Exception as exc:
+                    import logging
+                    logging.getLogger(__name__).error("Failed to save market candles: %s", exc)
+                # -------------------------------------
+                
                 timeframe_debug[timeframe] = debug
                 if debug.get("stale_or_merged_candle_warning"):
                     fetch_errors[timeframe] = debug.get("error_message") or "STALE_OR_MERGED_CANDLES"
@@ -3047,6 +3179,17 @@ def confirm_momentum_symbol_timeframes(
         previous_timeframe = None
         for timeframe in timeframes:
             candles, debug = _fetch_swing_timeframe_with_validation(client, timeframe, previous_debug, previous_timeframe)
+            
+            # --- HISTORICAL MARKET DATA LAYER ---
+            try:
+                from services.market_data_service import save_candles
+                print(f"[TRACE] tv_confirmation calling save_candles for Momentum {timeframe}...")
+                save_candles(requested_symbol or symbol_meta.get("symbol") or symbol, timeframe, candles, source="TradingView")
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).error("Failed to save market candles: %s", exc)
+            # -------------------------------------
+            
             timeframe_debug[timeframe] = debug
             if debug.get("stale_or_merged_candle_warning"):
                 fetch_errors[timeframe] = debug.get("error_message") or "STALE_OR_MERGED_CANDLES"

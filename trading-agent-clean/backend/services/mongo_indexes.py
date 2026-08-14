@@ -266,7 +266,17 @@ _INDEX_SPECS: tuple[IndexSpec, ...] = (
     IndexSpec("historical_scored_candidates", "canonical_symbol_1_trade_date_1", _keys(("canonical_symbol", 1), ("trade_date", 1)), **_noncritical("Query by symbol and date.")),
     IndexSpec("historical_scored_candidates", "selected_as_swing_1_trade_date_1", _keys(("selected_as_swing", 1), ("trade_date", 1)), **_noncritical("Query by swing and date.")),
     IndexSpec("historical_scored_candidates", "selected_as_momentum_1_trade_date_1", _keys(("selected_as_momentum", 1), ("trade_date", 1)), **_noncritical("Query by momentum and date.")),
-    IndexSpec("historical_scored_candidates", "generation_run_id_1", _keys(("generation_run_id", 1)), **_noncritical("Query by generation run.")),
+    IndexSpec(
+        "candidate_trade_outcomes",
+        "candidate_id_unique",
+        _keys(("identity.candidate_id", 1)),
+        unique=True,
+        **_critical("Unique identity for candidate trade outcome record."),
+    ),
+    IndexSpec("candidate_trade_outcomes", "symbol_date", _keys(("identity.canonical_symbol", 1), ("identity.scan_date", 1)), **_noncritical("Query by symbol and date.")),
+    IndexSpec("candidate_trade_outcomes", "date_strategy", _keys(("identity.scan_date", 1), ("candidate_features.strategy_type", 1)), **_noncritical("Query by scan date and strategy.")),
+    IndexSpec("candidate_trade_outcomes", "outcome_label", _keys(("final_label.trade_outcome", 1), ("identity.scan_date", 1)), **_noncritical("Query by outcome label.")),
+    IndexSpec("candidate_trade_outcomes", "selection_status", _keys(("selection_status.selected_for_trade", 1), ("identity.scan_date", 1)), **_noncritical("Query by selection status.")),
     IndexSpec(
         "historical_ohlcv",
         "historical_ohlcv_candle_id_unique",
@@ -335,6 +345,13 @@ _INDEX_SPECS: tuple[IndexSpec, ...] = (
     ),
     IndexSpec("swing_tv_confirmations", "swing_tv_confirmations_identity_lookup", _keys(*((field, 1) for field in TV_CONFIRMATION_BASE_IDENTITY_FIELDS)), **_noncritical("Swing TV confirmation lookup/upsert support; uniqueness is status-aware.")),
     IndexSpec("swing_tv_confirmations", "swing_tv_confirmations_lookup", _keys(("index_name", 1), ("timeframes_hash", 1), ("updated_at", -1)), **_noncritical("GET /api/swing/tv-confirmed lookup and sort.")),
+    IndexSpec(
+        "daily_tradingview_counts",
+        "daily_tradingview_counts_trade_date_unique",
+        _keys(("trade_date", 1)),
+        unique=True,
+        **_critical("Unique daily TradingView confirmed counts document per trade date."),
+    ),
     IndexSpec(
         "momentum_tv_confirmations",
         "momentum_tv_confirmations_non_technical_unique_v1",
@@ -465,6 +482,13 @@ _INDEX_SPECS: tuple[IndexSpec, ...] = (
         **_critical("Canonical daily trade dataset immutable dataset_id."),
     ),
     IndexSpec(
+        "trade_outcomes",
+        "trade_outcomes_trade_id_unique",
+        _keys(("trade_id", 1)),
+        unique=True,
+        **_critical("Unique trade outcome per trade_id."),
+    ),
+    IndexSpec(
         "daily_trade_dataset",
         "daily_trade_dataset_identity_hash_version_unique",
         _keys(("identity.identity_hash", 1), ("identity.dataset_version", 1)),
@@ -543,7 +567,139 @@ _INDEX_SPECS: tuple[IndexSpec, ...] = (
         _keys(("schema_version", 1), ("build_type", 1), ("started_at", -1)),
         **_noncritical("Dataset build-run schema/build-type history lookup."),
     ),
+    IndexSpec(
+        "ml_candidates",
+        "candidate_id_unique",
+        _keys(("candidate_id", 1)),
+        unique=True,
+        **_critical("Unique identity for ML candidate."),
+    ),
+    IndexSpec(
+        "ml_candidates",
+        "symbol_candidate_type_setup_date_unique",
+        _keys(("symbol", 1), ("candidate_type", 1), ("setup_date", 1)),
+        unique=True,
+        **_critical("Compound unique identity to enforce 1 ML candidate per setup."),
+    ),
+    IndexSpec(
+        "ml_candidates",
+        "paper_trade_id_1",
+        _keys(("paper_trade_id", 1)),
+        **_noncritical("Lookup ML candidate by paper trade ID."),
+    ),
+    IndexSpec(
+        "ml_candidates",
+        "symbol_1",
+        _keys(("symbol", 1)),
+        **_noncritical("Lookup ML candidate by symbol."),
+    ),
+    IndexSpec(
+        "ml_candidate_daily_progress",
+        "paper_trade_id_1",
+        _keys(("paper_trade_id", 1)),
+        unique=True,
+        **_critical("Unique paper trade document identity for daily progress."),
+    ),
+    IndexSpec(
+        "ml_candidate_daily_progress",
+        "candidate_id_1",
+        _keys(("candidate_id", 1)),
+        **_noncritical("Lookup daily progress by candidate_id."),
+    ),
+    IndexSpec(
+        "ml_candidate_daily_progress",
+        "daily_progress_date_1",
+        _keys(("daily_progress.progress_date", 1)),
+        **_noncritical("Query progress documents by embedded daily progress date."),
+    ),
+    IndexSpec(
+        "ml_candidate_outcomes",
+        "candidate_id_1",
+        _keys(("candidate_id", 1)),
+        unique=True,
+        **_critical("Unique 1:1 relationship between ML candidate and outcome."),
+    ),
+    IndexSpec(
+        "ml_candidate_outcomes",
+        "outcome_id_1",
+        _keys(("outcome_id", 1)),
+        unique=True,
+        **_critical("Unique identity for ML outcome document."),
+    ),
+    IndexSpec(
+        "ml_candidate_outcomes",
+        "paper_trade_id_1",
+        _keys(("paper_trade_id", 1)),
+        **_noncritical("Lookup outcome by paper trade foreign key."),
+    ),
+    IndexSpec(
+        "ml_candidate_outcomes",
+        "result_1",
+        _keys(("result", 1)),
+        **_noncritical("Filter outcomes by categorical result."),
+    ),
+    IndexSpec(
+        "ml_candidate_outcomes",
+        "max_rr_1",
+        _keys(("max_rr", 1)),
+        **_noncritical("Query outcomes by max risk-to-reward."),
+    ),
+    IndexSpec(
+        "ml_candidate_outcomes",
+        "strategy_version_1",
+        _keys(("strategy_version", 1)),
+        **_noncritical("Query outcomes by strategy version."),
+    ),
+    IndexSpec(
+        "ml_candidate_outcomes",
+        "created_at_1",
+        _keys(("created_at", 1)),
+        **_noncritical("Query outcomes by creation timestamp."),
+    ),
+    IndexSpec(
+        "ml_candidate_decisions",
+        "candidate_id_1_decision_type_1",
+        _keys(("candidate_id", 1), ("decision_type", 1)),
+        unique=True,
+        **_critical("Compound unique identity for candidate decision."),
+    ),
+    IndexSpec(
+        "ml_candidate_decisions",
+        "paper_trade_id_1",
+        _keys(("paper_trade_id", 1)),
+        **_noncritical("Lookup decisions by paper trade foreign key."),
+    ),
+    IndexSpec(
+        "market_candles",
+        "market_candles_unique_identity",
+        _keys(("symbol", 1), ("timeframe", 1), ("timestamp", 1)),
+        unique=True,
+        **_critical("Ensure uniqueness for historical market candles."),
+    ),
+    IndexSpec("market_candles", "market_candles_symbol", _keys(("symbol", 1)), **_noncritical("Filter market candles by symbol.")),
+    IndexSpec("market_candles", "market_candles_timeframe", _keys(("timeframe", 1)), **_noncritical("Filter market candles by timeframe.")),
+    IndexSpec("market_candles", "market_candles_timestamp", _keys(("timestamp", 1)), **_noncritical("Filter and sort market candles by timestamp.")),
+    IndexSpec(
+        "historical_market_data",
+        "historical_market_data_unique_identity",
+        _keys(("symbol", 1), ("timeframe", 1)),
+        unique=True,
+        **_critical("Ensure unique bucket document per symbol and timeframe for historical market data."),
+    ),
+    IndexSpec(
+        "historical_market_data",
+        "historical_market_data_canonical",
+        _keys(("canonical_symbol", 1), ("timeframe", 1)),
+        **_noncritical("Lookup historical market data by canonical symbol and timeframe."),
+    ),
+    IndexSpec(
+        "historical_market_data",
+        "historical_market_data_last_updated",
+        _keys(("last_updated", 1)),
+        **_noncritical("Freshness audit and sorting by last_updated."),
+    ),
 )
+
 
 
 def get_index_specs(*, critical: bool | None = None) -> tuple[IndexSpec, ...]:
@@ -1286,13 +1442,15 @@ async def _ensure_spec(db: Any, spec: IndexSpec, summary: dict[str, Any]) -> Non
 
 
 def _base_identity(row: dict[str, Any]) -> tuple[Any, ...]:
-    return tuple(row.get(field) for field in TV_CONFIRMATION_BASE_IDENTITY_FIELDS)
+    return tuple((row.get(field) or "default" if field == "timeframes_hash" else row.get(field)) for field in TV_CONFIRMATION_BASE_IDENTITY_FIELDS)
 
 
 def _malformed_identity(row: dict[str, Any]) -> list[str]:
     missing = []
     for field in TV_CONFIRMATION_BASE_IDENTITY_FIELDS:
         value = row.get(field)
+        if field == "timeframes_hash":
+            value = value or "default"
         if value is None or value == "":
             missing.append(field)
     return missing
@@ -1509,6 +1667,11 @@ async def ensure_active_indexes(db: Any) -> dict[str, Any]:
                     "details": exc.details,
                 }
             )
+    try:
+        from services.ml_pipeline import ml_pipeline
+        await ml_pipeline.initialize_indexes()
+    except Exception as exc:
+        logger.error(f"Error initializing ML pipeline indexes: {exc}")
     return summary
 
 

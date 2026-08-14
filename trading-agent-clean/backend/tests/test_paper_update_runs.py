@@ -326,13 +326,13 @@ def test_missing_market_data_creates_completed_run_log_without_transition(monkey
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["errors_count"] == 0
+    assert payload["errors_count"] == 1
     assert payload["proposed_write_count"] == 0
     run = db.paper_update_runs.rows[0]
-    assert run["status"] == "COMPLETED"
-    assert run["errors_count"] == 0
-    assert run["per_trade_results"][0]["proposed_reason"] == "DATA_INSUFFICIENT"
-    assert run["approval_status"] == "AVAILABLE"
+    assert run["status"] == "FAILED"
+    assert run["errors_count"] == 1
+    assert run["per_trade_results"][0]["proposed_reason"] == "EVALUATION_ERROR"
+    assert run["approval_status"] == "INVALIDATED"
     assert db.paper_trades.update_calls == []
 
 

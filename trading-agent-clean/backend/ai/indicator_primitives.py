@@ -261,6 +261,7 @@ def resolve_scores(
         scored_candidate.get("trend_score"),
         tv_confirmation.get("trend_score"),
         paper_signal.get("trend_score"),
+        paper_trade.get("trend_score"),
         _breakdown_sum(sub_breakdown, TREND_BREAKDOWN_KEYS.get(strat, ())),
     )
 
@@ -268,6 +269,7 @@ def resolve_scores(
         scored_candidate.get("volume_score"),
         tv_confirmation.get("volume_score"),
         paper_signal.get("volume_score"),
+        paper_trade.get("volume_score"),
         _breakdown_sum(sub_breakdown, VOLUME_BREAKDOWN_KEYS.get(strat, ())),
     )
 
@@ -276,12 +278,15 @@ def resolve_scores(
         scored_candidate.get("score"),
         scored_candidate.get("nse_score"),
         paper_signal.get("score"),
+        paper_trade.get("rule_score"),
+        paper_trade.get("score"),
     )
 
     momentum_score = _first_number(
         scored_candidate.get("momentum_score"),
         paper_signal.get("momentum_score"),
         tv_confirmation.get("momentum_score"),
+        paper_trade.get("momentum_score"),
     )
 
     risk_score = _first_number(

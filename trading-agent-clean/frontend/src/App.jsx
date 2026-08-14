@@ -1,10 +1,10 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   API_BASE, attachTradingViewTab, detachTradingViewTab,
   getAiDataCollectionStatus, getAiFeatureDatasetSummary, getAiFeatureSnapshots, getAiOutcomePreview, getDashboardPaperEquity, getHealth, getMarketDataSymbol, getMarketLoadProgress, getMomentumCandidates, getMomentumPrecheck,
   getMomentumSummary, getMomentumTvConfirmed, getPaperHistory, getPaperOpenTrades, getPaperSummary, getPaperUpdateLock, getPaperUpdateProgress, getPaperUpdateRuns, getPaperUpdateSchedulerStatus, getScanRows, getScoreSummary, getSettings, getSwingCandidates, getSystemRuntimeInfo,
   getSwingPrecheck, getSwingSummary, getSwingTvConfirmed, getTradingViewAttachableTabs, getTradingViewRuntimeStatus, isRequestCancellation, momentumTvConfirm, loadAllMarketData, runPaperPipeline, runScoring,
-  swingTvConfirm, testTvSymbol, tradingViewBadge, deriveTradingViewBusy, isBatchReady, canStartTradingViewOperation,
+  swingTvConfirm, testTvSymbol, tradingViewBadge, deriveTradingViewBusy, isBatchReady, canStartTradingViewOperation, buildTradingViewUrl,
 } from "./api";
 import { aiDataCollectionChecklist, aiOutcomeEligibleRows, aiOutcomeSkippedRows, aiSnapshotDisplayRows } from "./aiDataset";
 import { confirmationTimestampLabel } from "./timestampUtils";
@@ -554,7 +554,7 @@ function DashboardPortfolio({ data }) {
       <StatCard label="Total Equity" value={money(numberField("total_equity"))} />
     </div>
     <div className="statsGrid">
-      <StatCard label="Open Trades" value={(() => {
+      <StatCard label="Active Trades (Full / Partial)" value={(() => {
         const raw = data?.active_partial_trade_count;
         if (typeof raw === "string" && raw.trim()) return raw.trim();
         if (typeof raw === "number" && Number.isFinite(raw)) return String(raw);
@@ -1852,6 +1852,8 @@ const PAPER_TABLE_COLUMNS = [
   { key: "shares", label: "Shares", type: "shares" },
   { key: "entry", label: "Entry" },
   { key: "current_price", label: "Price", type: "price" },
+  { key: "distance_to_entry", label: "Distance (₹)" },
+  { key: "distance_to_entry_percent", label: "Distance (%)" },
   { key: "stop_loss", label: "Stop Loss" },
   { key: "target_1", label: "T1" },
   { key: "target_2", label: "T2" },
@@ -1859,6 +1861,8 @@ const PAPER_TABLE_COLUMNS = [
   { key: "pnl", label: "P&L", type: "pnl" },
   { key: "reserved_margin", label: "Reserved Margin", type: "margin" },
   { key: "setup_time", label: "Setup Time" },
+  { key: "setup_valid_until", label: "Setup Valid Until" },
+  { key: "actions", label: "Actions", type: "actions" },
 ];
 const PAPER_SORT_LABELS = {
   "setup_time|desc": "Newest setup first",
@@ -1883,10 +1887,10 @@ const PAPER_ACTIVE_STATUSES = new Set(["ACTIVE"]);
 const PAPER_COMPLETED_STATUSES = new Set(["T3_HIT", "TARGET_3_HIT", "COMPLETED", "TARGET_HIT", "TARGET_1_HIT", "TARGET_1_HIT_FINAL", "TARGET_2_HIT", "T1_HIT", "T2_HIT", "WON_T1", "WON_T2", "WON_T3"]);
 const PAPER_STOPPED_STATUSES = new Set(["SL_HIT", "STOPPED", "STOP_HIT", "STOPPED_AFTER_T1", "LOST_SL"]);
 const PAPER_AMBIGUOUS_STATUSES = new Set(["AMBIGUOUS"]);
-const PAPER_EXPIRED_STATUSES = new Set(["EXPIRED", "NOT_TRIGGERED"]);
+const PAPER_EXPIRED_STATUSES = new Set(["EXPIRED", "NOT_TRIGGERED", "ENTRY_MISSED_GAP_UP"]);
 
 function paperTradeIdentity(trade, fallback = 0) {
-  return trade?.paper_trade_id || trade?.trade_id || trade?.setup_id || trade?._id || `${trade?.symbol || "trade"}-${fallback}`;
+  return trade?.paper_trade_id || trade?.trade_id || trade?.setup_id || trade?._id || trade?.id || `${trade?.symbol || "trade"}-${fallback}`;
 }
 function dedupePaperTrades(rows) {
   const seen = new Set();
@@ -1923,13 +1927,18 @@ function hasAnyPaperStatus(statuses, candidates) {
   return false;
 }
 function paperDisplayStatus(trade) {
+  if (trade?.outcome_label) return trade.outcome_label;
   if (trade?.status === "INVALIDATED_STALE" || trade?.invalidated_reason) return "Invalidated";
   const statuses = paperStatusSet(trade);
   if (hasAnyPaperStatus(statuses, PAPER_EXPIRED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_ACTIVE_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_PARTIAL_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_COMPLETED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_STOPPED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_AMBIGUOUS_STATUSES)) return "Expired / Not Triggered";
   if (hasAnyPaperStatus(statuses, PAPER_WAITING_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_ACTIVE_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_PARTIAL_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_COMPLETED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_STOPPED_STATUSES) && !hasAnyPaperStatus(statuses, PAPER_AMBIGUOUS_STATUSES)) return "Waiting for Entry";
   if (hasAnyPaperStatus(statuses, PAPER_PARTIAL_STATUSES)) return "Partial";
   if (hasAnyPaperStatus(statuses, PAPER_COMPLETED_STATUSES)) return "Completed";
-  if (hasAnyPaperStatus(statuses, PAPER_STOPPED_STATUSES)) return "Stopped";
+  if (hasAnyPaperStatus(statuses, PAPER_STOPPED_STATUSES)) {
+    if (trade?.partial_exit_1 || trade?.t1_hit) return "T1 Hit → Stop Loss";
+    if (trade?.exit_reason === "STOP_LOSS_HIT_BEFORE_ENTRY") return "Stopped Before Entry";
+    return "Stopped";
+  }
   if (hasAnyPaperStatus(statuses, PAPER_AMBIGUOUS_STATUSES)) return "Ambiguous";
   if (hasAnyPaperStatus(statuses, PAPER_ACTIVE_STATUSES)) return "Active";
   return trade?.ui_status || trade?.status || trade?.outcome_status || "-";
@@ -1977,6 +1986,23 @@ function paperCellValue(row, column) {
     return row?.pnl_display ?? row?.paper_pnl ?? row?.pnl;
   }
   if (column.key === "setup_time") return row?.setup_time ?? row?.created_at ?? row?.source_confirmation_created_at;
+  if (column.key === "setup_valid_until") return row?.setup_valid_until ?? row?.valid_until ?? row?.expires_at ?? row?.expiry_timestamp ?? "End of Day";
+  if (column.key === "distance_to_entry") {
+    const info = getActiveTradeDistanceInfo(row);
+    if (info.distanceRupees !== null && info.distanceRupees !== undefined) {
+      return Number(info.distanceRupees).toFixed(2);
+    }
+    const val = row?.distance_to_entry ?? (row?.entry_price && row?.current_price ? Math.abs((row?.entry_price ?? row?.entry) - (row?.current_price ?? row?.latest_close)) : null);
+    return val !== null && val !== undefined ? Number(val).toFixed(2) : "—";
+  }
+  if (column.key === "distance_to_entry_percent") {
+    const info = getActiveTradeDistanceInfo(row);
+    if (info.distancePercent !== null && info.distancePercent !== undefined) {
+      return `${Number(info.distancePercent).toFixed(2)}%`;
+    }
+    const val = row?.distance_to_entry_percent ?? (row?.entry_price && row?.current_price && row.entry_price > 0 ? (((row.entry_price - row.current_price) / row.entry_price) * 100) : null);
+    return val !== null && val !== undefined ? `${Number(val).toFixed(2)}%` : "—";
+  }
   if (column.key === "shares") return row;
   if (column.key === "reserved_margin") return row?.reserved_margin;
   return row?.[column.key];
@@ -1984,6 +2010,112 @@ function paperCellValue(row, column) {
 function numericSortValue(value) {
   const parsed = Number(String(value ?? "").replace(/,/g, ""));
   return Number.isFinite(parsed) ? parsed : null;
+}
+function getActiveTradeDistanceInfo(row) {
+  const normStatus = normalizePaperStatus(row?.status);
+  const isWaiting = PAPER_WAITING_STATUSES.has(normStatus) || row?.group === "waiting";
+
+  const entryPrice = Number(row?.entry_price ?? row?.entry);
+  const currentPrice = Number(row?.current_price ?? row?.latest_close);
+  const t1 = Number(row?.target_1 ?? row?.t1);
+  const t2 = Number(row?.target_2 ?? row?.t2);
+  const t3 = Number(row?.target_3 ?? row?.t3);
+
+  if (!currentPrice || isNaN(currentPrice) || !entryPrice || isNaN(entryPrice)) {
+    return {
+      distanceRupees: null,
+      distancePercent: null,
+      targetName: null,
+      targetPrice: null,
+      className: "",
+      style: {}
+    };
+  }
+
+  if (isWaiting && currentPrice < entryPrice) {
+    const distRs = Math.abs(entryPrice - currentPrice);
+    const distPct = ((entryPrice - currentPrice) / entryPrice) * 100;
+    const intensity = Math.min(Math.abs(distPct) / 10.0, 1.0);
+    return {
+      distanceRupees: distRs,
+      distancePercent: distPct,
+      targetName: "Entry",
+      targetPrice: entryPrice,
+      className: "paperDistanceRed",
+      style: { "--distance-intensity": intensity.toFixed(3) }
+    };
+  }
+
+  let nextTarget = null;
+  let targetName = "Entry";
+
+  if (currentPrice < entryPrice) {
+    nextTarget = entryPrice;
+    targetName = "Entry";
+  } else if (t1 && !isNaN(t1) && currentPrice < t1) {
+    nextTarget = t1;
+    targetName = "T1";
+  } else if (t2 && !isNaN(t2) && currentPrice < t2) {
+    nextTarget = t2;
+    targetName = "T2";
+  } else if (t3 && !isNaN(t3) && currentPrice < t3) {
+    nextTarget = t3;
+    targetName = "T3";
+  } else if (t3 && !isNaN(t3) && currentPrice >= t3) {
+    nextTarget = t3;
+    targetName = "T3";
+  } else if (t2 && !isNaN(t2)) {
+    nextTarget = t2;
+    targetName = "T2";
+  } else if (t1 && !isNaN(t1)) {
+    nextTarget = t1;
+    targetName = "T1";
+  } else {
+    nextTarget = entryPrice;
+    targetName = "Entry";
+  }
+
+  if (currentPrice < entryPrice) {
+    const distRs = entryPrice - currentPrice;
+    const distPct = ((entryPrice - currentPrice) / entryPrice) * 100;
+    const intensity = Math.min(Math.abs(distPct) / 10.0, 1.0);
+    return {
+      distanceRupees: distRs,
+      distancePercent: distPct,
+      targetName: "Entry",
+      targetPrice: entryPrice,
+      className: "paperDistanceRed",
+      style: { "--distance-intensity": intensity.toFixed(3) }
+    };
+  }
+
+  if (t3 && !isNaN(t3) && currentPrice >= t3 && nextTarget === t3) {
+    return {
+      distanceRupees: 0,
+      distancePercent: 0,
+      targetName: "T3",
+      targetPrice: t3,
+      className: "paperDistanceGreen",
+      style: { "--distance-intensity": "0.000" }
+    };
+  }
+
+  const distRs = Math.max(nextTarget - currentPrice, 0);
+  const distPct = Math.max(((nextTarget - currentPrice) / nextTarget) * 100, 0);
+  const intensity = Math.min(distPct / 10.0, 1.0);
+
+  return {
+    distanceRupees: distRs,
+    distancePercent: distPct,
+    targetName: targetName,
+    targetPrice: nextTarget,
+    className: "paperDistanceGreen",
+    style: { "--distance-intensity": intensity.toFixed(3) }
+  };
+}
+
+function getPaperDistanceStyle(row) {
+  return getActiveTradeDistanceInfo(row);
 }
 function paperSortValue(row, field) {
   if (field === "strategy") return paperStrategyText(row);
@@ -2149,6 +2281,68 @@ function buildDailyPnlMap(trades, year, strategyFilter = "ALL") {
   }
   return dailyMap;
 }
+
+function buildDailyTargetExitMap(trades, year, strategyFilter = "ALL") {
+  const dailyMap = new Map();
+  const cleanFilter = String(strategyFilter || "ALL").toUpperCase();
+  for (const trade of Array.isArray(trades) ? trades : []) {
+    const status = trade?.status;
+    const exReason = trade?.exit_reason;
+    const rejReason = trade?.rejection_reason;
+    if (status === "INVALIDATED_STALE" || exReason === "INVALIDATED_STALE" || rejReason === "INVALIDATED_STALE") {
+      continue;
+    }
+    const strategy = paperStrategyText(trade);
+    if (cleanFilter !== "ALL" && !strategy.toUpperCase().includes(cleanFilter)) continue;
+
+    for (const key of ["partial_exit_1", "partial_exit_2", "partial_exit_3"]) {
+      const pe = trade?.[key];
+      if (pe && typeof pe === "object") {
+        const date = parseTradeDate(pe.exited_at || pe.timestamp);
+        if (!date || date.getFullYear() !== Number(year)) continue;
+        const pnl = parsePaperNumber(pe.paper_pnl ?? pe.realized_pnl ?? pe.pnl);
+        const qty = parsePaperNumber(pe.quantity ?? pe.qty);
+        if (qty <= 0 && (pnl === null || pnl <= 0)) continue;
+
+        const dateKey = formatDateKey(date);
+        const day = dailyMap.get(dateKey) || {
+          date,
+          dateKey,
+          totalPnl: 0,
+          trades: 0,
+          wins: 0,
+          losses: 0,
+          ambiguous: 0,
+          bestTrade: null,
+          worstTrade: null,
+          strategyBreakdown: {},
+        };
+        const pnlVal = pnl ?? 0;
+        day.totalPnl += pnlVal;
+        day.trades += 1;
+        if (pnlVal > 0) day.wins += 1;
+        if (pnlVal < 0) day.losses += 1;
+
+        const stage = pe.exit_stage || key.replace("partial_exit_", "T").toUpperCase();
+        const tradeSummary = {
+          symbol: `${trade?.symbol || trade?.tradingview_symbol || "-"} (${stage})`,
+          pnl: pnlVal,
+        };
+        if (!day.bestTrade || pnlVal > day.bestTrade.pnl) day.bestTrade = tradeSummary;
+        if (!day.worstTrade || pnlVal < day.worstTrade.pnl) day.worstTrade = tradeSummary;
+
+        const strategyEntry = day.strategyBreakdown[strategy] || { count: 0, pnl: 0 };
+        strategyEntry.count += 1;
+        strategyEntry.pnl += pnlVal;
+        day.strategyBreakdown[strategy] = strategyEntry;
+
+        dailyMap.set(dateKey, day);
+      }
+    }
+  }
+  return dailyMap;
+}
+
 function buildMonthlyPnlSummary(dailyMap, year) {
   const months = PNL_CALENDAR_MONTHS.map((monthName, month) => ({
     month,
@@ -2232,7 +2426,7 @@ function PnlCalendarCell({ cell, day, metric, maxAbsPnl, maxTradeCount }) {
     ? [
       displayDate(day.date),
       `P&L: ${money(day.totalPnl)}`,
-      `Trades: ${day.trades}`,
+      `Events / Trades: ${day.trades}`,
       `Wins: ${day.wins}`,
       `Losses: ${day.losses}`,
       `Ambiguous: ${day.ambiguous}`,
@@ -2240,7 +2434,7 @@ function PnlCalendarCell({ cell, day, metric, maxAbsPnl, maxTradeCount }) {
       `Best: ${day.bestTrade?.symbol || "-"} ${money(day.bestTrade?.pnl ?? 0)}`,
       `Worst: ${day.worstTrade?.symbol || "-"} ${money(day.worstTrade?.pnl ?? 0)}`,
     ].join("\n")
-    : `${displayDate(cell.date)}\nNo closed paper trades`;
+    : `${displayDate(cell.date)}\nNo realized P&L events`;
   return (
     <div
       aria-label={title.replace(/\n/g, ". ")}
@@ -2260,7 +2454,7 @@ function MonthlyPnlSummary({ months }) {
       const title = [
         month.monthName,
         `P&L: ${money(month.totalPnl)}`,
-        `Trades: ${month.totalTrades}`,
+        `Events / Trades: ${month.totalTrades}`,
         `Winning days: ${month.winningDays}`,
         `Losing days: ${month.losingDays}`,
         `Best day: ${month.bestDay ? `${displayDate(month.bestDay.date)} ${money(month.bestDay.totalPnl)}` : "-"}`,
@@ -2269,7 +2463,7 @@ function MonthlyPnlSummary({ months }) {
       return <div className={`monthlyPnlCard monthlyPnl-${tone}`} key={month.monthName} title={title}>
         <span>{month.monthName}</span>
         <strong>{money(month.totalPnl)}</strong>
-        <p>{month.totalTrades} trades</p>
+        <p>{month.totalTrades} events / trades</p>
         <small>{month.winningDays} win days / {month.losingDays} loss days</small>
         <div className="monthlyPnlBar"><i style={{ width }} /></div>
       </div>;
@@ -2280,33 +2474,50 @@ function PnlCalendarHeatmap({ trades = [] }) {
   const availableYears = useMemo(() => {
     const years = new Set();
     for (const trade of Array.isArray(trades) ? trades : []) {
-      if (!isRealizedPnlTrade(trade) || getTradeRealizedPnl(trade) === null) continue;
-      const date = getTradeExitDate(trade);
-      if (date) years.add(date.getFullYear());
+      if (isRealizedPnlTrade(trade) && getTradeRealizedPnl(trade) !== null) {
+        const date = getTradeExitDate(trade);
+        if (date) years.add(date.getFullYear());
+      }
+      for (const key of ["partial_exit_1", "partial_exit_2", "partial_exit_3"]) {
+        const pe = trade?.[key];
+        if (pe && typeof pe === "object") {
+          const d = parseTradeDate(pe.exited_at || pe.timestamp);
+          if (d) years.add(d.getFullYear());
+        }
+      }
     }
     return [...years].sort((a, b) => b - a);
   }, [trades]);
   const [manualYear, setManualYear] = useState("");
   const [strategyFilter, setStrategyFilter] = useState("ALL");
-  const [metric, setMetric] = useState("pnl");
+  const [metric, setMetric] = useState("targets");
   const selectedYear = Number(manualYear || availableYears[0] || new Date().getFullYear());
   const yearOptions = availableYears.includes(selectedYear) ? availableYears : [selectedYear, ...availableYears];
-  const dailyMap = useMemo(() => buildDailyPnlMap(trades, selectedYear, strategyFilter), [trades, selectedYear, strategyFilter]);
-  const months = useMemo(() => buildMonthlyPnlSummary(dailyMap, selectedYear), [dailyMap, selectedYear]);
+
+  const closedDailyMap = useMemo(() => buildDailyPnlMap(trades, selectedYear, strategyFilter), [trades, selectedYear, strategyFilter]);
+  const targetExitDailyMap = useMemo(() => buildDailyTargetExitMap(trades, selectedYear, strategyFilter), [trades, selectedYear, strategyFilter]);
+
+  const activeDailyMap = metric === "closed" ? closedDailyMap : metric === "targets" ? targetExitDailyMap : targetExitDailyMap;
+
+  const months = useMemo(() => buildMonthlyPnlSummary(activeDailyMap, selectedYear), [activeDailyMap, selectedYear]);
   const cells = useMemo(() => buildCalendarCells(selectedYear), [selectedYear]);
   const monthLabels = useMemo(() => buildMonthLabels(selectedYear, cells), [selectedYear, cells]);
-  const maxAbsPnl = Math.max(...[...dailyMap.values()].map((day) => Math.abs(day.totalPnl)), 1);
-  const maxTradeCount = Math.max(...[...dailyMap.values()].map((day) => day.trades), 1);
+  const maxAbsPnl = Math.max(...[...activeDailyMap.values()].map((day) => Math.abs(day.totalPnl)), 1);
+  const maxTradeCount = Math.max(...[...activeDailyMap.values()].map((day) => day.trades), 1);
   const gridStyle = { gridTemplateColumns: `repeat(${Math.max(...cells.map((cell) => cell.week), 0) + 1}, 12px)` };
-  const totalTrades = [...dailyMap.values()].reduce((sum, day) => sum + day.trades, 0);
-  const totalPnl = [...dailyMap.values()].reduce((sum, day) => sum + day.totalPnl, 0);
+
+  const totalClosedTrades = [...closedDailyMap.values()].reduce((sum, day) => sum + day.trades, 0);
+  const totalClosedPnl = [...closedDailyMap.values()].reduce((sum, day) => sum + day.totalPnl, 0);
+
+  const totalTargetEvents = [...targetExitDailyMap.values()].reduce((sum, day) => sum + day.trades, 0);
+  const totalTargetPnl = [...targetExitDailyMap.values()].reduce((sum, day) => sum + day.totalPnl, 0);
 
   return <section className="card pnlCalendarPanel">
     <div className="pnlCalendarHeader">
       <div>
         <span>analytics</span>
         <h2>P&L Calendar</h2>
-        <p>Day-wise realized paper P&L</p>
+        <p>Day-wise realized paper P&L &amp; target exit events</p>
       </div>
       <div className="pnlCalendarControls">
         <label>Year<select value={selectedYear} onChange={(event) => setManualYear(event.target.value)}>
@@ -2318,14 +2529,22 @@ function PnlCalendarHeatmap({ trades = [] }) {
           <option value="MOMENTUM">Momentum</option>
         </select></label>
         <div className="pnlMetricToggle" role="group" aria-label="P&L calendar metric">
-          <button className={metric === "pnl" ? "active" : ""} type="button" onClick={() => setMetric("pnl")}>P&L</button>
+          <button className={metric === "targets" ? "active" : ""} type="button" onClick={() => setMetric("targets")}>Target Exits P&amp;L</button>
+          <button className={metric === "closed" ? "active" : ""} type="button" onClick={() => setMetric("closed")}>Closed Trades P&amp;L</button>
           <button className={metric === "count" ? "active" : ""} type="button" onClick={() => setMetric("count")}>Trade Count</button>
         </div>
       </div>
     </div>
-    <div className="pnlCalendarTotals">
-      <span>{totalTrades} closed trades</span>
-      <strong className={paperPnlClass(totalPnl)}>{money(totalPnl)}</strong>
+    <div className="pnlCalendarTotals" style={{ display: "flex", gap: "24px", alignItems: "center" }}>
+      <div>
+        <span style={{ fontSize: "11px", textTransform: "uppercase", letterSpacing: "0.5px", opacity: 0.7, display: "block" }}>Closed Parent Trades</span>
+        <span>{totalClosedTrades} closed trades</span> &bull; <strong className={paperPnlClass(totalClosedPnl)}>{money(totalClosedPnl)}</strong>
+      </div>
+      <div style={{ width: "1px", height: "30px", background: "rgba(255,255,255,0.15)" }} />
+      <div>
+        <span style={{ fontSize: "11px", textTransform: "uppercase", letterSpacing: "0.5px", color: "var(--accent-color, #38bdf8)", fontWeight: 600, display: "block" }}>Realized Target Exit Events</span>
+        <span>{totalTargetEvents} target exits</span> &bull; <strong className={paperPnlClass(totalTargetPnl)}>{money(totalTargetPnl)}</strong>
+      </div>
     </div>
     <div className="pnlHeatmap" aria-label={`Daily realized paper P&L for ${selectedYear}`}>
       <div className="pnlHeatmapScroll">
@@ -2335,7 +2554,7 @@ function PnlCalendarHeatmap({ trades = [] }) {
         <div className="pnlHeatmapBody">
           <div className="pnlWeekdayLabels">{PNL_CALENDAR_WEEKDAYS.map((day) => <span key={day}>{day}</span>)}</div>
           <div className="pnlHeatmapGrid" role="grid" style={gridStyle}>
-            {cells.map((cell) => <PnlCalendarCell key={cell.dateKey} cell={cell} day={dailyMap.get(cell.dateKey)} metric={metric} maxAbsPnl={maxAbsPnl} maxTradeCount={maxTradeCount} />)}
+            {cells.map((cell) => <PnlCalendarCell key={cell.dateKey} cell={cell} day={activeDailyMap.get(cell.dateKey)} metric={metric} maxAbsPnl={maxAbsPnl} maxTradeCount={maxTradeCount} />)}
           </div>
         </div>
       </div>
@@ -2343,55 +2562,131 @@ function PnlCalendarHeatmap({ trades = [] }) {
     <MonthlyPnlSummary months={months} />
   </section>;
 }
-function PaperTradeTable({ rows, loading, emptyMessage }) {
-  const safeRows = Array.isArray(rows) ? rows : [];
-  return <div className="tableShell results-table-wrap paperTableShell"><table className="paperCompactTable"><thead><tr>{PAPER_TABLE_COLUMNS.map((column) => <th key={column.key}>{column.label}</th>)}</tr></thead><tbody>
-    {loading ? <tr><td colSpan={PAPER_TABLE_COLUMNS.length}>Loading paper trades...</td></tr> : safeRows.length ? safeRows.map((row, index) => <tr key={paperTradeIdentity(row, index)}>{PAPER_TABLE_COLUMNS.map((column) => {
-      const value = paperCellValue(row, column);
-      if (column.type === "strategy") return <td key={column.key}><Badge tone={paperStrategyTone(row)}>{paperStrategyText(row)}</Badge></td>;
-      if (column.type === "status") return <td key={column.key}><Badge tone={paperStatusToneFromLabel(value)}>{val(value)}</Badge></td>;
-      if (column.type === "pnl") return <td key={column.key}><span className={`paperPnl ${paperPnlClass(value)}`}>{fmt(value)}</span></td>;
-      if (column.type === "shares") {
-        const normStatus = normalizePaperStatus(row?.status);
-        const warning = row?.quantity_integrity_warning;
-        let text = "Unavailable";
-        if (!warning && row?.bought_quantity !== null && row?.bought_quantity !== undefined) {
-          if (PAPER_EXPIRED_STATUSES.has(normStatus)) {
-            text = "0 bought / 0 open";
-          } else if (PAPER_WAITING_STATUSES.has(normStatus)) {
-            text = `0 bought / ${row.planned_quantity} planned`;
-          } else if (PAPER_ACTIVE_STATUSES.has(normStatus) || PAPER_PARTIAL_STATUSES.has(normStatus)) {
-            text = `${row.bought_quantity} bought / ${row.open_quantity} open`;
-          } else if (PAPER_COMPLETED_STATUSES.has(normStatus) || PAPER_STOPPED_STATUSES.has(normStatus)) {
-            text = `${row.bought_quantity} bought / 0 open`;
-          }
-        }
-        return <td key={column.key} className="sharesCell">{text}</td>;
-      }
-      if (column.type === "margin") {
-        return <td key={column.key} className="marginCell">{money(value)}</td>;
-      }
-      if (column.type === "price") {
-        const normStatus = normalizePaperStatus(row?.status);
-        if (PAPER_COMPLETED_STATUSES.has(normStatus) || PAPER_STOPPED_STATUSES.has(normStatus)) {
-          return (
-            <td key={column.key} className="priceCell priceExit">
-              <span className="priceLabel textMuted" style={{ fontSize: "10px", opacity: 0.7, marginRight: "4px" }}>Exit:</span>
-              <strong>{value !== null && value !== undefined ? fmt(value) : "—"}</strong>
-            </td>
-          );
-        } else {
-          return (
-            <td key={column.key} className="priceCell priceCurrent">
-              <span className="priceLabel textMuted" style={{ fontSize: "10px", opacity: 0.7, marginRight: "4px" }}>Current:</span>
-              <strong>{value !== null && value !== undefined ? fmt(value) : "—"}</strong>
-            </td>
-          );
-        }
-      }
-      return <td key={column.key}>{fmt(value)}</td>;
-    })}</tr>) : <tr><td colSpan={PAPER_TABLE_COLUMNS.length}>{emptyMessage}</td></tr>}
-  </tbody></table></div>;
+
+function PaperTradeTable({ activeTab = "waiting", rows = [], loading = false, emptyMessage = "No trades match filters.", onShowProgress, onVerifyTrade }) {
+  const columns = PAPER_TABLE_COLUMNS.filter((col) => {
+    if (activeTab === "waiting") {
+      return !["pnl", "reserved_margin"].includes(col.key);
+    }
+    if (activeTab === "completed") {
+      return !["distance_to_entry", "distance_to_entry_percent"].includes(col.key);
+    }
+    return true;
+  });
+
+  if (loading) {
+    return <div className="paperTableLoading"><span className="spinner" /> Loading paper trades...</div>;
+  }
+  return (
+    <div className="tableShell">
+      <table className="paperCompactTable">
+        <thead>
+          <tr>{columns.map((column) => <th key={column.key} className={column.key === "actions" ? "verifyTableCell" : ""}>{column.label}</th>)}</tr>
+        </thead>
+        <tbody>
+            {rows.length ? rows.map((row, index) => <tr key={paperTradeIdentity(row, index)}>{columns.map((column) => {
+              const value = paperCellValue(row, column);
+              if (column.type === "strategy") return <td key={column.key}><Badge tone={paperStrategyTone(row)}>{paperStrategyText(row)}</Badge></td>;
+              if (column.type === "status") {
+                const isHistorical = Boolean(row?.historical_dataset_mode);
+                return (
+                  <td key={column.key}>
+                    <div style={{ display: "inline-flex", alignItems: "center", gap: "4px", flexWrap: "wrap" }}>
+                      <Badge tone={paperStatusToneFromLabel(value)}>{val(value)}</Badge>
+                      {isHistorical && <Badge tone="gray">HISTORICAL REPLAY</Badge>}
+                    </div>
+                  </td>
+                );
+              }
+              if (column.type === "pnl") return <td key={column.key}><span className={`paperPnl ${paperPnlClass(value)}`}>{fmt(value)}</span></td>;
+              if (column.key === "distance_to_entry" || column.key === "distance_to_entry_percent") {
+                const distInfo = getPaperDistanceStyle(row);
+                return (
+                  <td key={column.key}>
+                    {value !== null && value !== undefined && value !== "—" ? (
+                      <span className={distInfo.className} style={distInfo.style}>
+                        {fmt(value)}
+                      </span>
+                    ) : (
+                      fmt(value)
+                    )}
+                  </td>
+                );
+              }
+              if (column.type === "shares") {
+                const normStatus = normalizePaperStatus(row?.status);
+                const warning = row?.quantity_integrity_warning;
+                let text = "Unavailable";
+                if (!warning && row?.bought_quantity !== null && row?.bought_quantity !== undefined) {
+                  if (PAPER_EXPIRED_STATUSES.has(normStatus)) {
+                    text = "0 bought / 0 open";
+                  } else if (PAPER_WAITING_STATUSES.has(normStatus)) {
+                    text = `0 bought / ${row.planned_quantity} planned`;
+                  } else if (PAPER_ACTIVE_STATUSES.has(normStatus) || PAPER_PARTIAL_STATUSES.has(normStatus)) {
+                    text = `${row.bought_quantity} bought / ${row.open_quantity} open`;
+                  } else if (PAPER_COMPLETED_STATUSES.has(normStatus) || PAPER_STOPPED_STATUSES.has(normStatus)) {
+                    text = `${row.bought_quantity} bought / 0 open`;
+                  }
+                }
+                return <td key={column.key} className="sharesCell">{text}</td>;
+              }
+              if (column.type === "margin") {
+                const isHistorical = Boolean(row?.historical_dataset_mode);
+                return (
+                  <td key={column.key} className="marginCell">
+                    {money(value)}
+                    {isHistorical && <span style={{ fontSize: "10px", opacity: 0.7, display: "block" }}>[Dataset Isolation]</span>}
+                  </td>
+                );
+              }
+              if (column.type === "price") {
+                const normStatus = normalizePaperStatus(row?.status);
+                if (PAPER_COMPLETED_STATUSES.has(normStatus) || PAPER_STOPPED_STATUSES.has(normStatus)) {
+                  return (
+                    <td key={column.key} className="priceCell priceExit">
+                      <span className="priceLabel textMuted" style={{ fontSize: "10px", opacity: 0.7, marginRight: "4px" }}>Exit:</span>
+                      <strong>{value !== null && value !== undefined ? fmt(value) : "—"}</strong>
+                    </td>
+                  );
+                } else {
+                  return (
+                    <td key={column.key} className="priceCell priceCurrent">
+                      <span className="priceLabel textMuted" style={{ fontSize: "10px", opacity: 0.7, marginRight: "4px" }}>Current:</span>
+                      <strong>{value !== null && value !== undefined ? fmt(value) : "—"}</strong>
+                    </td>
+                  );
+                }
+              }
+              if (column.type === "actions") {
+                return (
+                  <td key={column.key} className="actionsCell verifyTableCell">
+                    <div style={{ display: "flex", gap: "6px" }}>
+                      <button
+                        type="button"
+                        className="paperStateButton"
+                        style={{ padding: "3px 8px", fontSize: "11px", height: "auto", minWidth: "60px" }}
+                        onClick={() => onShowProgress && onShowProgress(row)}
+                      >
+                        Progress
+                      </button>
+                      <button
+                        type="button"
+                        className="paperStateButton"
+                        style={{ padding: "3px 8px", fontSize: "11px", height: "auto", minWidth: "55px" }}
+                        onClick={() => onVerifyTrade && onVerifyTrade(row)}
+                      >
+                        Verify
+                      </button>
+                    </div>
+                  </td>
+                );
+              }
+              return <td key={column.key}>{fmt(value)}</td>;
+            })}</tr>) : <tr><td colSpan={columns.length}>{emptyMessage}</td></tr>}
+          </tbody>
+        </table>
+      </div>
+  );
 }
 
 function PaperTrades({ openTrades, history, summary, liveStatus }) {
@@ -2400,13 +2695,29 @@ function PaperTrades({ openTrades, history, summary, liveStatus }) {
   const [activeTradeFilter, setActiveTradeFilter] = useState("waiting");
   const [sortField, setSortField] = useState("setup_time");
   const [sortDirection, setSortDirection] = useState("desc");
-  const waitingTrades = withPaperGroup(arr(openTrades, ["waiting_for_entry"]), "waiting");
-  const activeTrades = withPaperGroup(arr(openTrades, ["active_partial"]), "active");
+  const [selectedProgressTrade, setSelectedProgressTrade] = useState(null);
+
+  const handleVerifyTrade = (trade) => {
+    const url = buildTradingViewUrl(trade);
+    if (url) {
+      window.open(url, "_blank", "noopener,noreferrer");
+    }
+  };
+
+  const openTradeRows = Array.isArray(openTrades)
+    ? openTrades
+    : Array.isArray(openTrades?.trades)
+      ? openTrades.trades
+      : Array.isArray(openTrades?.results)
+        ? openTrades.results
+        : [...(Array.isArray(openTrades?.waiting_for_entry) ? openTrades.waiting_for_entry : []), ...(Array.isArray(openTrades?.active_partial) ? openTrades.active_partial : [])];
+  const waitingTrades = withPaperGroup(openTradeRows.filter((t) => hasAnyPaperStatus(paperStatusSet(t), PAPER_WAITING_STATUSES)), "waiting");
+  const activeTrades = withPaperGroup(openTradeRows.filter((t) => hasAnyPaperStatus(paperStatusSet(t), PAPER_ACTIVE_STATUSES) || hasAnyPaperStatus(paperStatusSet(t), PAPER_PARTIAL_STATUSES)), "active");
   const completedTrades = withPaperGroup(arr(history, ["completed"]), "completed");
   const stoppedTrades = withPaperGroup(arr(history, ["sl_hit"]), "stopped");
   const ambiguousTrades = withPaperGroup(arr(history, ["ambiguous"]), "ambiguous");
   const expiredTrades = withPaperGroup(arr(history, ["expired_not_triggered"]), "expired");
-  const calendarTrades = dedupePaperTrades([...completedTrades, ...stoppedTrades, ...ambiguousTrades]);
+  const calendarTrades = dedupePaperTrades([...activeTrades, ...completedTrades, ...stoppedTrades, ...ambiguousTrades]);
   const allRows = dedupePaperTrades([...waitingTrades, ...activeTrades, ...completedTrades, ...stoppedTrades, ...ambiguousTrades, ...expiredTrades]);
   const selectedFilter = PAPER_TRADE_FILTERS.find((filter) => filter.key === activeTradeFilter) || PAPER_TRADE_FILTERS[0];
   const tabRows = selectedFilter.groups ? allRows.filter((trade) => selectedFilter.groups.has(trade.paper_group)) : allRows;
@@ -2416,8 +2727,10 @@ function PaperTrades({ openTrades, history, summary, liveStatus }) {
   const emptyMessage = liveStatus?.hasLoaded ? "No paper trades match the current filters." : "No paper trades loaded yet.";
   const waitingCount = summary?.waiting_for_entry ?? summary?.waiting_trades ?? openTrades?.waiting_count ?? waitingTrades.length;
   const activeCount = summary?.open_trades ?? openTrades?.active_partial_count ?? activeTrades.length;
-  const targetHitCount = summary?.target_hit_count ?? completedTrades.length;
-  const slHitCount = summary?.sl_hit_count ?? history?.sl_hit_count ?? stoppedTrades.length;
+  const targetCompletedCount = summary?.target_completed_count ?? summary?.target_hit_count ?? completedTrades.length;
+  const targetPartialThenSlCount = summary?.target_partial_then_sl_count ?? stoppedTrades.filter((t) => t.partial_exit_1 || t.t1_hit).length;
+  const pureSlCount = summary?.pure_sl_hit_count ?? summary?.sl_hit_count ?? stoppedTrades.filter((t) => !t.partial_exit_1 && !t.t1_hit && t.exit_reason !== "STOP_LOSS_HIT_BEFORE_ENTRY").length;
+
   return <div className="pageStack">
     <div className="topHeader">
       <div><h2>Paper Trades</h2><p>Live tracking and history of automated paper executions.</p></div>
@@ -2427,8 +2740,9 @@ function PaperTrades({ openTrades, history, summary, liveStatus }) {
       <div className="heroGrid">
         <StatCard label="Waiting for Entry" value={waitingCount} tone="yellow" />
         <StatCard label="Active" value={activeCount} />
-        <StatCard label="Target Hit" value={targetHitCount} />
-        <StatCard label="SL Hit" value={slHitCount} tone="red" />
+        <StatCard label="Target Completed" value={targetCompletedCount} tone="green" />
+        <StatCard label="Target → SL" value={targetPartialThenSlCount} tone="yellow" />
+        <StatCard label="Pure SL Hit" value={pureSlCount} tone="red" />
       </div>
       <PnlCalendarHeatmap trades={calendarTrades} />
       <div className="card paperTableCard">
@@ -2469,9 +2783,292 @@ function PaperTrades({ openTrades, history, summary, liveStatus }) {
           <Badge tone={selectedFilter.key === "completed" ? "yellow" : selectedFilter.key === "active" ? "green" : "gray"}>{selectedFilter.label}</Badge>
         </div>
         <div className="paperTableShell">
-          <PaperTradeTable rows={filteredRows} loading={initialLoading} emptyMessage={emptyMessage} />
+          <PaperTradeTable rows={filteredRows} activeTab={activeTradeFilter} loading={initialLoading} emptyMessage={emptyMessage} onShowProgress={(trade) => setSelectedProgressTrade(trade)} onVerifyTrade={handleVerifyTrade} />
         </div>
       </div>
+
+      {selectedProgressTrade && (
+        <div className="modalOverlay" onClick={() => setSelectedProgressTrade(null)}>
+          <div className="modalCard progressModalCard" onClick={(e) => e.stopPropagation()}>
+            <div className="modalHeader">
+              <div>
+                <h3>Trade Progress — {selectedProgressTrade.symbol}</h3>
+                <div className="modalSubtitle">{paperStrategyText(selectedProgressTrade)} Strategy &middot; {paperDisplayStatus(selectedProgressTrade)}</div>
+              </div>
+              <button type="button" className="btnSecondary" onClick={() => setSelectedProgressTrade(null)}>Close</button>
+            </div>
+            <div className="progressSectionStack">
+              <div className="progressSectionCard">
+                <h4 className="progressSectionTitle">1. Trade Metadata &amp; Strategy</h4>
+                <div className="progressGrid">
+                  <div><span>Symbol</span><strong>{selectedProgressTrade.symbol ?? selectedProgressTrade.tradingview_symbol ?? "N/A"}</strong></div>
+                  <div><span>Strategy</span><strong>{paperStrategyText(selectedProgressTrade)}</strong></div>
+                  <div><span>Status</span><strong>{paperDisplayStatus(selectedProgressTrade)}</strong></div>
+                  <div><span>Quality Grade</span><strong>{selectedProgressTrade.trade_quality_grade ?? "N/A"}</strong></div>
+                  <div><span>Setup Time</span><strong>{paperCellValue(selectedProgressTrade, { key: "setup_time" })}</strong></div>
+                  <div><span>Valid Until</span><strong>{paperCellValue(selectedProgressTrade, { key: "setup_valid_until" })}</strong></div>
+                </div>
+              </div>
+
+              <div className="progressSectionCard">
+                <h4 className="progressSectionTitle">2. Price Levels</h4>
+                <div className="progressGrid">
+                  <div><span>Entry Price</span><strong>₹{selectedProgressTrade.entry_price ?? selectedProgressTrade.entry ?? "—"}</strong></div>
+                  <div><span>Current Price</span><strong>₹{selectedProgressTrade.current_price ?? selectedProgressTrade.latest_close ?? "—"}</strong></div>
+                  <div><span>Stop Loss</span><strong>₹{selectedProgressTrade.stop_loss ?? selectedProgressTrade.current_stop_loss ?? "—"}</strong></div>
+                  <div><span>Target 1 (T1)</span><strong>₹{selectedProgressTrade.target_1 ?? selectedProgressTrade.t1 ?? "—"}</strong></div>
+                  <div><span>Target 2 (T2)</span><strong>{selectedProgressTrade.target_2 != null ? `₹${selectedProgressTrade.target_2}` : selectedProgressTrade.t2 != null ? `₹${selectedProgressTrade.t2}` : "N/A"}</strong></div>
+                  <div><span>Target 3 (T3)</span><strong>{selectedProgressTrade.target_3 != null ? `₹${selectedProgressTrade.target_3}` : selectedProgressTrade.t3 != null ? `₹${selectedProgressTrade.t3}` : "N/A"}</strong></div>
+                </div>
+              </div>
+
+              <div className="progressSectionCard">
+                <h4 className="progressSectionTitle">3. Position Sizing &amp; Margin</h4>
+                <div className="progressGrid">
+                  <div><span>Planned Quantity</span><strong>{selectedProgressTrade.planned_quantity ?? selectedProgressTrade.quantity ?? "N/A"}</strong></div>
+                  <div><span>Bought Quantity</span><strong>{selectedProgressTrade.bought_quantity ?? "N/A"}</strong></div>
+                  <div><span>Open Quantity</span><strong>{selectedProgressTrade.open_quantity ?? "N/A"}</strong></div>
+                  <div><span>Reserved Margin</span><strong>₹{selectedProgressTrade.reserved_margin ?? "—"}</strong></div>
+                </div>
+              </div>
+
+              <div className="progressSectionCard">
+                <h4 className="progressSectionTitle">4. Price Progress</h4>
+                <div className="progressGrid">
+                  <div><span>Distance to Entry (₹)</span><strong>₹{paperCellValue(selectedProgressTrade, { key: "distance_to_entry" })}</strong></div>
+                  <div><span>Distance to Entry (%)</span><strong>{paperCellValue(selectedProgressTrade, { key: "distance_to_entry_percent" })}</strong></div>
+                  <div><span>Distance to SL (₹)</span><strong>{(() => {
+                    const cp = Number(selectedProgressTrade.current_price ?? selectedProgressTrade.latest_close);
+                    const sl = Number(selectedProgressTrade.stop_loss ?? selectedProgressTrade.current_stop_loss);
+                    if (!isNaN(cp) && !isNaN(sl)) {
+                      return `₹${(cp - sl).toFixed(2)}`;
+                    }
+                    return "N/A";
+                  })()}</strong></div>
+                  <div><span>Distance to SL (%)</span><strong>{(() => {
+                    const cp = Number(selectedProgressTrade.current_price ?? selectedProgressTrade.latest_close);
+                    const sl = Number(selectedProgressTrade.stop_loss ?? selectedProgressTrade.current_stop_loss);
+                    if (!isNaN(cp) && !isNaN(sl) && cp > 0) {
+                      return `${(((cp - sl) / cp) * 100).toFixed(2)}%`;
+                    }
+                    return "N/A";
+                  })()}</strong></div>
+                  <div><span>P&amp;L</span><strong>₹{paperCellValue(selectedProgressTrade, { key: "pnl" })}</strong></div>
+                </div>
+              </div>
+
+              <div className="progressSectionCard">
+                <h4 className="progressSectionTitle">5. Live Trade Progress</h4>
+                {selectedProgressTrade.status === "WAITING_FOR_ENTRY" || selectedProgressTrade.status === "WAITING_FOR_CAPITAL" ? (
+                  <p className="muted progressNotice">Position not triggered yet. Live tracking active once trade triggers.</p>
+                ) : (
+                  <div className="progressGrid">
+                    <div><span>Max High</span><strong>{selectedProgressTrade.max_high != null ? `₹${selectedProgressTrade.max_high}` : "N/A"}</strong></div>
+                    <div><span>Min Low</span><strong>{selectedProgressTrade.min_low != null ? `₹${selectedProgressTrade.min_low}` : "N/A"}</strong></div>
+                    <div><span>Current R</span><strong>{(() => {
+                      if (selectedProgressTrade.current_r != null) return `${selectedProgressTrade.current_r} R`;
+                      const cp = Number(selectedProgressTrade.current_price ?? selectedProgressTrade.latest_close);
+                      const entry = Number(selectedProgressTrade.entry_price ?? selectedProgressTrade.entry);
+                      const sl = Number(selectedProgressTrade.stop_loss ?? selectedProgressTrade.current_stop_loss);
+                      const isTriggered = Boolean(selectedProgressTrade.entry_triggered_at) || !["WAITING_FOR_ENTRY", "WAITING_FOR_CAPITAL"].includes(selectedProgressTrade.status);
+                      if (isTriggered && !isNaN(cp) && !isNaN(entry) && !isNaN(sl) && entry > sl) {
+                        return `${((cp - entry) / (entry - sl)).toFixed(4)} R`;
+                      }
+                      return "N/A";
+                    })()}</strong></div>
+                    <div><span>Realized RR</span><strong>{selectedProgressTrade.realized_rr != null ? `${selectedProgressTrade.realized_rr} R` : "N/A"}</strong></div>
+                  </div>
+                )}
+              </div>
+
+              <div className="progressSectionCard">
+                <h4 className="progressSectionTitle">6. Execution Logic &amp; Diagnostics</h4>
+                <div className="progressGrid">
+                  <div><span>EMA Alignment</span><strong>{selectedProgressTrade.ema_alignment ?? "N/A"}</strong></div>
+                  <div><span>ATR</span><strong>{selectedProgressTrade.atr ?? "N/A"}</strong></div>
+                  <div><span>Volume Confirmation</span><strong>{selectedProgressTrade.volume_confirmation ?? "N/A"}</strong></div>
+                  <div><span>MTF Confirmation</span><strong>{selectedProgressTrade.mtf_confirmation ?? "N/A"}</strong></div>
+                  <div><span>Trap Detection</span><strong>{selectedProgressTrade.trap_status ?? "N/A"}</strong></div>
+                </div>
+              </div>
+
+              {/* SECTION 7 — LIVE TRADE PROGRESS & OUTCOME */}
+              <div className="progressSectionCard sec7LiveCard">
+                <h4 className="progressSectionTitle">7. Live Trade Progress &amp; Outcome</h4>
+                
+                {/* A. TOP STATUS HEADER */}
+                <div className="sec7Header">
+                  <div>
+                    <div className="sec7HeaderLabel">Trade Status</div>
+                    <Badge tone={paperStatusToneFromLabel(paperDisplayStatus(selectedProgressTrade))}>
+                      {paperDisplayStatus(selectedProgressTrade)}
+                    </Badge>
+                  </div>
+                  <div style={{ textAlign: "right" }}>
+                    <div className="sec7HeaderLabel">Current Market Price</div>
+                    <div className="sec7PriceBig">
+                      {selectedProgressTrade.current_price ?? selectedProgressTrade.latest_close ? `₹${selectedProgressTrade.current_price ?? selectedProgressTrade.latest_close}` : "--"}
+                    </div>
+                  </div>
+                </div>
+
+                {/* B. PRICE PROGRESSION BAR */}
+                {(() => {
+                  const cp = Number(selectedProgressTrade.current_price ?? selectedProgressTrade.latest_close);
+                  const sl = Number(selectedProgressTrade.stop_loss ?? selectedProgressTrade.current_stop_loss);
+                  const entry = Number(selectedProgressTrade.entry_price ?? selectedProgressTrade.entry);
+                  const t1 = Number(selectedProgressTrade.target_1 ?? selectedProgressTrade.t1);
+                  const t2 = Number(selectedProgressTrade.target_2 ?? selectedProgressTrade.t2);
+                  const t3 = Number(selectedProgressTrade.target_3 ?? selectedProgressTrade.t3);
+
+                  let pct = 25; // default at Entry
+                  if (!isNaN(cp) && !isNaN(sl) && !isNaN(entry)) {
+                    if (cp <= sl) {
+                      pct = 0;
+                    } else if (cp < entry) {
+                      const range = entry - sl;
+                      pct = range > 0 ? Math.min(25, Math.max(0, ((cp - sl) / range) * 25)) : 25;
+                    } else if (!isNaN(t1) && cp < t1) {
+                      const range = t1 - entry;
+                      pct = range > 0 ? Math.min(50, Math.max(25, 25 + ((cp - entry) / range) * 25)) : 25;
+                    } else if (!isNaN(t2) && cp < t2) {
+                      const range = t2 - t1;
+                      pct = range > 0 ? Math.min(75, Math.max(50, 50 + ((cp - t1) / range) * 25)) : 50;
+                    } else if (!isNaN(t3) && cp < t3) {
+                      const range = t3 - t2;
+                      pct = range > 0 ? Math.min(100, Math.max(75, 75 + ((cp - t2) / range) * 25)) : 75;
+                    } else if (!isNaN(t3) && cp >= t3) {
+                      pct = 100;
+                    } else if (!isNaN(t2) && cp >= t2) {
+                      pct = 75;
+                    } else if (!isNaN(t1) && cp >= t1) {
+                      pct = 50;
+                    } else if (cp >= entry) {
+                      pct = 25;
+                    }
+                  }
+
+                  const isEntryTriggered = Boolean(selectedProgressTrade.entry_triggered_at) || !["WAITING_FOR_ENTRY", "WAITING_FOR_CAPITAL"].includes(selectedProgressTrade.status);
+                  const isWaitingState = ["WAITING_FOR_ENTRY", "WAITING_FOR_CAPITAL"].includes(selectedProgressTrade.status) || (!selectedProgressTrade.entry_triggered && !selectedProgressTrade.entry_triggered_at);
+                  const maxH = selectedProgressTrade.max_high != null ? Number(selectedProgressTrade.max_high) : null;
+                  const minL = selectedProgressTrade.min_low != null ? Number(selectedProgressTrade.min_low) : null;
+
+                  const isSlHit = selectedProgressTrade.status === "SL_HIT" || selectedProgressTrade.status === "STOPPED" || selectedProgressTrade.exit_reason === "STOP_LOSS_HIT";
+
+                  return (
+                    <>
+                      <div className="sec7TrackContainer">
+                        <div className="sec7TrackLabels">
+                          <span><span>SL</span><strong>{sl ? `₹${sl}` : "--"}</strong></span>
+                          <span><span>Entry</span><strong>{entry ? `₹${entry}` : "--"}</strong></span>
+                          <span><span>T1</span><strong>{t1 ? `₹${t1}` : "--"}</strong></span>
+                          <span><span>T2</span><strong>{t2 ? `₹${t2}` : "--"}</strong></span>
+                          <span><span>T3</span><strong>{t3 ? `₹${t3}` : "--"}</strong></span>
+                        </div>
+                        <div className="sec7TrackBarWrapper">
+                          <div className="sec7TrackFill" style={{ width: `${pct}%` }} />
+                          <div className="sec7TrackMarker" style={{ left: `${pct}%` }} title={`Current: ₹${cp}`} />
+                        </div>
+                        <div className="sec7GainPill">
+                          &bull; {isWaitingState ? `Distance to Entry (${!isNaN(cp) && !isNaN(entry) ? `₹${(entry - cp).toFixed(2)}` : "--"})` : `Active Price (${!isNaN(cp) ? `₹${cp}` : "--"})`}
+                        </div>
+                      </div>
+
+                      {/* D. THREE-COLUMN TRADE PROGRESS CARDS */}
+                      <div className="sec7CardGrid">
+                        {/* 1. ENTRY */}
+                        <div className="sec7CompactCard">
+                          <div className="sec7CardTitle">1. Entry</div>
+                          <div className="sec7CardMain">{isEntryTriggered ? "Triggered" : "Not Triggered"}</div>
+                          <div className="sec7CardSub">{entry ? `₹${entry}` : "--"}</div>
+                        </div>
+
+                        {/* 2. MAX (HIGH) */}
+                        <div className="sec7CompactCard">
+                          <div className="sec7CardTitle">2. Max (High)</div>
+                          <div className="sec7CardMain">{maxH != null ? `₹${maxH}` : "N/A"}</div>
+                          <div className="sec7CardSub">
+                            {maxH != null && entry ? `+₹${(maxH - entry).toFixed(2)} (+${(((maxH - entry) / entry) * 100).toFixed(2)}%)` : "No data"}
+                          </div>
+                        </div>
+
+                        {/* 3. MIN (LOW) */}
+                        <div className="sec7CompactCard">
+                          <div className="sec7CardTitle">3. Min (Low)</div>
+                          <div className="sec7CardMain">{minL != null ? `₹${minL}` : "N/A"}</div>
+                          <div className="sec7CardSub">
+                            {minL != null && entry ? `₹${(minL - entry).toFixed(2)} (${(((minL - entry) / entry) * 100).toFixed(2)}%)` : "No data"}
+                          </div>
+                        </div>
+
+                        {/* 4. TARGET 1 */}
+                        <div className="sec7CompactCard">
+                          <div className="sec7CardTitle">4. Target 1</div>
+                          <div className="sec7CardMain">
+                            {!isNaN(cp) && !isNaN(t1) ? (cp >= t1 ? "Hit" : `₹${(t1 - cp).toFixed(2)} Away`) : "N/A"}
+                          </div>
+                          <div className="sec7CardSub">{t1 ? `Target: ₹${t1}` : "--"}</div>
+                        </div>
+
+                        {/* 5. TARGET 2 */}
+                        <div className="sec7CompactCard">
+                          <div className="sec7CardTitle">5. Target 2</div>
+                          <div className="sec7CardMain">
+                            {!isNaN(cp) && !isNaN(t2) ? (cp >= t2 ? "Hit" : `₹${(t2 - cp).toFixed(2)} Away`) : "N/A"}
+                          </div>
+                          <div className="sec7CardSub">{t2 ? `Target: ₹${t2}` : "--"}</div>
+                        </div>
+
+                        {/* 6. STOP LOSS */}
+                        <div className="sec7CompactCard">
+                          <div className="sec7CardTitle">6. Stop Loss</div>
+                          <div className="sec7CardMain">{isSlHit ? "Hit" : "Not Hit"}</div>
+                          <div className="sec7CardSub">{sl ? `Level: ₹${sl}` : "--"}</div>
+                        </div>
+                      </div>
+
+                      {/* E. RISK / POSITION SUMMARY PANEL */}
+                      <div className="sec7RiskPanel">
+                        <div>
+                          <div className="sec7RiskRow"><span>Risk Budget:</span><strong>{entry && sl && (selectedProgressTrade.planned_quantity || selectedProgressTrade.quantity) ? `₹${((entry - sl) * (selectedProgressTrade.planned_quantity || selectedProgressTrade.quantity)).toFixed(2)}` : "--"}</strong></div>
+                          <div className="sec7RiskRow"><span>Distance to SL:</span><strong>{!isNaN(cp) && !isNaN(sl) ? `₹${(cp - sl).toFixed(2)} (${(((cp - sl) / cp) * 100).toFixed(2)}%)` : "--"}</strong></div>
+                          <div className="sec7RiskRow"><span>Unrealized P&amp;L:</span><strong>₹{paperCellValue(selectedProgressTrade, { key: "pnl" })}</strong></div>
+                        </div>
+                        <div>
+                          <div className="sec7RiskRow"><span>Position Size:</span><strong>{isWaitingState ? "0 shares" : `${selectedProgressTrade.open_quantity ?? selectedProgressTrade.bought_quantity ?? selectedProgressTrade.quantity ?? "--"} shares`}</strong></div>
+                          <div className="sec7RiskRow"><span>Current R:</span><strong>{(() => {
+                            if (selectedProgressTrade.current_r != null) return `${selectedProgressTrade.current_r} R`;
+                            if (!isWaitingState && !isNaN(cp) && !isNaN(entry) && !isNaN(sl) && entry > sl) {
+                              return `${((cp - entry) / (entry - sl)).toFixed(4)} R`;
+                            }
+                            return "N/A";
+                          })()}</strong></div>
+                          <div className="sec7RiskRow"><span>Reward Achieved:</span><strong>{selectedProgressTrade.realized_rr != null ? `${selectedProgressTrade.realized_rr} R` : "N/A"}</strong></div>
+                        </div>
+                      </div>
+
+                      {/* F. OUTCOME MESSAGE & AUDIT */}
+                      <div className="sec7OutcomeBox">
+                        {selectedProgressTrade.exit_reason ? (
+                          <div><strong>Outcome:</strong> {selectedProgressTrade.exit_reason}</div>
+                        ) : selectedProgressTrade.rejection_reason || selectedProgressTrade.invalidation_reason || selectedProgressTrade.capital_rejection_reason ? (
+                          <div>
+                            {selectedProgressTrade.rejection_reason && <div><strong>Rejection Reason:</strong> {selectedProgressTrade.rejection_reason}</div>}
+                            {selectedProgressTrade.invalidation_reason && <div><strong>Invalidation Reason:</strong> {selectedProgressTrade.invalidation_reason}</div>}
+                            {selectedProgressTrade.capital_rejection_reason && <div><strong>Capital Rejection:</strong> {selectedProgressTrade.capital_rejection_reason}</div>}
+                          </div>
+                        ) : (
+                          <div>No trade outcome available yet.</div>
+                        )}
+                      </div>
+                    </>
+                  );
+                })()}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   </div>;
 }

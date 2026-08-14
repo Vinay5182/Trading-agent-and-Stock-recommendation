@@ -1,0 +1,139 @@
+{
+  "dataset_version": "v1.0.0",
+  "schema_hash": "9d02a597700076ab",
+  "training_timestamp": "2026-07-25T19:56:51.263001+00:00",
+  "task_type": "classification",
+  "target_column": "binary_label",
+  "best_algorithm": "random_forest",
+  "metrics": {
+    "accuracy": 0.7941,
+    "precision": 0.6429,
+    "recall": 0.8182,
+    "f1_score": 0.72,
+    "roc_auc": 0.9012,
+    "confusion_matrix": [
+      [
+        18,
+        5
+      ],
+      [
+        2,
+        9
+      ]
+    ]
+  },
+  "feature_count": 34,
+  "training_duration_seconds": 1.93,
+  "model_artifact": "models\\model_random_forest_classification_v1.0.0.joblib",
+  "preprocessor_artifact": "models\\preprocessor_v1.0.0.joblib",
+  "feature_importance_artifact": "models\\feature_importance_random_forest_v1.0.0.json",
+  "benchmark_summary": [
+    {
+      "rank": 1,
+      "algorithm": "random_forest",
+      "metrics": {
+        "accuracy": 0.7941,
+        "precision": 0.6429,
+        "recall": 0.8182,
+        "f1_score": 0.72,
+        "roc_auc": 0.9012,
+        "confusion_matrix": [
+          [
+            18,
+            5
+          ],
+          [
+            2,
+            9
+          ]
+        ]
+      }
+    },
+    {
+      "rank": 2,
+      "algorithm": "lightgbm",
+      "metrics": {
+        "accuracy": 0.7353,
+        "precision": 0.5556,
+        "recall": 0.9091,
+        "f1_score": 0.6897,
+        "roc_auc": 0.8419,
+        "confusion_matrix": [
+          [
+            15,
+            8
+          ],
+          [
+            1,
+            10
+          ]
+        ]
+      }
+    },
+    {
+      "rank": 3,
+      "algorithm": "xgboost",
+      "metrics": {
+        "accuracy": 0.7059,
+        "precision": 0.5263,
+        "recall": 0.9091,
+        "f1_score": 0.6667,
+        "roc_auc": 0.8221,
+        "confusion_matrix": [
+          [
+            14,
+            9
+          ],
+          [
+            1,
+            10
+          ]
+        ]
+      }
+    },
+    {
+      "rank": 4,
+      "algorithm": "extra_trees",
+      "metrics": {
+        "accuracy": 0.7059,
+        "precision": 0.5263,
+        "recall": 0.9091,
+        "f1_score": 0.6667,
+        "roc_auc": 0.8379,
+        "confusion_matrix": [
+          [
+            14,
+            9
+          ],
+          [
+            1,
+            10
+          ]
+        ]
+      }
+    },
+    {
+      "rank": 5,
+      "algorithm": "linear",
+      "metrics": {
+        "accuracy": 0.5588,
+        "precision": 0.3889,
+        "recall": 0.6364,
+        "f1_score": 0.4828,
+        "roc_auc": 0.6008,
+        "confusion_matrix": [
+          [
+            12,
+            11
+          ],
+          [
+            4,
+            7
+          ]
+        ]
+      }
+    }
+  ],
+  "historical_data_status": "SUPERSEDED_PRE_CUTOFF",
+  "note": "Model trained on dataset v1.0.0 prior to pre-2026-07-19 data cleanup operation. Requires retraining once new post-2026-07-19 dataset is collected."
+}

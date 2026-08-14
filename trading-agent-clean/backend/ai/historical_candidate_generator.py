@@ -1,6 +1,6 @@
 import hashlib
+import inspect
 import logging
-import hashlib
 import math
 from typing import Any, Iterable
 
@@ -9,8 +9,8 @@ from pymongo import UpdateOne
 
 from scoring import SCORING_VERSION, score_market_data_row
 
-
 logger = logging.getLogger(__name__)
+
 
 
 def calculate_historical_features(
@@ -48,6 +48,23 @@ def calculate_historical_features(
     
     # Change percent for the day
     df["change_percent"] = ((df["close"] / df["previous_close"]) - 1) * 100
+
+    # True Range & ATR(14)
+    high_low = df["high"] - df["low"]
+    high_prev_close = (df["high"] - df["previous_close"]).abs()
+    low_prev_close = (df["low"] - df["previous_close"]).abs()
+    df["tr"] = pd.concat([high_low, high_prev_close, low_prev_close], axis=1).max(axis=1)
+    df["atr_14"] = df["tr"].rolling(window=14, min_periods=5).mean().shift(1)
+
+    # RSI(14)
+    delta = df["close"].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14, min_periods=5).mean().shift(1)
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14, min_periods=5).mean().shift(1)
+    rs = gain / loss.replace(0, 1e-6)
+    df["rsi_14"] = 100 - (100 / (1 + rs))
+
+    # Volatility %
+    df["volatility_pct"] = (df["atr_14"] / df["close"]) * 100.0
 
     # traded_value approximation if not present
     if "traded_value" not in df.columns:
@@ -98,6 +115,9 @@ def build_historical_candidate_rows(
             "change_percent": float(row["change_percent"]) if pd.notna(row.get("change_percent")) else None,
             "relative_volume": float(row["relative_volume"]) if pd.notna(row.get("relative_volume")) else None,
             "thirty_day_change_percent": float(row["thirty_day_change_percent"]) if pd.notna(row.get("thirty_day_change_percent")) else None,
+            "atr_14": float(row["atr_14"]) if pd.notna(row.get("atr_14")) else None,
+            "rsi_14": float(row["rsi_14"]) if pd.notna(row.get("rsi_14")) else None,
+            "volatility_pct": float(row["volatility_pct"]) if pd.notna(row.get("volatility_pct")) else None,
         }
         
         scored = score_market_data_row(market_data)
@@ -273,18 +293,70 @@ async def persist_historical_candidate_rows(
         operations.append(op)
 
     col = db["historical_scored_candidates"]
+    validation_errors = []
+    cto_inserted = 0
+    cto_updated = 0
     try:
-        res = await col.bulk_write(operations, ordered=False)
+        raw_res = col.bulk_write(operations, ordered=False)
+        if inspect.isawaitable(raw_res):
+            res = await raw_res
+        else:
+            res = raw_res
+
+        # Also persist to candidate_trade_outcomes (Single Source of Truth)
+        try:
+            from services.candidate_trade_outcomes_service import create_candidate_trade_outcome_doc, persist_candidate_trade_outcome_records
+            outcome_docs = []
+            for c in candidates:
+                trade_plan = {
+                    "entry_price": c.get("normalized_score_inputs", {}).get("current_price", 0.0),
+                    "stop_loss": c.get("normalized_score_inputs", {}).get("current_price", 0.0) * 0.98,
+                    "target_1": c.get("normalized_score_inputs", {}).get("current_price", 0.0) * 1.05,
+                    "target_2": c.get("normalized_score_inputs", {}).get("current_price", 0.0) * 1.10,
+                    "target_3": c.get("normalized_score_inputs", {}).get("current_price", 0.0) * 1.15,
+                    "risk_reward_ratio": 2.5,
+                    "position_size": 100,
+                }
+                selection_status = {
+                    "selected_for_trade": c.get("selected_for_tv", False) or c.get("swing_candidate", False) or c.get("momentum_candidate", False),
+                    "selection_reason": "QUALIFIED_BY_SCANNER" if (c.get("swing_candidate") or c.get("momentum_candidate")) else "REJECTED_LOW_SCORE",
+                    "rejection_reason": None if (c.get("swing_candidate") or c.get("momentum_candidate")) else "SCORE_BELOW_THRESHOLD",
+                }
+                doc = create_candidate_trade_outcome_doc(
+                    symbol=c.get("symbol", ""),
+                    scan_date=c.get("trade_date", ""),
+                    candidate_features=c,
+                    trade_plan=trade_plan,
+                    selection_status=selection_status,
+                )
+                outcome_docs.append(doc)
+            cto_res = await persist_candidate_trade_outcome_records(db, outcome_docs)
+            cto_inserted = cto_res.get("inserted_count", 0)
+            cto_updated = cto_res.get("updated_count", 0)
+            if "error" in cto_res:
+                validation_errors.append(f"CTO persistence error: {cto_res['error']}")
+        except Exception as ex:
+            logger.error(f"Failed to persist candidate_trade_outcomes: {ex}")
+            validation_errors.append(f"CTO persistence exception: {str(ex)}")
+
+        upserted = getattr(res, "upserted_count", 0)
+        modified = getattr(res, "modified_count", 0)
         return {
-            "inserted_count": res.upserted_count,
-            "updated_count": res.modified_count,
-            "duplicate_skipped_count": len(candidates) - (res.upserted_count + res.modified_count),
-            "validation_errors": [],
+            "inserted_count": upserted,
+            "updated_count": modified,
+            "cto_inserted_count": cto_inserted,
+            "cto_updated_count": cto_updated,
+            "duplicate_skipped_count": len(candidates) - (upserted + modified),
+            "validation_errors": validation_errors,
         }
     except Exception as e:
         return {
             "inserted_count": 0,
             "updated_count": 0,
+            "cto_inserted_count": 0,
+            "cto_updated_count": 0,
             "duplicate_skipped_count": 0,
             "validation_errors": [str(e)],
         }
+
+

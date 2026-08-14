@@ -47,6 +47,8 @@ SWING_CANDIDATE_FIELDS = {
     "score_breakdown.swing": 1,
     "source_used": 1,
     "updated_at": 1,
+    "setup_date": 1,
+    "score_version": 1,
 }
 
 
@@ -266,9 +268,7 @@ def serialize_swing_confirmation_row(row: dict) -> dict:
     return serialized
 
 
-async def save_confirmation_row(row: dict) -> dict[str, Any]:
-    now = row.get("swing_confirmed_at") or row.get("confirmed_at") or utc_now_iso()
-    row = stamp_swing_confirmation_row(row, now)
+def build_swing_identity(row: dict, now: str = None) -> tuple[dict, dict]:
     base_identity = {
         "symbol": row.get("symbol"),
         "tradingview_symbol": row.get("tradingview_symbol"),
@@ -279,6 +279,12 @@ async def save_confirmation_row(row: dict) -> dict[str, Any]:
         identity = {**base_identity, "tv_status": "TECHNICAL_FAILED", "failure_run_id": row.get("failure_run_id") or now}
     else:
         identity = {**base_identity, "tv_status": {"$ne": "TECHNICAL_FAILED"}}
+    return identity, base_identity
+
+async def save_confirmation_row(row: dict) -> dict[str, Any]:
+    now = row.get("swing_confirmed_at") or row.get("confirmed_at") or utc_now_iso()
+    row = stamp_swing_confirmation_row(row, now)
+    identity, base_identity = build_swing_identity(row, now)
     document = {**row, **base_identity, "updated_at": now}
     document.pop("created_at", None)
     if row.get("tv_status") == "TECHNICAL_FAILED":
@@ -288,7 +294,6 @@ async def save_confirmation_row(row: dict) -> dict[str, Any]:
         {
             "$set": document,
             "$setOnInsert": {"created_at": now},
-            "$unset": {"trade_allowed": ""}
         },
         upsert=True,
     )
@@ -388,6 +393,31 @@ async def run_swing_tv_confirmation(
                 res = await save_confirmation_row(row)
                 if res:
                     dataset_updates.append(res)
+                    
+        # --- ML DATA ACQUISITION HOOK (PHASE 2.2B) ---
+        import asyncio
+        from routes.score import _safe_ml_observer
+        from services.ml_pipeline import ml_pipeline
+
+        # --- OPTION A ARCHITECTURAL FIX: TRUE FINAL STATE RE-READ ---
+        observer_row = row
+        if save:
+            try:
+                identity, _ = build_swing_identity(row, row.get("updated_at") or row.get("swing_confirmed_at") or row.get("confirmed_at"))
+                final_row = await get_database().swing_tv_confirmations.find_one(identity)
+                if final_row:
+                    observer_row = final_row
+                else:
+                    logger.warning(f"Phase 2.2B TV Observer: confirmation for {row.get('symbol')} not found in Mongo, skipping.")
+                    observer_row = None
+            except Exception as e:
+                logger.warning(f"Phase 2.2B TV Observer Failed to re-read document: {e}")
+                observer_row = None
+
+        if observer_row:
+            asyncio.create_task(_safe_ml_observer(ml_pipeline.record_tv_confirmation(observer_row, candidate)))
+        # ---------------------------------------------
+        
         rows.append(row)
 
     confirmed_count = sum(1 for row in rows if row.get("tv_status") == "CONFIRMED_SIGNAL")
@@ -422,6 +452,19 @@ async def run_swing_tv_confirmation(
         "rows": rows,
     }
     if save:
+        try:
+            db = get_database()
+            from services.tv_saved_results import persist_daily_tv_counts, categorize_tv_rows
+            selected_cnt, confirmed_cnt, rejected_cnt = categorize_tv_rows("swing", rows)
+            await persist_daily_tv_counts(
+                db,
+                strategy_type="swing",
+                selected_count=selected_cnt,
+                confirmed_count=confirmed_cnt,
+                rejected_count=rejected_cnt,
+            )
+        except Exception as exc:
+            logger.warning("persist_daily_tv_counts skipped: %s", exc)
         response["daily_dataset_update"] = {
             "processed_count": len(dataset_updates),
             "updated_count": sum(u.get("updated_count") or 0 for u in dataset_updates),

@@ -33,6 +33,9 @@ import {
   tradingViewBadge,
   isBatchReady,
   canStartTradingViewOperation,
+  mapTimeframeToInterval,
+  buildTradingViewSymbol,
+  buildTradingViewUrl,
 } from "./api.js";
 import { aiDataCollectionChecklist, aiOutcomeSkippedRows, aiSnapshotDisplayRows } from "./aiDataset.js";
 import {
@@ -371,7 +374,7 @@ test("Paper Trades P&L calendar includes ambiguous realized trades without date 
   assert.equal(dailyMapSource.includes("Date.now()"), false);
   assert.equal(dailyMapSource.toLowerCase().includes("today"), false);
   assert.ok(paperTradesSource.includes("const ambiguousTrades = withPaperGroup(arr(history, [\"ambiguous\"]), \"ambiguous\");"));
-  assert.ok(paperTradesSource.includes("const calendarTrades = dedupePaperTrades([...completedTrades, ...stoppedTrades, ...ambiguousTrades]);"));
+  assert.ok(paperTradesSource.includes("const calendarTrades = dedupePaperTrades([...activeTrades, ...completedTrades, ...stoppedTrades, ...ambiguousTrades]);"));
 });
 
 test("stock detail requests cancel stale responses and abort on unmount", () => {
@@ -1385,3 +1388,165 @@ test("Saved TV cards display explicit confirmation labels without created_at fal
   assert.equal(appSource.includes("row?.created_at || row?.confirmed_at"), false);
   assert.equal(appSource.includes("row?.source_candle_at || row?.confirmed_at"), false);
 });
+
+test("TradingView symbol and timeframe interval URL construction rules", () => {
+  assert.equal(buildTradingViewSymbol({ symbol: "BAJAJ_AUTO", exchange: "NSE" }), "NSE:BAJAJ_AUTO");
+  assert.equal(buildTradingViewSymbol({ symbol: "NAM_INDIA", exchange: "NSE" }), "NSE:NAM_INDIA");
+  assert.equal(buildTradingViewSymbol({ symbol: "BAJAJ-AUTO" }), "NSE:BAJAJ_AUTO");
+  assert.equal(buildTradingViewSymbol({ symbol: "BSE:500325" }), "BSE:500325");
+  assert.equal(buildTradingViewSymbol({ tradingview_symbol: "NSE:SBIN" }), "NSE:SBIN");
+  assert.equal(buildTradingViewSymbol({ symbol: "M_M.NS" }), "NSE:M_M");
+
+  assert.equal(mapTimeframeToInterval("1D"), "D");
+  assert.equal(mapTimeframeToInterval("1W"), "W");
+  assert.equal(mapTimeframeToInterval("4H"), "240");
+  assert.equal(mapTimeframeToInterval("1H"), "60");
+  assert.equal(mapTimeframeToInterval(""), "D");
+  assert.equal(mapTimeframeToInterval(null), "D");
+
+  assert.equal(
+    buildTradingViewUrl({ symbol: "BAJAJ_AUTO", timeframe: "1D" }),
+    "https://www.tradingview.com/chart/?symbol=NSE%3ABAJAJ_AUTO&interval=D"
+  );
+  assert.equal(
+    buildTradingViewUrl({ symbol: "NAM_INDIA", timeframe: "1W" }),
+    "https://www.tradingview.com/chart/?symbol=NSE%3ANAM_INDIA&interval=W"
+  );
+  assert.equal(
+    buildTradingViewUrl({ tradingview_symbol: "NSE:TATAMOTORS", timeframe: "4H" }),
+    "https://www.tradingview.com/chart/?symbol=NSE%3ATATAMOTORS&interval=240"
+  );
+});
+
+test("Verify button opens TradingView chart in new browser tab without modal or DB write", (t) => {
+  const originalWindowOpen = globalThis.window?.open;
+  const originalFetch = globalThis.fetch;
+  const openCalls = [];
+  const fetchCalls = [];
+
+  t.after(() => {
+    if (globalThis.window) {
+      globalThis.window.open = originalWindowOpen;
+    }
+    globalThis.fetch = originalFetch;
+  });
+
+  if (!globalThis.window) {
+    globalThis.window = {};
+  }
+  globalThis.window.open = (url, target, features) => {
+    openCalls.push({ url, target, features });
+  };
+  globalThis.fetch = async (url, options = {}) => {
+    fetchCalls.push({ url, options });
+    return { ok: true, status: 200, text: async () => JSON.stringify({}) };
+  };
+
+  const tradeRow = { symbol: "BAJAJ_AUTO", timeframe: "1D", exchange: "NSE" };
+  const targetUrl = buildTradingViewUrl(tradeRow);
+
+  globalThis.window.open(targetUrl, "_blank", "noopener,noreferrer");
+
+  assert.equal(openCalls.length, 1);
+  assert.equal(openCalls[0].url, "https://www.tradingview.com/chart/?symbol=NSE%3ABAJAJ_AUTO&interval=D");
+  assert.equal(openCalls[0].target, "_blank");
+  assert.equal(openCalls[0].features, "noopener,noreferrer");
+
+  assert.equal(fetchCalls.length, 0, "Verify action must not make any API / DB write calls");
+});
+
+test("Paper Trades Verify workflow structure safety check", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  assert.equal(appSource.includes("Trade Verification Audit"), false, "Fake verification audit modal must be removed");
+  assert.equal(appSource.includes("selectedVerifyTrade"), false, "selectedVerifyTrade state must be removed");
+
+  assert.ok(appSource.includes("const handleVerifyTrade = (trade) => {"), "handleVerifyTrade handler present");
+  assert.ok(appSource.includes("window.open(url, \"_blank\", \"noopener,noreferrer\")"), "Opens TradingView chart in new tab");
+  assert.ok(appSource.includes("onVerifyTrade={handleVerifyTrade}"), "Passes handleVerifyTrade to PaperTradeTable");
+
+  assert.ok(appSource.includes("selectedProgressTrade"), "Trade Progress modal state preserved");
+  assert.ok(appSource.includes("Trade Progress —"), "Trade Progress modal UI preserved");
+});
+
+test("Paper Trades detailed Progress modal structure safety check", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  // Verify all 7 detailed progress sections exist
+  assert.ok(appSource.includes("1. Trade Metadata &amp; Strategy"), "Section 1 present");
+  assert.ok(appSource.includes("2. Price Levels"), "Section 2 present");
+  assert.ok(appSource.includes("3. Position Sizing &amp; Margin"), "Section 3 present");
+  assert.ok(appSource.includes("4. Price Progress"), "Section 4 present");
+  assert.ok(appSource.includes("5. Live Trade Progress"), "Section 5 present");
+  assert.ok(appSource.includes("6. Execution Logic &amp; Diagnostics"), "Section 6 present");
+  assert.ok(appSource.includes("7. Live Trade Progress &amp; Outcome"), "Section 7 rich title present");
+  assert.ok(appSource.includes("sec7LiveCard"), "sec7LiveCard present");
+  assert.ok(appSource.includes("Trade Status"), "Trade status header label present");
+  assert.ok(appSource.includes("Current Market Price"), "Current Market Price header label present");
+  assert.ok(appSource.includes("sec7TrackBarWrapper"), "sec7TrackBarWrapper present");
+  assert.ok(appSource.includes("sec7TrackMarker"), "sec7TrackMarker present");
+  assert.ok(appSource.includes("sec7CardGrid"), "sec7CardGrid present");
+  assert.ok(appSource.includes("sec7RiskPanel"), "sec7RiskPanel present");
+  assert.ok(appSource.includes("sec7OutcomeBox"), "sec7OutcomeBox present");
+
+  // Verify restored fields exist in modal JSX
+  assert.ok(appSource.includes("Target 2 (T2)"), "T2 present");
+  assert.ok(appSource.includes("Target 3 (T3)"), "T3 present");
+  assert.ok(appSource.includes("Planned Quantity"), "Planned Qty present");
+  assert.ok(appSource.includes("Bought Quantity"), "Bought Qty present");
+  assert.ok(appSource.includes("Open Quantity"), "Open Qty present");
+  assert.ok(appSource.includes("Distance to SL (₹)"), "Distance to SL present");
+  assert.ok(appSource.includes("Max High"), "Max High present");
+  assert.ok(appSource.includes("Min Low"), "Min Low present");
+  assert.ok(appSource.includes("Current R"), "Current R present");
+  assert.ok(appSource.includes("Realized RR"), "Realized RR present");
+  assert.ok(appSource.includes("EMA Alignment"), "EMA Alignment present");
+  assert.ok(appSource.includes("ATR"), "ATR present");
+  assert.ok(appSource.includes("Volume Confirmation"), "Volume Confirmation present");
+  assert.ok(appSource.includes("MTF Confirmation"), "MTF Confirmation present");
+  assert.ok(appSource.includes("Trap Detection"), "Trap Detection present");
+
+  // Verify modal is styled with responsive CSS class
+  assert.ok(appSource.includes("progressModalCard"), "progressModalCard class applied");
+});
+
+test("Paper Trades hero grid outcome StatCards structure safety check", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  assert.ok(appSource.includes('label="Target Completed"'), "Target Completed StatCard present");
+  assert.ok(appSource.includes('label="Target → SL"'), "Target → SL StatCard present");
+  assert.ok(appSource.includes('label="Pure SL Hit"'), "Pure SL Hit StatCard present");
+});
+
+test("Pure SL Hit count logic prioritizes canonical pure_sl_hit_count over legacy sl_hit_count when pure_sl_hit_count is 0", () => {
+  const summary = {
+    pure_sl_hit_count: 0,
+    target_partial_then_sl_count: 3,
+    target_completed_count: 1,
+    sl_hit_count: 4,
+    waiting_for_entry: 57,
+    open_trades: 45,
+  };
+  const stoppedTrades = [{ partial_exit_1: true }, { partial_exit_1: true }, { partial_exit_1: true }, { exit_reason: "STOP_LOSS_HIT_BEFORE_ENTRY" }];
+
+  const pureSlCount = summary?.pure_sl_hit_count ?? summary?.sl_hit_count ?? stoppedTrades.filter((t) => !t.partial_exit_1 && !t.t1_hit && t.exit_reason !== "STOP_LOSS_HIT_BEFORE_ENTRY").length;
+  const targetPartialThenSlCount = summary?.target_partial_then_sl_count ?? stoppedTrades.filter((t) => t.partial_exit_1 || t.t1_hit).length;
+  const targetCompletedCount = summary?.target_completed_count ?? 1;
+
+  assert.strictEqual(pureSlCount, 0, "Pure SL Hit count must be 0 when pure_sl_hit_count is 0 despite sl_hit_count being 4");
+  assert.strictEqual(targetPartialThenSlCount, 3, "Target → SL count must be 3");
+  assert.strictEqual(targetCompletedCount, 1, "Target Completed count must be 1");
+});
+
+test("P&L Calendar dual-metric aggregation logic handles target exit events and closed trades separately", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  assert.ok(appSource.includes("buildDailyTargetExitMap"), "buildDailyTargetExitMap helper present");
+  assert.ok(appSource.includes("Realized Target Exit Events"), "Realized Target Exit Events summary header label present");
+  assert.ok(appSource.includes("Closed Parent Trades"), "Closed Parent Trades summary header label present");
+  assert.ok(appSource.includes('INVALIDATED_STALE'), "INVALIDATED_STALE exclusion present");
+  assert.ok(appSource.includes('pe.exited_at || pe.timestamp'), "Date attribution uses partial_exit exited_at timestamp");
+  assert.ok(appSource.includes('openTrades?.waiting_for_entry') && appSource.includes('openTrades?.active_partial'), "openTrades robustly combines waiting_for_entry and active_partial when present");
+  assert.ok(appSource.includes('const calendarTrades = dedupePaperTrades([...activeTrades, ...completedTrades, ...stoppedTrades, ...ambiguousTrades]);'), "calendarTrades includes activeTrades so target exit events on active trades are passed to calendar");
+});
+

@@ -84,6 +84,7 @@ CLOSED_TRADE_STATUSES: frozenset[str] = frozenset(
         "CLOSED",
         "EXPIRED",
         "AMBIGUOUS",
+        "ENTRY_MISSED_GAP_UP",
     }
 )
 

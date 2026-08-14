@@ -33,6 +33,23 @@ class MLCandidate(BaseModel):
     # Pre-setup history
     pre_setup_ohlcv_90d: List[Dict[str, Any]] = Field(default_factory=list, description="90 days of OHLCV leading up to setup")
     
+    # Phase 2.2B: TradingView Observer Enrichment
+    tradingview_status: Optional[str] = Field(None, description="Raw TV status")
+    confirmation_status: Optional[str] = Field(None, description="Mapped confirmation status")
+    confidence: Optional[float] = Field(None, description="Confidence score")
+    quality_grade: Optional[str] = Field(None, description="Trade quality grade")
+    trap_status: Optional[str] = Field(None, description="Trap status")
+    strategy_decision: Optional[str] = Field(None, description="Strategy decision")
+    diagnostics: Optional[str] = Field(None, description="Risk diagnostics")
+    rejection_reason: Optional[str] = Field(None, description="Rejection reason")
+    paper_trade_valid: Optional[bool] = Field(None, description="Paper plan validity")
+    entry: Optional[float] = Field(None, description="Entry price")
+    stop_loss: Optional[float] = Field(None, description="Stop loss price")
+    targets: Optional[List[float]] = Field(None, description="Target prices")
+    risk_reward: Optional[float] = Field(None, description="Risk reward ratio")
+    timestamp: Optional[datetime] = Field(None, description="Time of observation")
+    observer_version: Optional[str] = Field(None, description="Observer analysis version")
+    
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -81,10 +98,23 @@ class MLMarketContext(BaseModel):
     market_date: str = Field(..., description="Date of the market context")
     nifty_trend: str = Field("")
     banknifty_trend: str = Field("")
+    sensex_trend: str = Field("")
     india_vix: float = Field(0.0)
+    vix_regime: str = Field("")
+    total_advances: int = Field(0)
+    total_declines: int = Field(0)
     advance_decline_ratio: float = Field(0.0)
+    percent_advancing: float = Field(0.0)
     market_breadth: float = Field(0.0)
+    stocks_above_20_ema: int = Field(0)
+    stocks_above_50_ema: int = Field(0)
+    stocks_above_200_ema: int = Field(0)
+    top_3_strongest_sectors: List[str] = Field(default_factory=list)
+    top_3_weakest_sectors: List[str] = Field(default_factory=list)
+    market_regime: str = Field("")
+    source_versions: Dict[str, str] = Field(default_factory=dict)
     
+    generated_at: datetime = Field(default_factory=datetime.utcnow)
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 class MLSectorContext(BaseModel):
@@ -94,6 +124,12 @@ class MLSectorContext(BaseModel):
     relative_strength_ranking: int = Field(0)
     
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class MLUnifiedMarketContext(BaseModel):
+    trade_date: str = Field(..., description="Trade date in YYYY-MM-DD format")
+    generated_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    market_context: Dict[str, Any] = Field(default_factory=dict)
+    sector_context: Dict[str, Any] = Field(default_factory=dict)
 
 class MLDecision(BaseModel):
     candidate_id: str = Field(...)

@@ -425,6 +425,7 @@ async def get_paper_equity() -> dict:
         "broker_funded": _round(broker_funded), # backward compatibility
         "active_partial_trade_count": f"{active_count} / {partial_count}",
         "active_partial_count": f"{active_count} / {partial_count}", # backward compatibility
+        "total_open_trades": len(open_trades),
         "total_margin_released": _round(total_margin_released),
         "capital_returned_from_latest_exits": _round(capital_returned_from_latest_exits),
 

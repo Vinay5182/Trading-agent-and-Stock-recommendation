@@ -1,0 +1,72 @@
+{
+  "project_name": "Trading Agent & Stock Recommendation System",
+  "version": "0.2.0",
+  "target_market": "NSE India (National Stock Exchange)",
+  "mode": "PAPER_TRADING_ONLY",
+  "master_documentation": "PROJECT_MASTER_DOCUMENTATION.md",
+  "backend": {
+    "entry_point": "backend/main.py",
+    "config": "backend/config.py",
+    "database": "backend/database.py",
+    "scoring_engine": "backend/scoring.py",
+    "data_providers": [
+      "backend/data_provider.py",
+      "backend/nse_client.py",
+      "backend/nse_universe.py"
+    ],
+    "tradingview_cdp": [
+      "backend/tv_client.py",
+      "backend/tv_confirmation.py",
+      "backend/services/tradingview_manager.py"
+    ],
+    "paper_trading": [
+      "backend/services/paper_sync.py",
+      "backend/services/paper_automation.py",
+      "backend/services/position_sizing.py",
+      "backend/services/capital_accounting.py",
+      "backend/services/trade_journal.py"
+    ],
+    "ai_dataset": [
+      "backend/ai/features.py",
+      "backend/services/daily_dataset.py",
+      "backend/services/decision_outcome_dataset.py",
+      "backend/services/ml_outcome_evaluator.py"
+    ],
+    "security": [
+      "backend/security/operator_intent.py",
+      "backend/services/redaction.py"
+    ],
+    "utilities": [
+      "backend/services/mongo_indexes.py",
+      "backend/services/timestamps.py",
+      "backend/services/trade_plan_calculator.py",
+      "backend/services/system_errors.py",
+      "backend/services/error_contract.py"
+    ]
+  },
+  "frontend": {
+    "entry_point": "frontend/src/main.jsx",
+    "main_dashboard": "frontend/src/App.jsx",
+    "api_client": "frontend/src/api.js",
+    "ai_helpers": "frontend/src/aiDataset.js",
+    "timestamp_utils": "frontend/src/timestampUtils.js",
+    "styles": "frontend/src/App.css"
+  },
+  "database_collections": [
+    "market_data",
+    "market_load_state",
+    "scored_candidates",
+    "swing_tv_confirmations",
+    "momentum_tv_confirmations",
+    "paper_signals",
+    "paper_trades",
+    "trade_journal",
+    "ai_feature_snapshots",
+    "candidate_trade_outcomes",
+    "paper_update_runs",
+    "paper_update_locks",
+    "scheduler_status",
+    "system_errors",
+    "historical_ohlcv"
+  ]
+}

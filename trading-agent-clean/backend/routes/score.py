@@ -17,7 +17,17 @@ from services.pipeline_run_lock import (
     run_with_pipeline_lock,
 )
 import asyncio
+import logging
+from typing import Coroutine, Any
 from services.ml_pipeline import ml_pipeline
+
+logger = logging.getLogger("uvicorn.error")
+
+async def _safe_ml_observer(coro: Coroutine[Any, Any, Any]) -> None:
+    try:
+        await coro
+    except Exception:
+        logger.exception("ML observer task failed unexpectedly")
 
 
 router = APIRouter()
@@ -116,6 +126,7 @@ def scored_document(row: dict, index_name: str, now: str) -> dict:
     document["index_name"] = index_name
     document.update(scoring)
     document["updated_at"] = now
+    document["setup_date"] = now[:10]
     return document
 
 
@@ -190,7 +201,7 @@ async def _run_score_real(db, clean_index: str, lease=None) -> dict:
             
         # --- ML DATA ACQUISITION HOOK (PHASE 2.2A) ---
         if document.get("swing_candidate") or document.get("momentum_candidate"):
-            asyncio.create_task(ml_pipeline.record_candidate_setup(document))
+            asyncio.create_task(_safe_ml_observer(ml_pipeline.record_candidate_setup(document)))
         # ---------------------------------------------
             
         operations.append(
@@ -213,6 +224,19 @@ async def _run_score_real(db, clean_index: str, lease=None) -> dict:
         if lease is not None:
             await lease.renew()
         result = await db.scored_candidates.bulk_write(operations, ordered=False)
+        
+        # --- DAILY TRADE DATASET CANDIDATE SNAPSHOT SEEDING ---
+        try:
+            from services.daily_dataset import build_daily_dataset_candidate_snapshot_run
+            await build_daily_dataset_candidate_snapshot_run(
+                db,
+                limit=1000,
+                dry_run=False,
+                created_by="scoring_pipeline"
+            )
+        except Exception as ds_exc:
+            logger.error("Failed to seed daily_trade_dataset candidate snapshots: %s", ds_exc, exc_info=True)
+        # ------------------------------------------------------
 
     return {
         "index_name": clean_index,

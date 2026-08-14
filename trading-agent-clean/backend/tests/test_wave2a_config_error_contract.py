@@ -17,6 +17,11 @@ from main import app
 from services.system_errors import record_system_error
 
 
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
 class FakeSystemErrors:
     def __init__(self) -> None:
         self.rows = []
@@ -66,9 +71,11 @@ def test_unsafe_scheduler_config_fails_before_startup():
     assert exc_info.value.code == "CONFIG_UNSAFE_SCHEDULER"
 
 
-def test_lifespan_smoke_skips_automation_and_normal_preserves_startup(monkeypatch):
-    from services import mongo_indexes, paper_automation
+@pytest.mark.anyio
+async def test_lifespan_smoke_skips_automation_and_normal_preserves_startup(monkeypatch):
+    from services import mongo_indexes, paper_automation, ml_outcome_evaluator
     from services.tradingview_manager import tradingview_manager
+    from ai import daily_ohlcv_collector
 
     calls = []
 
@@ -97,21 +104,51 @@ def test_lifespan_smoke_skips_automation_and_normal_preserves_startup(monkeypatc
     async def fake_shutdown():
         calls.append(("shutdown", None))
 
+    def fake_start_daily(db):
+        calls.append(("start_daily_ohlcv", None))
+        return SimpleNamespace(get_name=lambda: "fake-daily-ohlcv")
+
+    async def fake_shutdown_daily():
+        calls.append(("shutdown_daily_ohlcv", None))
+
+    def fake_start_eval(db):
+        calls.append(("start_evaluator", None))
+        return SimpleNamespace(get_name=lambda: "fake-evaluator")
+
+    async def fake_shutdown_eval():
+        calls.append(("shutdown_evaluator", None))
+
+    async def fake_connect():
+        database.mongo_client = FakeClient()
+
+    async def fake_close():
+        calls.append(("close", None))
+        database.mongo_client = None
+
     async def run_lifespan(is_smoke: bool):
         calls.clear()
-        monkeypatch.setattr(database, "settings", replace(config.settings, SMOKE_READ_ONLY_MODE=is_smoke))
-        monkeypatch.setattr(database, "AsyncIOMotorClient", lambda uri: FakeClient())
+        monkeypatch.setattr(database, "mongo_client", None)
+        new_settings = replace(config.settings, SMOKE_READ_ONLY_MODE=is_smoke)
+        monkeypatch.setattr(database, "settings", new_settings)
+        monkeypatch.setattr(config, "settings", new_settings)
+        monkeypatch.setattr(database, "connect_to_mongo", fake_connect)
+        monkeypatch.setattr(database, "close_mongo_connection", fake_close)
+        monkeypatch.setattr(database, "get_database", lambda: FakeClient()["trading_agent_clean"])
         monkeypatch.setattr(mongo_indexes, "ensure_active_indexes", fake_indexes)
         monkeypatch.setattr(paper_automation, "initialize_scheduler_status", fake_initialize)
         monkeypatch.setattr(tradingview_manager, "validate_preference_on_restart", fake_validate_preference)
         monkeypatch.setattr(paper_automation, "start_paper_automation_once", fake_start)
         monkeypatch.setattr(paper_automation, "shutdown_paper_automation", fake_shutdown)
+        monkeypatch.setattr(daily_ohlcv_collector, "start_daily_ohlcv_scheduler_once", fake_start_daily)
+        monkeypatch.setattr(daily_ohlcv_collector, "shutdown_daily_ohlcv_scheduler", fake_shutdown_daily)
+        monkeypatch.setattr(ml_outcome_evaluator, "start_ml_outcome_evaluator_once", fake_start_eval)
+        monkeypatch.setattr(ml_outcome_evaluator, "shutdown_ml_outcome_evaluator", fake_shutdown_eval)
         async with database.lifespan(SimpleNamespace()):
             calls.append(("yielded", None))
         return list(calls)
 
-    smoke_calls = asyncio.run(run_lifespan(True))
-    normal_calls = asyncio.run(run_lifespan(False))
+    smoke_calls = await run_lifespan(True)
+    normal_calls = await run_lifespan(False)
 
     assert [name for name, _ in smoke_calls] == ["db", "indexes", "yielded", "close"]
     assert [name for name, _ in normal_calls] == [
@@ -121,7 +158,11 @@ def test_lifespan_smoke_skips_automation_and_normal_preserves_startup(monkeypatc
         "initialize",
         "validate_preference",
         "start_automation",
+        "start_daily_ohlcv",
+        "start_evaluator",
         "yielded",
+        "shutdown_evaluator",
+        "shutdown_daily_ohlcv",
         "shutdown",
         "close",
     ]

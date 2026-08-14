@@ -314,3 +314,4 @@ def test_dashboard_has_no_stale_virtual_balance_defaults() -> None:
     assert "settings.STARTING_VIRTUAL_BALANCE" in source
     assert "STARTING_VIRTUAL_BALANCE = 250000" not in source
     assert "STARTING_VIRTUAL_BALANCE = 1500000" not in source
+    assert "STARTING_VIRTUAL_BALANCE = 2500000" not in source

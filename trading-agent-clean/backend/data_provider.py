@@ -249,16 +249,7 @@ def normalize_provider_timestamp(
         return None
 
 
-def normalize_symbol(exchange: str, symbol: str) -> str:
-    clean = (symbol or "").strip().upper()
-    exchange_prefix = f"{(exchange or '').strip().upper()}:"
-    if clean.startswith(exchange_prefix):
-        clean = clean[len(exchange_prefix):]
-    for suffix in (".NS", ".BO"):
-        if clean.endswith(suffix):
-            clean = clean[: -len(suffix)]
-    return clean.replace(" ", "")
-
+from utils.symbol_utils import normalize_symbol, build_tradingview_symbol
 
 def is_valid_market_symbol(symbol: str) -> bool:
     clean = (symbol or "").strip().upper()
@@ -271,9 +262,6 @@ def is_valid_market_symbol(symbol: str) -> bool:
     return not any(token in canonical for token in placeholder_tokens)
 
 
-def build_tradingview_symbol(exchange: str, symbol: str) -> str:
-    clean_exchange = (exchange or "").strip().upper()
-    return f"{clean_exchange}:{normalize_symbol(clean_exchange, symbol)}"
 
 
 def missing_fields(row: dict[str, Any], fields: list[str]) -> list[str]:

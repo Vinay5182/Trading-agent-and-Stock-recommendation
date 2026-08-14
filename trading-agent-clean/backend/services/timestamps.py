@@ -1,7 +1,13 @@
-from __future__ import annotations
-
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
+
+from services.trading_calendar import (
+    add_trading_days,
+    get_nse_holidays,
+    is_trading_day,
+    next_trading_day,
+    trading_days_between,
+)
 
 
 CANONICAL_UTC_FORMAT = "YYYY-MM-DDTHH:MM:SS.ffffffZ"

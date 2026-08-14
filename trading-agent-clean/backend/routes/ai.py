@@ -71,6 +71,22 @@ from ml.predict import predict_outcome
 
 router = APIRouter()
 
+@router.post("/evaluate-outcomes")
+async def trigger_ml_outcome_evaluation() -> dict[str, Any]:
+    """Manually triggers the OHLC-based evaluation of pending ML candidates."""
+    try:
+        from database import get_db
+        from services.ml_outcome_evaluator import evaluate_pending_ml_outcomes
+        db = await get_db()
+        # Fire and forget or await it? Let's await it since we want to know when it finishes.
+        # But if there are many candidates, it might take a bit. Since it's capped at 1000, it's fine.
+        await evaluate_pending_ml_outcomes(db)
+        return {"status": "success", "message": "Evaluation completed."}
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Error triggering ml_outcome_evaluator: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
 STRATEGY_SIGNAL_TYPES = {
     "swing": "SWING_TV_CONFIRMED",
     "momentum": "MOMENTUM_TV_CONFIRMED",
@@ -473,6 +489,7 @@ def _is_document_safe_at(document: dict | None, cutoff: Any) -> bool:
         or document.get("confirmed_at")
         or document.get("momentum_confirmed_at")
         or document.get("swing_confirmed_at")
+        or document.get("updated_at")
     )
     return event_time is not None and event_time <= cutoff_time
 
@@ -1002,9 +1019,11 @@ def _unlinked_snapshot_warning(linked_only: bool) -> str | None:
 
 def _append_journal_evidence(journals_by_trade_id: dict[str, list[dict]], journal: dict) -> None:
     paper_trade_id = journal.get("paper_trade_id")
-    if paper_trade_id in (None, ""):
-        return
-    journals_by_trade_id.setdefault(str(paper_trade_id), []).append(journal)
+    setup_id = journal.get("setup_id")
+    if paper_trade_id not in (None, ""):
+        journals_by_trade_id.setdefault(str(paper_trade_id), []).append(journal)
+    if setup_id not in (None, "") and str(setup_id) != str(paper_trade_id):
+        journals_by_trade_id.setdefault(str(setup_id), []).append(journal)
 
 
 def _prepare_snapshot_for_save(snapshot: dict) -> dict:
@@ -1019,11 +1038,17 @@ async def _is_duplicate_snapshot(collection, snapshot: dict) -> bool:
 
 
 async def _find_linked_paper_trade(collection, paper_trade_id: Any) -> dict | None:
-    values = [paper_trade_id]
-    if ObjectId.is_valid(str(paper_trade_id)):
-        values.insert(0, ObjectId(str(paper_trade_id)))
-    for value in values:
-        trade = await collection.find_one({"_id": value, "paper_only": True})
+    if paper_trade_id in (None, ""):
+        return None
+    pid_str = str(paper_trade_id)
+    queries = []
+    if ObjectId.is_valid(pid_str):
+        queries.append({"_id": ObjectId(pid_str), "paper_only": True})
+    queries.append({"setup_id": pid_str, "paper_only": True})
+    queries.append({"_id": paper_trade_id, "paper_only": True})
+    queries.append({"paper_trade_id": pid_str, "paper_only": True})
+    for q in queries:
+        trade = await collection.find_one(q)
         if trade is not None:
             return trade
     return None
@@ -1208,8 +1233,8 @@ def _is_waiting_paper_trade(trade: dict) -> bool:
 
 
 def _is_open_paper_trade(trade: dict) -> bool:
-    statuses = _paper_trade_statuses(trade)
-    return bool(statuses & OPEN_PAPER_TRADE_STATUSES) and not bool(statuses & CLOSED_TRADE_STATUSES)
+    from routes.paper import is_open_trade
+    return is_open_trade(trade)
 
 
 def _timestamp_quality_counts() -> dict[str, int]:
@@ -2005,16 +2030,25 @@ async def preview_canonical_training_rows(
     trades_dict = {}
     if bson_ids or string_ids:
         try:
-            trades_cursor = db.paper_trades.find({"_id": {"$in": bson_ids + string_ids}, "paper_only": True})
+            trades_cursor = db.paper_trades.find(
+                {"$or": [{"_id": {"$in": bson_ids + string_ids}}, {"setup_id": {"$in": string_ids}}, {"paper_trade_id": {"$in": string_ids}}], "paper_only": True}
+            )
             async for t in trades_cursor:
-                trades_dict[str(t["_id"])] = t
+                if t.get("_id") is not None:
+                    trades_dict[str(t["_id"])] = t
+                if t.get("setup_id"):
+                    trades_dict[str(t["setup_id"])] = t
+                if t.get("paper_trade_id"):
+                    trades_dict[str(t["paper_trade_id"])] = t
         except (AttributeError, TypeError):
             pass
 
     journals_dict: dict[str, list[dict]] = {}
     if string_ids:
         try:
-            journals_cursor = db.trade_journal.find({"paper_trade_id": {"$in": string_ids}})
+            journals_cursor = db.trade_journal.find(
+                {"$or": [{"paper_trade_id": {"$in": string_ids}}, {"setup_id": {"$in": string_ids}}]}
+            )
             async for j in journals_cursor:
                 _append_journal_evidence(journals_dict, j)
         except (AttributeError, TypeError):
@@ -2483,13 +2517,22 @@ async def get_ai_features_label_audit(
 
     trades_dict = {}
     if bson_ids or string_ids:
-        trades_cursor = db.paper_trades.find({"_id": {"$in": bson_ids + string_ids}, "paper_only": True})
+        trades_cursor = db.paper_trades.find(
+            {"$or": [{"_id": {"$in": bson_ids + string_ids}}, {"setup_id": {"$in": string_ids}}, {"paper_trade_id": {"$in": string_ids}}], "paper_only": True}
+        )
         async for t in trades_cursor:
-            trades_dict[str(t["_id"])] = t
+            if t.get("_id") is not None:
+                trades_dict[str(t["_id"])] = t
+            if t.get("setup_id"):
+                trades_dict[str(t["setup_id"])] = t
+            if t.get("paper_trade_id"):
+                trades_dict[str(t["paper_trade_id"])] = t
 
     journals_dict: dict[str, list[dict]] = {}
     if string_ids:
-        journals_cursor = db.trade_journal.find({"paper_trade_id": {"$in": string_ids}})
+        journals_cursor = db.trade_journal.find(
+            {"$or": [{"paper_trade_id": {"$in": string_ids}}, {"setup_id": {"$in": string_ids}}]}
+        )
         async for j in journals_cursor:
             _append_journal_evidence(journals_dict, j)
 
@@ -2944,7 +2987,18 @@ async def api_get_daily_dataset_rows(
     }
     # Remove None values
     filters = {k: v for k, v in filters.items() if v is not None}
-    return await get_daily_dataset_rows(db, filters, limit, skip)
+    rows = await get_daily_dataset_rows(db, filters, limit, skip)
+
+    def _clean_obj(v: Any) -> Any:
+        if isinstance(v, dict):
+            return {k: _clean_obj(x) for k, x in v.items()}
+        elif isinstance(v, list):
+            return [_clean_obj(x) for x in v]
+        elif type(v).__name__ == "ObjectId":
+            return str(v)
+        return v
+
+    return _clean_obj(rows)
 
 @router.get("/daily-dataset/export-readiness")
 async def api_get_daily_dataset_export_readiness() -> dict[str, Any]:
@@ -3009,11 +3063,136 @@ async def get_data_collection_status():
             "from": first[0]["candle_open_at"] if first else None,
             "to": last[0]["candle_open_at"] if last else None
         },
-        "duplicate_counts": {
-            "historical_scored_candidates": len(dup_hsc),
-            "daily_trade_dataset": len(dup_ds)
-        },
         "label_pending_count": pending_labels,
         "export_ready_count": 0,
         "latest_collection_run": latest_run_doc
     }
+
+
+@router.get("/candidate-outcomes/calendar")
+async def get_candidate_outcomes_calendar(year: int | None = None) -> dict[str, Any]:
+    """
+    Read-only aggregation endpoint for AI Dataset Daily Calendar.
+    Returns daily TradingView confirmed counts per trade date.
+    """
+    from datetime import datetime
+    db = get_database()
+
+    query: dict[str, Any] = {}
+    if year is not None:
+        query["trade_date"] = {"$regex": f"^{year}-"}
+
+    cursor = db.daily_tradingview_counts.find(query, {"_id": 0}).sort("trade_date", -1)
+    docs = await cursor.to_list(length=10000)
+
+    daily_map = {}
+    years_set = set()
+
+    for doc in docs:
+        trade_date = doc.get("trade_date")
+        if not trade_date or len(trade_date) < 10:
+            continue
+        try:
+            years_set.add(int(trade_date[:4]))
+        except Exception:
+            pass
+        daily_map[trade_date] = {
+            "trade_date": trade_date,
+            "swing_selected": doc.get("swing_selected", 0),
+            "swing_confirmed": doc.get("swing_confirmed", 0),
+            "swing_rejected": doc.get("swing_rejected", 0),
+            "momentum_selected": doc.get("momentum_selected", 0),
+            "momentum_confirmed": doc.get("momentum_confirmed", 0),
+            "momentum_rejected": doc.get("momentum_rejected", 0),
+        }
+
+    swing_tv_docs = await db.swing_tv_confirmations.find({}, {"_id": 0, "tv_status": 1, "swing_confirmed_at": 1, "confirmed_at": 1, "created_at": 1, "updated_at": 1}).to_list(length=10000)
+    mom_tv_docs = await db.momentum_tv_confirmations.find({}, {"_id": 0, "tv_status": 1, "momentum_confirmed_at": 1, "confirmed_at": 1, "created_at": 1, "updated_at": 1}).to_list(length=10000)
+
+    grouped_swing: dict[str, list[str]] = {}
+    for doc in swing_tv_docs:
+        date_str = str(doc.get("swing_confirmed_at") or doc.get("confirmed_at") or doc.get("created_at") or doc.get("updated_at"))[:10]
+        if len(date_str) >= 10:
+            grouped_swing.setdefault(date_str, []).append(str(doc.get("tv_status") or ""))
+
+    grouped_mom: dict[str, list[str]] = {}
+    for doc in mom_tv_docs:
+        date_str = str(doc.get("momentum_confirmed_at") or doc.get("confirmed_at") or doc.get("created_at") or doc.get("updated_at"))[:10]
+        if len(date_str) >= 10:
+            grouped_mom.setdefault(date_str, []).append(str(doc.get("tv_status") or ""))
+
+    all_dates = set(daily_map.keys()) | set(grouped_swing.keys()) | set(grouped_mom.keys())
+
+    for date_str in all_dates:
+        if year is not None and not date_str.startswith(f"{year}-"):
+            continue
+        try:
+            years_set.add(int(date_str[:4]))
+        except Exception:
+            pass
+
+        existing = daily_map.get(date_str, {})
+        has_swing_counts = existing.get("swing_selected", 0) > 0 or existing.get("swing_confirmed", 0) > 0
+        has_mom_counts = existing.get("momentum_selected", 0) > 0 or existing.get("momentum_confirmed", 0) > 0
+
+        from services.tv_saved_results import is_swing_confirmed_or_watch, is_momentum_confirmed_or_watch
+
+        sw_statuses = grouped_swing.get(date_str, [])
+        mom_statuses = grouped_mom.get(date_str, [])
+
+        sw_sel = existing.get("swing_selected") if has_swing_counts else len(sw_statuses)
+        sw_conf = existing.get("swing_confirmed") if has_swing_counts else sum(1 for s in sw_statuses if is_swing_confirmed_or_watch(s))
+        sw_rej = existing.get("swing_rejected") if has_swing_counts else max(0, sw_sel - sw_conf)
+
+        mom_sel = existing.get("momentum_selected") if has_mom_counts else len(mom_statuses)
+        mom_conf = existing.get("momentum_confirmed") if has_mom_counts else sum(1 for s in mom_statuses if is_momentum_confirmed_or_watch(s))
+        mom_rej = existing.get("momentum_rejected") if has_mom_counts else max(0, mom_sel - mom_conf)
+
+        res_item = {
+            "trade_date": date_str,
+            "swing_selected": sw_sel,
+            "swing_confirmed": sw_conf,
+            "swing_rejected": sw_rej,
+            "momentum_selected": mom_sel,
+            "momentum_confirmed": mom_conf,
+            "momentum_rejected": mom_rej,
+        }
+        daily_map[date_str] = res_item
+
+        # Automatically sync complete doc to daily_tradingview_counts if missing
+        if not existing or not has_swing_counts or not has_mom_counts:
+            try:
+                await db.daily_tradingview_counts.update_one(
+                    {"trade_date": date_str},
+                    {
+                        "$set": {
+                            "swing_selected": sw_sel,
+                            "swing_confirmed": sw_conf,
+                            "swing_rejected": sw_rej,
+                            "momentum_selected": mom_sel,
+                            "momentum_confirmed": mom_conf,
+                            "momentum_rejected": mom_rej,
+                            "updated_at": datetime.utcnow().isoformat() + "Z",
+                        },
+                        "$setOnInsert": {
+                            "trade_date": date_str,
+                        },
+                    },
+                    upsert=True,
+                )
+            except Exception:
+                pass
+
+    last_updated = datetime.utcnow().isoformat() + "Z"
+
+    return {
+        "summary": {
+            "total_days": len(daily_map),
+            "last_updated": last_updated,
+        },
+        "available_years": sorted(list(years_set), reverse=True) if years_set else [2026],
+        "daily_map": daily_map,
+    }
+
+
+

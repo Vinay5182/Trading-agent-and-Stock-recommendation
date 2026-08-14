@@ -36,13 +36,12 @@ async def lifespan(app):
     from services.mongo_indexes import ensure_active_indexes
     from services.paper_automation import initialize_scheduler_status, shutdown_paper_automation, start_paper_automation_once
     from ai.daily_ohlcv_collector import shutdown_daily_ohlcv_scheduler, start_daily_ohlcv_scheduler_once
+    from services.ml_outcome_evaluator import start_ml_outcome_evaluator_once, shutdown_ml_outcome_evaluator
 
     automation_started = False
     daily_ohlcv_scheduler_started = False
+    ml_evaluator_started = False
     try:
-        from services.ml_pipeline import ml_pipeline
-        await ml_pipeline.initialize_indexes()
-        
         index_summary = await ensure_active_indexes(get_database())
         logger.info(
             "Critical Mongo indexes verified expected=%s verified=%s created=%s",
@@ -64,8 +63,16 @@ async def lifespan(app):
         if daily_task is not None:
             daily_ohlcv_scheduler_started = True
             logger.info("Registered daily OHLCV scheduler background task name=%s", daily_task.get_name())
+            
+        ml_eval_task = start_ml_outcome_evaluator_once(get_database)
+        if ml_eval_task is not None:
+            ml_evaluator_started = True
+            logger.info("Registered ML Outcome Evaluator background task name=%s", ml_eval_task.get_name())
+            
         yield
     finally:
+        if ml_evaluator_started:
+            await shutdown_ml_outcome_evaluator()
         if daily_ohlcv_scheduler_started:
             await shutdown_daily_ohlcv_scheduler()
         if automation_started:

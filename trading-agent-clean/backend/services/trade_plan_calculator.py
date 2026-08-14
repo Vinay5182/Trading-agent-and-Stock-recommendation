@@ -15,7 +15,7 @@ def tick_round(val: float | None, tick: float = 0.05) -> float | None:
     except (TypeError, ValueError):
         return None
 
-def get_grade_params(grade: str) -> tuple[float, float] | None:
+def get_grade_params(grade: str) -> tuple[float, float]:
     grade_clean = str(grade or "").strip().upper().replace(" ", "_").replace("-", "_")
     if grade_clean in {"A+", "A_PLUS"}:
         return settings.GRADE_RISK_PERCENT_A_PLUS, settings.GRADE_MARGIN_CAP_A_PLUS
@@ -23,7 +23,7 @@ def get_grade_params(grade: str) -> tuple[float, float] | None:
         return settings.GRADE_RISK_PERCENT_A, settings.GRADE_MARGIN_CAP_A
     elif grade_clean == "B":
         return settings.GRADE_RISK_PERCENT_B, settings.GRADE_MARGIN_CAP_B
-    return None
+    return settings.GRADE_RISK_PERCENT_B, settings.GRADE_MARGIN_CAP_B
 
 def calculate_trade_plan(
     strategy_type: str,
@@ -178,6 +178,7 @@ def calculate_trade_plan(
         if level is not None and level > entry_price:
             valid_zones.append(zone)
 
+    prev_target = entry_price
     for idx, raw_target in enumerate([t1_raw, t2_raw, t3_raw]):
         tolerance = raw_target * (tol_pct / 100.0)
         case_a_candidates = []
@@ -185,6 +186,8 @@ def calculate_trade_plan(
 
         for zone in valid_zones:
             level = zone["level"]
+            if level <= prev_target + 1e-4:
+                continue
             if abs(level - raw_target) <= tolerance:
                 case_a_candidates.append(zone)
             elif level < raw_target - tolerance:
@@ -200,6 +203,7 @@ def calculate_trade_plan(
             else:
                 target_flags.append("STRUCTURE_CONFIRMED")
             target_structures.append(selected)
+            prev_target = level_rounded
         elif case_b_candidates:
             selected = max(case_b_candidates, key=lambda z: z["level"])
             level_rounded = tick_round(selected["level"], tick_size)
@@ -207,6 +211,7 @@ def calculate_trade_plan(
             target_confidences.append("HIGH")
             target_flags.append("STRUCTURE_CAPS_TARGET_BELOW_RAW_R")
             target_structures.append(selected)
+            prev_target = level_rounded
         else:
             final_targets.append(raw_target)
             target_confidences.append("LOW")
@@ -216,6 +221,7 @@ def calculate_trade_plan(
                 "source": "NONE_R_MULTIPLE_ONLY",
                 "timeframe": "N/A"
             })
+            prev_target = raw_target
 
     res["final_targets"] = final_targets
     res["target_confidence"] = target_confidences
@@ -254,11 +260,30 @@ def calculate_trade_plan(
     risk_budget = current_balance * (grade_risk_percent / 100.0)
     quantity_by_risk = math.floor(risk_budget / risk_per_share)
 
+    # Centralized Capital Caps (1.5% of balance, absolute ₹30,000 hard cap, 90.0% portfolio limit)
+    per_trade_cap_pct = getattr(settings, "PER_TRADE_CAPITAL_ALLOCATION_PERCENT", 1.5)
+    max_per_trade_cap = getattr(settings, "MAX_PER_TRADE_CAPITAL", 30000.0)
+    pct_capital_limit = current_balance * (per_trade_cap_pct / 100.0)
+    max_trade_capital = min(pct_capital_limit, max_per_trade_cap)
+    quantity_by_capital_cap = math.floor((max_trade_capital * settings.LEVERAGE) / entry_price)
+
+    portfolio_util_cap_pct = getattr(settings, "PORTFOLIO_MARGIN_UTILIZATION_CAP_PERCENT", 90.0)
+    portfolio_margin_limit = current_balance * (portfolio_util_cap_pct / 100.0)
+    open_margin = current_balance - available_margin
+    remaining_portfolio_capacity = max(0.0, portfolio_margin_limit - open_margin)
+    quantity_by_portfolio_capacity = math.floor((remaining_portfolio_capacity * leverage) / entry_price)
+
     grade_margin_capital = current_balance * (grade_margin_cap_percent / 100.0)
     quantity_by_grade_margin = math.floor(grade_margin_capital * leverage / entry_price)
     quantity_by_available_margin = math.floor(available_margin * leverage / entry_price)
 
-    final_quantity = min(quantity_by_risk, quantity_by_grade_margin, quantity_by_available_margin)
+    final_quantity = min(
+        quantity_by_risk,
+        quantity_by_grade_margin,
+        quantity_by_capital_cap,
+        quantity_by_available_margin,
+        quantity_by_portfolio_capacity,
+    )
 
     quantity_for_minimum_margin = math.ceil((settings.MINIMUM_ENTRY_MARGIN * leverage) / entry_price)
     minimum_allowed_quantity = max(4, quantity_for_minimum_margin)
@@ -266,19 +291,27 @@ def calculate_trade_plan(
     res["risk_budget"] = round(risk_budget, 4)
     res["quantity_by_risk"] = quantity_by_risk
     res["quantity_by_grade_margin"] = quantity_by_grade_margin
+    res["quantity_by_capital_cap"] = quantity_by_capital_cap
     res["quantity_by_available_margin"] = quantity_by_available_margin
+    res["quantity_by_portfolio_capacity"] = quantity_by_portfolio_capacity
     res["quantity_for_minimum_margin"] = quantity_for_minimum_margin
     res["minimum_allowed_quantity"] = minimum_allowed_quantity
     res["final_quantity"] = final_quantity
 
     if final_quantity < minimum_allowed_quantity:
         res["activation_allowed"] = False
-        if quantity_by_risk < minimum_allowed_quantity:
-            res["block_code"] = "RISK_QUANTITY_BELOW_MINIMUM"
-            res["block_message"] = f"Quantity by risk ({quantity_by_risk}) is below minimum allowed ({minimum_allowed_quantity})."
-        elif quantity_by_available_margin < minimum_allowed_quantity:
+        if quantity_by_available_margin < minimum_allowed_quantity:
             res["block_code"] = "INSUFFICIENT_AVAILABLE_MARGIN"
             res["block_message"] = "Available margin is insufficient to support minimum allowed quantity."
+        elif quantity_by_risk < minimum_allowed_quantity:
+            res["block_code"] = "RISK_QUANTITY_BELOW_MINIMUM"
+            res["block_message"] = f"Quantity by risk ({quantity_by_risk}) is below minimum allowed ({minimum_allowed_quantity})."
+        elif quantity_by_capital_cap < minimum_allowed_quantity:
+            res["block_code"] = "PER_TRADE_CAPITAL_LIMIT_EXCEEDED"
+            res["block_message"] = "Per-trade capital allocation limit exceeded."
+        elif quantity_by_portfolio_capacity < minimum_allowed_quantity:
+            res["block_code"] = "PORTFOLIO_MARGIN_LIMIT_EXCEEDED"
+            res["block_message"] = "Portfolio margin limit exceeded."
         elif quantity_by_grade_margin < minimum_allowed_quantity:
             res["block_code"] = "GRADE_MARGIN_CAP_TOO_LOW"
             res["block_message"] = "Setup grade margin cap is too low to support minimum allowed quantity."

@@ -172,9 +172,9 @@ class TradingViewExecutionManager:
     def _clear_live_attachment(self) -> None:
         self._attached_target = None
         self._current_tab_id = None
-        self._connected = False
         self._cached_preflight = None
         self._preflight_updated_at = 0.0
+        self._connected = False
 
     @staticmethod
     def _now() -> str:
@@ -403,14 +403,20 @@ class TradingViewExecutionManager:
         try:
             client.connect_to_debug_port()
             tabs = client.list_tabs()
-        except Exception:
+        except Exception as exc:
+            logger.error("CDP unavailable during restart validation: %s", exc)
             self._clear_live_attachment()
             return
         valid_charts = [t for t in tabs if is_real_tradingview_chart_target(t)]
         target_tab = next((t for t in valid_charts if t.get("id") == pref_id), None)
         if not target_tab:
+            logger.info("Stale saved TradingView tab removed on restart (ID: %s)", pref_id)
             self._clear_live_attachment()
-            return
+            if len(valid_charts) == 1:
+                logger.info("Auto-attaching to single valid chart on restart")
+                target_tab = valid_charts[0]
+            else:
+                return
         try:
             readiness = client.read_chart_readiness(target_tab)
             if readiness.get("activeChartAvailable"):
@@ -426,6 +432,8 @@ class TradingViewExecutionManager:
                 }
                 self._current_tab_id = str(target_payload.get("target_id"))
                 self._connected = True
+                self._save_preference(self._attached_target)
+                logger.info("Successfully validated/attached to TradingView chart tab on restart: %s", self._current_tab_id)
             else:
                 self._clear_live_attachment()
         except Exception:
@@ -456,6 +464,7 @@ class TradingViewExecutionManager:
                 "message": f"TradingView CDP port {settings.TRADINGVIEW_DEBUG_PORT} is unreachable: {str(exc)}",
                 "sanitized_error": str(exc),
             }
+            logger.error("CDP unavailable: %s", exc)
             raise TradingViewPreflightError("TV_CDP_UNREACHABLE", details["message"], details)
 
         open_charts = [t for t in tabs if is_real_tradingview_chart_target(t)]
@@ -467,6 +476,7 @@ class TradingViewExecutionManager:
             attached_tab = next((t for t in open_charts if str(t.get("id")) == str(attached_id)), None)
             if not attached_tab:
                 # Stale preference target, clear it
+                logger.info("Stale TradingView tab removed (ID: %s)", attached_id)
                 self._clear_live_attachment()
                 attached_id = None
 
@@ -488,6 +498,7 @@ class TradingViewExecutionManager:
                     "message": "No open TradingView chart tabs found in TradingView Desktop",
                     "sanitized_error": None,
                 }
+                logger.warning("No TradingView chart tabs open. Manual attachment required.")
                 raise TradingViewPreflightError("TV_NO_VALID_CHART_TAB", details["message"], details)
             elif valid_target_count == 1:
                 if not allow_single_tab_auto_attach:
@@ -535,6 +546,7 @@ class TradingViewExecutionManager:
                     attached_snapshot = self.attach_target(target_payload)
                     attached_id = self.attached_target_id
                     attached_tab = tab_to_attach
+                    logger.info("Successfully auto-attached to TradingView chart tab: %s", attached_id)
                 else:
                     details = {
                         "state": "ATTACHED_NOT_READY",
@@ -569,6 +581,7 @@ class TradingViewExecutionManager:
                     "message": f"Multiple TradingView chart tabs ({valid_target_count}) are open. Please select one in Settings.",
                     "sanitized_error": None,
                 }
+                logger.warning("Multiple TradingView tabs open (%d). Manual selection required.", valid_target_count)
                 raise TradingViewPreflightError("TV_MULTIPLE_TABS_SELECTION_REQUIRED", details["message"], details)
 
         # Now attached target exists: verify it's still alive and activeChart is ready
@@ -755,18 +768,21 @@ class TradingViewExecutionManager:
                             sanitized_error = str(exc)
                             state = "ERROR"
                             self._clear_live_attachment()
+                            attached_id = None
                     else:
-                        preflight_code = "TV_NO_VALID_CHART_TAB"
-                        preflight_message = "Attached tab is no longer open"
-                        state = "NO_VALID_CHART_TAB"
+                        logger.info("Stale TradingView tab removed during preflight check (ID: %s)", attached_id)
                         self._clear_live_attachment()
-                else:
+                        attached_id = None
+                
+                if not attached_id:
                     if valid_chart_target_count == 1:
+                        logger.info("One TradingView tab open. Pending auto-attachment on next operation.")
                         preflight_code = "TV_TAB_NOT_ATTACHED"
                         preflight_message = "One TradingView tab is open and will be auto-attached on run"
                         state = "SINGLE_TAB_PENDING"
                         manual_attachment_required = False
                     elif len(open_charts) == 0:
+                        logger.warning("No TradingView chart tabs open.")
                         preflight_code = "TV_NO_VALID_CHART_TAB"
                         preflight_message = "No TradingView chart tabs open"
                         state = "NO_VALID_CHART_TAB"
@@ -776,11 +792,13 @@ class TradingViewExecutionManager:
                         preflight_message = "TradingView tab found but chart API is not ready"
                         state = "ATTACHED_NOT_READY"
                     elif valid_chart_target_count > 1:
+                        logger.warning("Multiple TradingView tabs open (%d). Manual selection required.", valid_chart_target_count)
                         preflight_code = "TV_MULTIPLE_TABS_SELECTION_REQUIRED"
                         preflight_message = f"Multiple TradingView tabs open ({valid_chart_target_count}). Manual selection required."
                         state = "MULTIPLE_TABS_SELECTION_REQUIRED"
                         manual_attachment_required = True
             except Exception as exc:
+                logger.error("CDP unavailable during preflight: %s", exc)
                 cdp_reachable = False
                 preflight_code = "TV_CDP_UNREACHABLE"
                 preflight_message = f"TradingView CDP port {settings.TRADINGVIEW_DEBUG_PORT} is unreachable: {str(exc)}"

@@ -59,18 +59,10 @@ class ScanResponse(BaseModel):
     provider_calls: bool = False
 
 
-def normalize_symbol(symbol: str | None) -> str:
-    if not symbol:
-        return ""
-    normalized = symbol.upper().strip()
-    for suffix in (".NS", ".BO", "-EQ"):
-        if normalized.endswith(suffix):
-            normalized = normalized[: -len(suffix)]
-    return "".join(ch for ch in normalized if ch.isalnum())
-
+from utils.symbol_utils import normalize_symbol
 
 def _scan_quote_from_provider_quote(quote_row: dict[str, Any]) -> dict[str, Any]:
-    symbol = normalize_symbol(quote_row.get("canonical_symbol") or quote_row.get("symbol"))
+    symbol = normalize_symbol("NSE", quote_row.get("canonical_symbol") or quote_row.get("symbol"))
     row = {
         "symbol": symbol,
         "current_price": quote_row.get("current_price"),
@@ -173,7 +165,6 @@ def scan_row_from_quote(symbol: str, quote_row: dict[str, Any], scan_run_id: str
         "status": "SCANNED",
         "selected_for_tv": False,
         "momentum_candidate": False,
-        "created_at": now,
         "updated_at": now,
         **quote_row,
     }
@@ -189,6 +180,102 @@ async def ensure_scan_indexes(db) -> dict:
             for spec in get_collection_index_specs(collection_name)
         ]
     }
+
+
+async def sync_scan_rows_from_market_data(
+    db,
+    rows: list[dict[str, Any]],
+    selected_index: str,
+    force_refresh: bool = False,
+    now: str | None = None,
+    lease=None,
+) -> str:
+    await ensure_scan_indexes(db)
+    now = now or datetime.utcnow().isoformat()
+    scan_run_id = f"scan-{uuid4().hex}"
+
+    scan_rows = []
+    for r in rows:
+        source = r.get("source_used")
+        if source in ("SKIPPED_INVALID_SYMBOL", "FETCH_FAILED") and not r.get("current_price") and not r.get("ltp"):
+            continue
+
+        symbol = r.get("canonical_symbol") or r.get("symbol")
+        if not symbol:
+            continue
+
+        price = r.get("current_price") or r.get("ltp")
+        vol = r.get("traded_volume") if r.get("traded_volume") is not None else r.get("volume")
+
+        row = {
+            "scan_run_id": scan_run_id,
+            "selected_index": selected_index,
+            "index_name": selected_index,
+            "exchange": r.get("exchange", "NSE"),
+            "symbol": symbol,
+            "canonical_symbol": symbol,
+            "tradingview_symbol": r.get("tradingview_symbol") or f"NSE:{symbol}",
+            "status": "SCANNED",
+            "reason": r.get("error"),
+            "selected_for_tv": False,
+            "momentum_candidate": False,
+            "updated_at": now,
+            "current_price": price,
+            "ltp": price,
+            "previous_close": r.get("previous_close"),
+            "open_price": r.get("open_price"),
+            "day_high": r.get("day_high"),
+            "day_low": r.get("day_low"),
+            "change_percent": r.get("change_percent"),
+            "traded_volume": vol,
+            "volume": vol,
+            "traded_value": r.get("traded_value"),
+            "primary_source": r.get("primary_source") or r.get("source_used") or "NSE_COMPONENT_INDEX",
+            "source_used": r.get("source_used") or "NSE",
+        }
+        scan_rows.append({k: v for k, v in row.items() if v is not None})
+
+    result = None
+    if scan_rows:
+        from pymongo import UpdateOne
+
+        def _clean_set_payload(r: dict[str, Any]) -> dict[str, Any]:
+            doc = dict(r)
+            doc.pop("created_at", None)
+            return doc
+
+        result = await db.scan_rows.bulk_write(
+            [
+                UpdateOne(
+                    {"scan_run_id": scan_run_id, "symbol": row["symbol"]},
+                    {"$set": _clean_set_payload(row), "$setOnInsert": {"created_at": now}},
+                    upsert=True,
+                )
+                for row in scan_rows
+            ],
+            ordered=False,
+        )
+        if result is not None:
+            await db.scan_rows.delete_many({"scan_run_id": {"$ne": scan_run_id}})
+
+    await db.scan_runs.update_one(
+        {"scan_run_id": scan_run_id},
+        {
+            "$set": {
+                "scan_run_id": scan_run_id,
+                "selected_index": selected_index,
+                "requested_limit": len(scan_rows),
+                "force_refresh": force_refresh,
+                "rows_count": len(scan_rows),
+                "diagnostics": {"source": "market_load_all_sync", "total_market_rows": len(rows)},
+                "updated_at": now,
+            },
+            "$setOnInsert": {"created_at": now},
+        },
+        upsert=True,
+    )
+    logger.info("Synchronized %d scan_rows for scan_run_id %s", len(scan_rows), scan_run_id)
+    return scan_run_id
 
 
 async def _run_scan_real(db, request: ScanRequest, selected_index: str, lease=None) -> dict:
@@ -214,17 +301,27 @@ async def _run_scan_real(db, request: ScanRequest, selected_index: str, lease=No
     if rows:
         from pymongo import UpdateOne
 
+        def _clean_set_payload(r: dict[str, Any]) -> dict[str, Any]:
+            doc = dict(r)
+            doc.pop("created_at", None)
+            return doc
+
         result = await db.scan_rows.bulk_write(
             [
                 UpdateOne(
                     {"scan_run_id": scan_run_id, "symbol": row["symbol"]},
-                    {"$set": row, "$setOnInsert": {"created_at": now}},
+                    {"$set": _clean_set_payload(row), "$setOnInsert": {"created_at": now}},
                     upsert=True,
                 )
                 for row in rows
             ],
             ordered=False,
         )
+        # Rolling snapshot maintenance: Prune historical scan rows from previous runs
+        # ONLY after the current scan's bulk_write has completed successfully.
+        if result is not None:
+            await db.scan_rows.delete_many({"scan_run_id": {"$ne": scan_run_id}})
+
     if lease is not None:
         await lease.renew()
     await db.scan_runs.update_one(
@@ -243,6 +340,12 @@ async def _run_scan_real(db, request: ScanRequest, selected_index: str, lease=No
         },
         upsert=True,
     )
+    # --- Auto-refresh market context after BROAD_MARKET_750 scan ---
+    if selected_index == "BROAD_MARKET_750" and rows:
+        try:
+            await _refresh_market_context(db, rows, now)
+        except Exception:
+            logger.warning("Market context refresh failed after scan", exc_info=True)
     return {
         "scan_run_id": scan_run_id,
         "selected_index": selected_index,
@@ -256,6 +359,26 @@ async def _run_scan_real(db, request: ScanRequest, selected_index: str, lease=No
         "mongo_writes": True,
         "provider_calls": True,
     }
+
+
+async def _refresh_market_context(db, rows: list[dict[str, Any]], now_iso: str) -> None:
+    """Build and upsert market + sector context from scan rows."""
+    from services.market_context_builder import build_market_and_sector_context
+    from services.ml_market_repository import MLMarketRepository
+
+    # Use IST date as trade_date (scan runs during Indian market hours)
+    trade_date = datetime.utcnow().strftime("%Y-%m-%d")
+
+    market_ctx, sector_ctxs = build_market_and_sector_context(rows, trade_date)
+
+    # Upsert market context and sector context atomically
+    await MLMarketRepository.insert_market_context(market_ctx, sector_context=sector_ctxs)
+
+    logger.info(
+        "Market context refreshed for %s: %d sectors",
+        trade_date, len(sector_ctxs),
+    )
+
 
 
 @router.post("", response_model=ScanResponse)

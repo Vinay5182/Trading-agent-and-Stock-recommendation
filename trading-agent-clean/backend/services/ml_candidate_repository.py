@@ -21,6 +21,7 @@ class MLCandidateRepository:
         try:
             collection = cls.get_collection()
             await collection.create_index("candidate_id", unique=True)
+            await collection.create_index([("symbol", 1), ("candidate_type", 1), ("setup_date", 1)], unique=True)
             await collection.create_index("paper_trade_id")
             await collection.create_index("setup_date")
             await collection.create_index("symbol")
@@ -45,6 +46,7 @@ class MLCandidateRepository:
             )
             return True
         except DuplicateKeyError:
+            logger.warning(f"Duplicate ML candidate rejected for {candidate_data.get('symbol')} on {candidate_data.get('setup_date')} ({candidate_data.get('candidate_type')})")
             return False
         except Exception as e:
             logger.error(f"Error inserting ML candidate {candidate_data.get('candidate_id')}: {e}")

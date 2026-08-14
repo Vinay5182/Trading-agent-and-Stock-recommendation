@@ -55,12 +55,30 @@ def calculate_proposed_sizing(
     risk_budget = current_balance * (grade_risk_percent / 100.0)
     quantity_by_risk = floor(risk_budget / stop_distance)
 
+    # Centralized Capital Caps (1.5% of balance, absolute ₹30,000 hard cap, 90.0% portfolio limit)
+    per_trade_cap_pct = getattr(settings, "PER_TRADE_CAPITAL_ALLOCATION_PERCENT", 1.5)
+    max_per_trade_cap = getattr(settings, "MAX_PER_TRADE_CAPITAL", 30000.0)
+    pct_capital_limit = current_balance * (per_trade_cap_pct / 100.0)
+    max_trade_capital = min(pct_capital_limit, max_per_trade_cap)
+    quantity_by_capital_cap = floor((max_trade_capital * settings.LEVERAGE) / entry_price)
+
+    portfolio_util_cap_pct = getattr(settings, "PORTFOLIO_MARGIN_UTILIZATION_CAP_PERCENT", 90.0)
+    portfolio_margin_limit = current_balance * (portfolio_util_cap_pct / 100.0)
+    remaining_portfolio_capacity = max(0.0, portfolio_margin_limit - open_margin)
+    quantity_by_portfolio_capacity = floor((remaining_portfolio_capacity * settings.LEVERAGE) / entry_price)
+
     grade_margin_capital = current_balance * (grade_margin_cap / 100.0)
-    quantity_by_grade_margin = floor(grade_margin_capital * settings.LEVERAGE / entry_price)
-    quantity_by_available_margin = floor(available_margin * settings.LEVERAGE / entry_price)
+    quantity_by_grade_margin = floor((grade_margin_capital * settings.LEVERAGE) / entry_price)
+    quantity_by_available_margin = floor((available_margin * settings.LEVERAGE) / entry_price)
 
     # Sizing checks treat all quantities as ceilings using min()
-    final_quantity = min(quantity_by_risk, quantity_by_grade_margin, quantity_by_available_margin)
+    final_quantity = min(
+        quantity_by_risk,
+        quantity_by_grade_margin,
+        quantity_by_capital_cap,
+        quantity_by_available_margin,
+        quantity_by_portfolio_capacity
+    )
 
     # Minimum entry-margin requirement
     if paper_mode and getattr(settings, "PAPER_ALLOW_SMALL_RISK_SIZED_POSITIONS", False):
@@ -70,10 +88,14 @@ def calculate_proposed_sizing(
         minimum_allowed_quantity = max(4, quantity_for_minimum_margin)
 
     if final_quantity < minimum_allowed_quantity:
-        if quantity_by_risk < minimum_allowed_quantity:
-            return {"ok": False, "reason": "RISK_QUANTITY_BELOW_MINIMUM"}
-        elif quantity_by_available_margin < minimum_allowed_quantity:
+        if quantity_by_available_margin < minimum_allowed_quantity:
             return {"ok": False, "reason": "INSUFFICIENT_AVAILABLE_MARGIN"}
+        elif quantity_by_risk < minimum_allowed_quantity:
+            return {"ok": False, "reason": "RISK_QUANTITY_BELOW_MINIMUM"}
+        elif quantity_by_capital_cap < minimum_allowed_quantity:
+            return {"ok": False, "reason": "PER_TRADE_CAPITAL_LIMIT_EXCEEDED"}
+        elif quantity_by_portfolio_capacity < minimum_allowed_quantity:
+            return {"ok": False, "reason": "PORTFOLIO_MARGIN_LIMIT_EXCEEDED"}
         elif quantity_by_grade_margin < minimum_allowed_quantity:
             return {"ok": False, "reason": "GRADE_MARGIN_CAP_TOO_LOW"}
         else:
@@ -83,13 +105,16 @@ def calculate_proposed_sizing(
     required_margin = exposure / settings.LEVERAGE
     estimated_sl_risk = final_quantity * stop_distance
 
-    if required_margin > current_balance * (grade_margin_cap / 100.0):
+    if required_margin > max_trade_capital + 1e-4:
+        return {"ok": False, "reason": "PER_TRADE_CAPITAL_LIMIT_EXCEEDED"}
+
+    if required_margin > (current_balance * (grade_margin_cap / 100.0)) + 1e-4:
         return {"ok": False, "reason": "GRADE_MARGIN_CAP_EXCEEDED"}
 
     if required_margin > available_margin:
         return {"ok": False, "reason": "INSUFFICIENT_MARGIN"}
 
-    if open_margin + required_margin > current_balance * (settings.PORTFOLIO_MARGIN_LIMIT_PERCENT / 100.0):
+    if open_margin + required_margin > portfolio_margin_limit:
         return {"ok": False, "reason": "PORTFOLIO_MARGIN_LIMIT_EXCEEDED"}
 
     if combined_open_risk + estimated_sl_risk > current_balance * (settings.PORTFOLIO_RISK_LIMIT_PERCENT / 100.0):
@@ -115,7 +140,8 @@ def adjust_accounting_on_quantity_change(plan: dict, updated: dict) -> dict:
     TERMINAL_STATUSES = {
         "AMBIGUOUS", "CLOSED", "COMPLETED", "EXPIRED", "LOST_SL", "SL_HIT", "STOP_HIT",
         "STOPPED", "STOPPED_AFTER_T1", "T1_HIT", "T2_HIT", "T3_HIT", "TARGET_HIT",
-        "TARGET_1_HIT_FINAL", "TARGET_2_HIT", "TARGET_3_HIT", "WON_T1", "WON_T2", "WON_T3"
+        "TARGET_1_HIT_FINAL", "TARGET_2_HIT", "TARGET_3_HIT", "WON_T1", "WON_T2", "WON_T3",
+        "ENTRY_MISSED_GAP_UP"
     }
 
     old_status = str(plan.get("status") or "").upper()

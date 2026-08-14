@@ -16,7 +16,7 @@ class MLDecisionRepository:
     async def create_indexes(cls):
         try:
             collection = cls.get_collection()
-            await collection.create_index("candidate_id")
+            await collection.create_index([("candidate_id", 1), ("decision_type", 1)], unique=True)
             await collection.create_index("paper_trade_id")
             await collection.create_index("decision_type")
             await collection.create_index("created_at")
@@ -26,8 +26,16 @@ class MLDecisionRepository:
     @classmethod
     async def insert_decision(cls, decision_data: Dict[str, Any]) -> bool:
         try:
-            # Decisions are likely append-only
-            await cls.get_collection().insert_one(decision_data)
+            candidate_id = decision_data.get("candidate_id")
+            decision_type = decision_data.get("decision_type", "TRADE_CLOSURE")
+            if not candidate_id:
+                logger.error("insert_decision called without candidate_id")
+                return False
+            await cls.get_collection().update_one(
+                {"candidate_id": candidate_id, "decision_type": decision_type},
+                {"$setOnInsert": decision_data},
+                upsert=True
+            )
             return True
         except DuplicateKeyError:
             return False

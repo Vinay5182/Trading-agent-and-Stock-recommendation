@@ -21,6 +21,9 @@ def trade_open_margin_used(trade: dict) -> float:
     """
     Returns the open margin reserved by the trade, prioritizing stored fields.
     """
+    if trade.get("historical_dataset_mode"):
+        return 0.0
+
     # Prefer stored margin_remaining
     margin = trade.get("margin_remaining")
     if margin is not None:
@@ -38,6 +41,8 @@ def trade_open_sl_risk(trade: dict) -> float:
     """
     Returns the open stop-loss risk of the trade, prioritizing stored fields.
     """
+    if trade.get("historical_dataset_mode"):
+        return 0.0
     # Prefer stored open_sl_risk
     risk = trade.get("open_sl_risk")
     if risk is not None:
@@ -116,13 +121,45 @@ async def try_activate_trade_with_capital(db, trade_id, current_state_version, n
             return {"ok": False, "reason": "LOCK_ALREADY_HELD", "lock": lock_result.get("lock")}
 
     try:
-        # 2. Re-read Trade
-        q_id = ObjectId(trade_id) if ObjectId.is_valid(trade_id) else trade_id
-        trade = await db.paper_trades.find_one({"_id": q_id, "paper_only": True})
+        # 2. Re-read Trade (support string and ObjectId _id format)
+        trade = await db.paper_trades.find_one({"_id": trade_id, "paper_only": True})
+        if not trade and ObjectId.is_valid(trade_id):
+            trade = await db.paper_trades.find_one({"_id": ObjectId(trade_id), "paper_only": True})
         if not trade:
             return {"ok": False, "reason": "TRADE_NOT_FOUND"}
 
-        # 3. Verify Status & Version
+        # 3. Verify Status & Version & Historical Dataset Mode
+        if trade.get("historical_dataset_mode"):
+            final_q = trade.get("quantity") or trade.get("proposed_quantity") or 1
+            update_doc = {
+                "status": "ACTIVE",
+                "outcome_status": "ACTIVE",
+                "state": "ACTIVE",
+                "status_updated_at": now,
+                "entry_triggered": True,
+                "entry_triggered_at": trade.get("entry_triggered_at") or now,
+                "original_quantity": final_q,
+                "quantity_remaining": final_q,
+                "initial_margin_reserved": 0.0,
+                "margin_remaining": 0.0,
+                "initial_sl_risk": 0.0,
+                "open_sl_risk": 0.0,
+                "exposure": 0.0,
+                "capital_model_version": trade.get("capital_model_version") or "v2",
+                "margin_released_total": 0.0,
+                "activation_blocked_reason": None,
+                "capital_rejection_reason": None,
+            }
+            res = await db.paper_trades.update_one(
+                {"_id": trade["_id"], "status": {"$in": ["WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL"]}, "state_version": current_state_version},
+                {"$set": update_doc, "$inc": {"state_version": 1}},
+                upsert=False
+            )
+            if res.modified_count > 0:
+                return {"ok": True, "activated": True, "quantity": final_q}
+            else:
+                return {"ok": False, "reason": "STATE_VERSION_CONFLICT"}
+
         status = trade.get("status")
         if status not in ("WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL"):
             return {"ok": False, "reason": "INVALID_PRECONDITION_STATUS", "status": status}

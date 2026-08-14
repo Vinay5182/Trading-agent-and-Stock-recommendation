@@ -86,10 +86,24 @@ graph TD
 - **How it works:** Uses mathematical bands to score metrics like price strength, relative volume, 30-day momentum, and proximity to the day's high/low.
 - **Why it exists:** Highlights the top actionable candidates for the day without manual chart screening.
 
-### TradingView Confirmation
-- **What it does:** Automatically opens a stock chart on TradingView, sets the correct timeframe, and extracts candle data to validate the setup.
-- **How it works:** Uses `websockets` to connect to Chrome's debugging port (`9222`). It injects JavaScript (`Runtime.evaluate`) to interact with the `window.TradingViewApi`.
-- **Why it exists:** Ensures that the backend logic is confirmed by actual chart data (preventing false positives from bad exchange data) and extracts indicator values like ATR and EMA.
+### TradingView Confirmation Pipeline & Lifecycle Architecture
+- **What it does:** Automatically opens a stock chart on TradingView, sets the correct timeframe, extracts multi-timeframe (MTF) candle data, calculates entry/stop/target levels, evaluates risk rules, and determines the final candidate lifecycle status.
+- **Pipeline Workflow (5 Steps):**
+  1. *Technical Chart Analysis*: Extracts 1W, 1D, 4H, and 1H candle data via CDP (`tv_client.py`).
+  2. *Multi-Timeframe Validation*: Verifies alignment across higher and lower timeframes (`tv_confirmation.py`).
+  3. *Trade Plan Construction*: Computes entry, stop-loss, and target ladder levels (`trade_plan_calculator.py`).
+  4. *Risk & Target Validation*: Evaluates R:R ratio ($\ge 2.0$), fake breakouts, retail traps, and target structure collisions.
+  5. *Final Lifecycle Determination*: Synchronizes macro candidate status (`tv_status`) with micro trade plan validity and readiness (`apply_trade_quality`).
+- **Meaning of `tv_status` Values:**
+  - `CONFIRMED_SIGNAL`: Swing setup with confirmed technical alignment, valid trade plan, and clean risk profile.
+  - `MOMENTUM_CONFIRMED`: Momentum setup with confirmed momentum alignment, valid trade plan, and clean risk profile.
+  - `WAIT_FOR_RETEST`: Valid swing setup technically, awaiting price retest trigger before trade activation.
+  - `WAIT_FOR_PULLBACK`: Valid momentum setup technically, awaiting price pullback trigger before trade activation.
+  - `REJECTED`: Setup rejected due to unaligned MTF structure, high risk flags, or downstream plan validation / target structure collision.
+  - `TECHNICAL_FAILED`: Infrastructure failure (CDP attachment timeout, symbol mismatch, timeframe mismatch, missing candles, or schema error).
+- **Lifecycle Synchronization & Non-Lossy Rejection:**
+  `tv_status` represents the *final lifecycle state* of the pipeline, not merely the raw chart verdict. If a setup passes chart alignment but fails downstream plan validation (e.g. `TARGET_STRUCTURE_COLLISION` or `RISK_REWARD_BELOW_2`), `tv_status` is synchronized to `REJECTED` to prevent internal contradictions (such as `tv_status = CONFIRMED_SIGNAL` alongside `entry_readiness = NO_TRADE`).
+  The exact rejection rationale remains 100% preserved in `avoid_reason`, `paper_plan_reason`, `trade_quality_grade`, `confidence_score`, and `timeframe_analysis`.
 
 ### Paper Trading Automation
 - **What it does:** Manages a virtual portfolio. It enters trades based on confirmed plans, monitors active positions, takes partial profits at Targets (T1, T2, T3), and triggers Stop Losses.

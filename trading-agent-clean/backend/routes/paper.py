@@ -21,6 +21,7 @@ from services.mongo_indexes import get_collection_index_specs
 from services.paper_identity import apply_setup_identity, paper_trade_setup_filter
 from services.paper_sync import sync_trade_ready
 from services.system_errors import record_system_error
+from services.trading_calendar import add_trading_days
 from services.capital_accounting import try_activate_trade_with_capital, get_current_virtual_balance_and_pnl, get_portfolio_totals, trade_open_margin_used
 
 from services.paper_update_scheduler import (
@@ -39,6 +40,7 @@ from services.trade_journal import (
     load_trade_journal,
     sync_completed_trades_to_journal,
 )
+from services.paper_orchestrator import atomic_insert_paper_trade_plan, best_effort_update_daily_dataset_from_paper_trade, should_update_daily_dataset_outcome_from_paper_trade
 from tv_client import TradingViewClient
 from tv_confirmation import PAPER_PLAN_FIELDS, build_price_action_paper_plan_from_candles, confirm_from_candles, confirm_momentum_from_candles
 
@@ -72,11 +74,12 @@ WAITING_FOR_ENTRY_STATUS = "WAITING_FOR_ENTRY"
 ENTRY_TRIGGERED_STATUS = "ENTRY_TRIGGERED"
 WAITING_FOR_CAPITAL_STATUS = "WAITING_FOR_CAPITAL"
 WAITING_STATUSES = {"NOT_TRIGGERED", "PLANNED", "WAITING", WAITING_FOR_ENTRY_STATUS, ENTRY_TRIGGERED_STATUS, WAITING_FOR_CAPITAL_STATUS}
-CANCELED_STATUSES = {"EXPIRED", "NOT_TRIGGERED"}
+CANCELED_STATUSES = {"EXPIRED", "NOT_TRIGGERED", "ENTRY_MISSED_GAP_UP", "GAP_SKIPPED", "INVALIDATED_STALE"}
 T1_PARTIAL_STATUS = "T1_PARTIAL"
 T2_PARTIAL_STATUS = "T2_PARTIAL"
 PARTIAL_STATUSES = {s for s in GENUINE_OPEN_STATUSES if s != "ACTIVE"}
 ACTIVE_STATUSES = GENUINE_OPEN_STATUSES
+ENTRY_MISSED_GAP_UP_STATUS = "ENTRY_MISSED_GAP_UP"
 TERMINAL_STATUSES = {
     "CLOSED",
     "COMPLETED",
@@ -97,6 +100,8 @@ TERMINAL_STATUSES = {
     "SL_HIT",
     "LOST_SL",
     "AMBIGUOUS",
+    "ENTRY_MISSED_GAP_UP",
+    "INVALIDATED_STALE",
 }
 PREVIOUS_DAY_LOW_FIELDS = (
     "previous_day_low",
@@ -114,10 +119,41 @@ OPEN_STATUSES = sorted(ACTIVE_STATUSES)
 NON_TERMINAL_STATUSES = sorted(WAITING_STATUSES | ACTIVE_STATUSES)
 CLOSED_STATUSES = sorted(TERMINAL_STATUSES)
 SL_HIT_STATUSES = {"SL_HIT", "STOP_HIT", "STOPPED", "STOPPED_AFTER_T1", "LOST_SL"}
-TARGET_COMPLETED_STATUSES = TERMINAL_STATUSES - SL_HIT_STATUSES - {"AMBIGUOUS", "EXPIRED", "NOT_TRIGGERED"}
+TARGET_COMPLETED_STATUSES = TERMINAL_STATUSES - SL_HIT_STATUSES - {"AMBIGUOUS", "EXPIRED", "NOT_TRIGGERED", "ENTRY_MISSED_GAP_UP", "INVALIDATED_STALE"}
 PAPER_UPDATE_LOCK_NAME = "paper_trade_outcome_update"
 PAPER_UPDATE_LOCK_TTL_SECONDS = 15 * 60
 PAPER_UPDATE_APPROVAL_TTL_SECONDS = 3 * 60
+
+LEGAL_STATE_TRANSITIONS = {
+    "WAITING_FOR_ENTRY": {"WAITING_FOR_ENTRY", "ACTIVE", "WAITING_FOR_CAPITAL", "EXPIRED", "CANCELLED", "NOT_TRIGGERED", "AMBIGUOUS", "ENTRY_MISSED_GAP_UP", "STOPPED"},
+    "PLANNED": {"WAITING_FOR_ENTRY", "ACTIVE", "WAITING_FOR_CAPITAL", "EXPIRED", "CANCELLED", "NOT_TRIGGERED", "AMBIGUOUS", "ENTRY_MISSED_GAP_UP", "STOPPED"},
+    "WAITING_FOR_CAPITAL": {"WAITING_FOR_CAPITAL", "ACTIVE", "WAITING_FOR_ENTRY", "EXPIRED", "CANCELLED", "AMBIGUOUS", "ENTRY_MISSED_GAP_UP", "STOPPED"},
+    "ACTIVE": {"ACTIVE", "T1_PARTIAL", "T2_PARTIAL", "TARGET_3_HIT", "SL_HIT", "MANUAL_EXIT", "CANCELLED", "COMPLETED", "AMBIGUOUS"},
+    "T1_PARTIAL": {"T1_PARTIAL", "T2_PARTIAL", "TARGET_3_HIT", "SL_HIT", "MANUAL_EXIT", "CANCELLED", "COMPLETED", "AMBIGUOUS"},
+    "T2_PARTIAL": {"T2_PARTIAL", "TARGET_3_HIT", "SL_HIT", "MANUAL_EXIT", "CANCELLED", "COMPLETED", "AMBIGUOUS"},
+    "TARGET_3_HIT": {"TARGET_3_HIT"},
+    "SL_HIT": {"SL_HIT"},
+    "EXPIRED": {"EXPIRED"},
+    "CANCELLED": {"CANCELLED"},
+    "MANUAL_EXIT": {"MANUAL_EXIT"},
+    "AMBIGUOUS": {"WAITING_FOR_ENTRY", "ACTIVE", "T1_PARTIAL", "T2_PARTIAL", "SL_HIT", "TARGET_3_HIT", "EXPIRED", "ENTRY_MISSED_GAP_UP"},
+    "ENTRY_MISSED_GAP_UP": {"ENTRY_MISSED_GAP_UP"},
+}
+
+def is_legal_state_transition(current_status: str | None, proposed_status: str | None) -> bool:
+    if not current_status or not proposed_status:
+        return True
+    raw_curr = normalize_status(current_status)
+    raw_prop = normalize_status(proposed_status)
+    if raw_curr == raw_prop:
+        return True
+    curr = normalized_trade_logic_status(raw_curr)
+    prop = normalized_trade_logic_status(raw_prop)
+    if curr == prop:
+        return True
+    allowed = LEGAL_STATE_TRANSITIONS.get(curr, set()) | LEGAL_STATE_TRANSITIONS.get(raw_curr, set())
+    return prop in allowed or raw_prop in allowed
+
 PAPER_UPDATE_APPROVAL_CONFIRMATION_TEXT = (
     "I understand this will write to paper_trades only and will not place broker orders"
 )
@@ -175,58 +211,15 @@ PAPER_UPDATE_APPROVED_FIELDS = {
     "capital_model_version",
     "margin_released_total",
     "capital_rejection_reason",
+    "sl_updated_at",
+    "bars_held",
+    "holding_days",
+    "days_held",
+    "entry_date",
+    "exit_date",
 }
 
 
-def should_update_daily_dataset_outcome_from_paper_trade(trade: dict) -> bool:
-    statuses = trade_statuses(trade)
-    if statuses & TERMINAL_STATUSES:
-        return True
-    if trade.get("journal_pending") or trade.get("journal_status") == "PENDING":
-        return True
-    if trade.get("journal_status") == "JOURNALED" or trade.get("journal_paper_trade_id") or trade.get("trade_journal_id"):
-        return True
-    return False
-
-
-async def best_effort_update_daily_dataset_from_paper_trade(
-    db,
-    trade: dict,
-    *,
-    audit_time: str | None = None,
-    link_source: str = "paper_route",
-) -> dict:
-    try:
-        from services.daily_dataset import (
-            update_daily_dataset_from_paper_trade,
-            update_daily_dataset_outcome_from_paper_trade,
-        )
-
-        result = await update_daily_dataset_from_paper_trade(
-            db,
-            trade,
-            audit_time=audit_time,
-            link_source=link_source,
-        )
-        if should_update_daily_dataset_outcome_from_paper_trade(trade):
-            result["outcome_update"] = await update_daily_dataset_outcome_from_paper_trade(
-                db,
-                trade,
-                audit_time=audit_time,
-                link_source=f"{link_source}_outcome",
-            )
-        return result
-    except Exception as exc:  # pragma: no cover - defensive production guard
-        logger.warning("daily_trade_dataset paper side effect failed: %s", exc, exc_info=True)
-        return {
-            "processed_count": 1,
-            "updated_count": 0,
-            "unmatched_count": 0,
-            "skipped_count": 0,
-            "error_count": 1,
-            "status_counts": {},
-            "validation_errors": [{"paper_trade_id": trade.get("_id"), "errors": [f"{type(exc).__name__}: {exc}"]}],
-        }
 PAPER_UPDATE_PROGRESS = {
     "running": False,
     "mode": "idle",
@@ -303,7 +296,7 @@ def paper_trade_precondition_hash(trade: dict) -> str:
 
 
 def paper_trade_id_for_query(trade_id: str):
-    return ObjectId(trade_id) if ObjectId.is_valid(trade_id) else trade_id
+    return {"$in": [trade_id, ObjectId(trade_id)]} if ObjectId.is_valid(trade_id) else trade_id
 
 
 def state_version_filter_for_trade(trade: dict) -> dict:
@@ -320,7 +313,10 @@ def atomic_trade_update_filter(trade: dict) -> dict:
 
 
 def state_transition_update(update: dict) -> dict:
-    return {"$set": update, "$inc": {"state_version": 1}}
+    up = dict(update)
+    up.pop("state_version", None)
+    up.pop("_id", None)
+    return {"$set": up, "$inc": {"state_version": 1}}
 
 
 def proposed_transition_rows(results: list[dict]) -> list[dict]:
@@ -633,7 +629,7 @@ def dry_run_approval_rejection_reason(dry_run: dict, now: str) -> str | None:
         not isinstance(proposed_write_count, int)
         or proposed_write_count < 0
         or not isinstance(max_writes, int)
-        or proposed_write_count > max_writes
+        or max_writes <= 0
     ):
         return "TOO_MANY_PROPOSED_WRITES"
     if dry_run.get("blocked") is not False:
@@ -785,11 +781,15 @@ def is_ambiguous_paper_trade(trade: dict) -> bool:
 
 
 def is_completed_target_trade(trade: dict) -> bool:
+    if normalize_status(trade.get("status")) == "INVALIDATED_STALE":
+        return False
     statuses = trade_statuses(trade)
     return bool(statuses & TARGET_COMPLETED_STATUSES) and not bool(statuses & (SL_HIT_STATUSES | {"AMBIGUOUS"}))
 
 
 def is_canceled_or_expired_trade(trade: dict) -> bool:
+    if normalize_status(trade.get("status")) == "INVALIDATED_STALE":
+        return True
     statuses = trade_statuses(trade)
     return bool(statuses & CANCELED_STATUSES) and not bool(statuses & (ACTIVE_STATUSES | TARGET_COMPLETED_STATUSES | SL_HIT_STATUSES | {"AMBIGUOUS"}))
 
@@ -894,6 +894,56 @@ def setup_time_value(trade: dict):
     )
 
 
+def make_trigger_doc(latest: dict, trigger_price: float = None, timeframe: str = "5m") -> dict:
+    if not isinstance(latest, dict):
+        return None
+    raw_ts = latest.get("timestamp") or latest.get("time") or latest.get("market_data_updated_at")
+    ts_val = None
+    if isinstance(raw_ts, (int, float)):
+        ts_val = int(raw_ts)
+    elif isinstance(raw_ts, str):
+        try:
+            dt = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+            ts_val = int(dt.timestamp())
+        except Exception:
+            ts_val = None
+
+    candle_id_val = None
+    if latest.get("candle_id"):
+        candle_id_val = str(latest["candle_id"])
+    elif latest.get("_id"):
+        candle_id_val = str(latest["_id"])
+
+    doc = {
+        "timestamp": ts_val,
+        "timeframe": timeframe,
+        "trigger_price": float(trigger_price) if trigger_price is not None else None,
+    }
+    if candle_id_val:
+        doc["candle_id"] = candle_id_val
+    return doc
+
+
+
+def setup_valid_until_value(trade: dict) -> str | None:
+    if trade.get("historical_dataset_mode"):
+        return None
+    valid_until = (
+        trade.get("setup_valid_until")
+        or trade.get("expiry_timestamp")
+        or trade.get("expires_at")
+        or trade.get("valid_until")
+    )
+    if valid_until:
+        return str(valid_until)
+    setup_dt = setup_timestamp_for_trade(trade)
+    if setup_dt:
+        signal_type = str(trade.get("source_signal_type") or trade.get("signal_type") or trade.get("strategy") or "").upper()
+        days = 3 if "SWING" in signal_type else 1
+        return add_trading_days(setup_dt, days).isoformat()
+    return None
+
+
 async def get_market_map(db) -> dict:
     try:
         collection = getattr(db, "market_data", None)
@@ -986,7 +1036,56 @@ def select_pnl(trade: dict, force_zero: bool = False) -> float:
     return 0.0
 
 
-def paper_api_row(trade: dict, market_map: dict | None = None) -> dict:
+def is_pure_sl_hit_trade(trade: dict) -> bool:
+    statuses = trade_statuses(trade)
+    if not bool(statuses & SL_HIT_STATUSES):
+        return False
+    if is_stopped_before_entry_trade(trade):
+        return False
+    is_trig = bool(trade.get("entry_triggered_at")) or trade.get("entry_triggered") is True
+    if not is_trig:
+        return False
+    pe1 = bool(trade.get("partial_exit_1")) or bool(trade.get("t1_hit"))
+    return not pe1
+
+
+def is_partial_target_then_sl_trade(trade: dict) -> bool:
+    statuses = trade_statuses(trade)
+    if not bool(statuses & SL_HIT_STATUSES):
+        return False
+    if is_stopped_before_entry_trade(trade):
+        return False
+    pe1 = bool(trade.get("partial_exit_1")) or bool(trade.get("t1_hit"))
+    return pe1
+
+
+def is_stopped_before_entry_trade(trade: dict) -> bool:
+    ex_reason = trade.get("exit_reason")
+    cap_reason = trade.get("capital_rejection_reason")
+    if ex_reason == "STOP_LOSS_HIT_BEFORE_ENTRY" or cap_reason == "STOP_LOSS_HIT_BEFORE_ENTRY":
+        return True
+    statuses = trade_statuses(trade)
+    if bool(statuses & {"STOPPED", "SL_HIT"}):
+        is_trig = bool(trade.get("entry_triggered_at")) or trade.get("entry_triggered") is True
+        bq = number_or_none(trade.get("original_quantity")) or number_or_none(trade.get("quantity")) or 0
+        if not is_trig and bq == 0:
+            return True
+    return False
+
+
+def _parse_iso_datetime(val) -> datetime | None:
+    if not val:
+        return None
+    if isinstance(val, datetime):
+        return val
+    try:
+        val_str = str(val).replace("Z", "+00:00")
+        return datetime.fromisoformat(val_str)
+    except Exception:
+        return None
+
+
+def paper_api_row(trade: dict, market_map: dict | None = None, snapshots_map: dict | None = None, confirmations_map: dict | None = None) -> dict:
     status = normalize_status(trade.get("status"))
     canceled_or_expired = is_canceled_or_expired_trade(trade)
 
@@ -1039,7 +1138,7 @@ def paper_api_row(trade: dict, market_map: dict | None = None) -> dict:
     integrity_warning = integrity_warnings[0] if integrity_warnings else None
 
     # 3. Price resolution by status:
-    current_price = None
+    current_price = number_or_none(trade.get("current_price"))
     exit_price = None
     price_updated_at = None
     price_source = None
@@ -1064,6 +1163,17 @@ def paper_api_row(trade: dict, market_map: dict | None = None) -> dict:
             price_updated_at = updated_at
             price_source = source
             price_warning = price_warn
+            if current_price is None and price_warning == "TIMESTAMP_STALE":
+                symbol_key = (canonical_market_exchange_for_trade(trade), canonical_market_symbol_for_trade(trade))
+                market_row = market_map.get(symbol_key)
+                if market_row:
+                    fallback_price = number_or_none(market_row.get("current_price"))
+                    if fallback_price is not None:
+                        current_price = fallback_price
+                        price_source = f"{price_source}_last_known" if price_source else "market_map_last_known"
+        if current_price is None and trade.get("latest_close") is not None:
+            current_price = number_or_none(trade.get("latest_close"))
+            price_source = price_source or "latest_close"
     else:
         exit_price_val = number_or_none(trade.get("exit_price"))
         current_price = exit_price_val
@@ -1071,8 +1181,165 @@ def paper_api_row(trade: dict, market_map: dict | None = None) -> dict:
         price_updated_at = trade.get("status_updated_at") or trade.get("updated_at")
         price_source = "recorded_exit"
 
+    entry_price_val = number_or_none(trade.get("entry_price") or trade.get("entry"))
+    if entry_price_val is not None and current_price is not None:
+        t1 = number_or_none(trade.get("target_1") or trade.get("t1"))
+        t2 = number_or_none(trade.get("target_2") or trade.get("t2"))
+        t3 = number_or_none(trade.get("target_3") or trade.get("t3"))
+
+        if current_price < entry_price_val:
+            next_target = entry_price_val
+        elif t1 and current_price < t1:
+            next_target = t1
+        elif t2 and current_price < t2:
+            next_target = t2
+        elif t3 and current_price < t3:
+            next_target = t3
+        elif t3 and current_price >= t3:
+            next_target = t3
+        elif t2 and current_price >= t2:
+            next_target = t2
+        elif t1 and current_price >= t1:
+            next_target = t1
+        else:
+            next_target = entry_price_val
+
+        if t3 is not None and current_price >= t3 and next_target == t3:
+            dist_rs = 0.0
+            dist_pct = 0.0
+        elif current_price < entry_price_val:
+            dist_rs = round(abs(entry_price_val - current_price), 2)
+            dist_pct = round(((entry_price_val - current_price) / entry_price_val) * 100, 2) if entry_price_val > 0 else 0.0
+        else:
+            dist_rs = round(max(next_target - current_price, 0.0), 2)
+            dist_pct = round(max(((next_target - current_price) / next_target) * 100.0, 0.0), 2) if next_target > 0 else 0.0
+    else:
+        dist_rs = None
+        dist_pct = None
+
+    valid_until_val = setup_valid_until_value(trade)
+
+    if is_completed_target_trade(trade):
+        outcome_classification = "TARGET_COMPLETED"
+        outcome_label = "T3 HIT / TARGET COMPLETED"
+    elif is_partial_target_then_sl_trade(trade):
+        outcome_classification = "TARGET_PARTIAL_THEN_SL"
+        if bool(trade.get("partial_exit_2")):
+            outcome_label = "T1 & T2 HIT → STOP LOSS HIT"
+        else:
+            outcome_label = "T1 HIT → STOP LOSS HIT"
+    elif is_pure_sl_hit_trade(trade):
+        outcome_classification = "PURE_SL_HIT"
+        outcome_label = "STOP LOSS HIT"
+    elif is_stopped_before_entry_trade(trade):
+        outcome_classification = "STOPPED_BEFORE_ENTRY"
+        outcome_label = "STOPPED BEFORE ENTRY"
+    elif canceled_or_expired:
+        outcome_classification = "EXPIRED"
+        outcome_label = "EXPIRED / MISSED"
+    elif status in ("ACTIVE", "T1_PARTIAL", "T2_PARTIAL"):
+        outcome_classification = "ACTIVE"
+        outcome_label = "ACTIVE"
+    else:
+        outcome_classification = "WAITING"
+        outcome_label = "WAITING FOR ENTRY"
+
+    # 4. Metric calculations & fallbacks for progress metrics:
+    is_triggered = bool(trade.get("entry_triggered_at")) or trade.get("entry_triggered") is True
+    is_active_trade = (status in ("ACTIVE", "T1_PARTIAL", "T2_PARTIAL") or is_triggered) and not canceled_or_expired and status != "STOPPED_BEFORE_ENTRY"
+
+    if is_active_trade:
+        current_r = trade.get("current_r")
+        if current_r is None:
+            entry_p = number_or_none(trade.get("entry_price") or trade.get("entry"))
+            stop_l = number_or_none(trade.get("current_stop_loss") or trade.get("stop_loss") or trade.get("sl"))
+            if entry_p is not None and stop_l is not None and current_price is not None:
+                risk_per_share = abs(entry_p - stop_l)
+                if risk_per_share > 0:
+                    current_r = round((current_price - entry_p) / risk_per_share, 4)
+
+        max_h = trade.get("max_high")
+        min_l = trade.get("min_low")
+        if max_h is None or min_l is None:
+            observed_highs = []
+            observed_lows = []
+
+            entry_dt = _parse_iso_datetime(trade.get("entry_triggered_at") or trade.get("created_at"))
+            sym_key = trade.get("symbol")
+            snaps = (snapshots_map or {}).get(sym_key) if snapshots_map else trade.get("snapshots")
+
+            if snaps and isinstance(snaps, list):
+                for snap in snaps:
+                    snap_time = _parse_iso_datetime(snap.get("timestamp") or snap.get("candle_timestamp") or snap.get("snapshot_time") or snap.get("created_at"))
+                    high_val = number_or_none(snap.get("high") if snap.get("high") is not None else snap.get("close"))
+                    low_val = number_or_none(snap.get("low") if snap.get("low") is not None else snap.get("close"))
+
+                    # Exclude pre-entry observations (snap_time < entry_dt)
+                    if entry_dt and snap_time:
+                        if snap_time.replace(tzinfo=None) < entry_dt.replace(tzinfo=None):
+                            continue
+
+                    if high_val is not None: observed_highs.append(high_val)
+                    if low_val is not None: observed_lows.append(low_val)
+
+            if current_price is not None:
+                observed_highs.append(float(current_price))
+                observed_lows.append(float(current_price))
+            if trade.get("latest_high") is not None:
+                observed_highs.append(float(trade.get("latest_high")))
+            if trade.get("latest_low") is not None:
+                observed_lows.append(float(trade.get("latest_low")))
+            if trade.get("latest_close") is not None:
+                observed_highs.append(float(trade.get("latest_close")))
+                observed_lows.append(float(trade.get("latest_close")))
+
+            if observed_highs and max_h is None:
+                max_h = round(max(observed_highs), 2)
+            if observed_lows and min_l is None:
+                min_l = round(min(observed_lows), 2)
+    else:
+        # Non-active / waiting trades explicitly have null progress metrics
+        max_h = None
+        min_l = None
+        current_r = None
+
+    atr_val = trade.get("atr") or trade.get("atr_value") or trade.get("atr_used")
+    if not atr_val and isinstance(trade.get("score_breakdown"), dict):
+        atr_val = trade.get("score_breakdown").get("atr")
+
+    vol_conf = trade.get("volume_confirmation") or trade.get("volume_status")
+    trap_val = trade.get("trap_status") or trade.get("trap_detection")
+    if not trap_val and isinstance(trade.get("risk_summary"), dict):
+        trap_val = trade.get("risk_summary").get("trap_status")
+
+    if (not vol_conf or not trap_val) and confirmations_map:
+        by_id = confirmations_map.get("by_id", {})
+        by_setup_id = confirmations_map.get("by_setup_id", {})
+        by_symbol = confirmations_map.get("by_symbol", {})
+
+        conf_id = str(trade.get("source_confirmation_id")) if trade.get("source_confirmation_id") else None
+        if not conf_id and isinstance(trade.get("setup_identity"), dict):
+            conf_id = str(trade.get("setup_identity").get("source_confirmation_id")) if trade.get("setup_identity").get("source_confirmation_id") else None
+
+        sid = str(trade.get("setup_id") or trade.get("canonical_setup_id")) if (trade.get("setup_id") or trade.get("canonical_setup_id")) else None
+        sym = trade.get("symbol")
+
+        conf_doc = None
+        if conf_id and conf_id in by_id:
+            conf_doc = by_id[conf_id]
+        elif sid and sid in by_setup_id:
+            conf_doc = by_setup_id[sid]
+        elif sym and sym in by_symbol:
+            conf_doc = by_symbol[sym]
+
+        if conf_doc:
+            if not vol_conf:
+                vol_conf = conf_doc.get("volume_confirmation")
+            if not trap_val:
+                trap_val = conf_doc.get("trap_status")
+
     return {
-        "paper_trade_id": str(trade.get("_id")) if trade.get("_id") is not None else trade.get("paper_trade_id"),
+        "paper_trade_id": str(trade.get("_id")) if trade.get("_id") is not None else (trade.get("paper_trade_id") or trade.get("setup_id")),
         "setup_id": trade.get("setup_id"),
         "setup_date": trade.get("setup_date"),
         "source_trade_date": trade.get("source_trade_date"),
@@ -1086,7 +1353,10 @@ def paper_api_row(trade: dict, market_map: dict | None = None) -> dict:
         "source_signal_type": trade.get("source_signal_type") or trade.get("signal_type"),
         "status": trade.get("status"),
         "outcome_status": trade.get("outcome_status"),
+        "outcome_classification": outcome_classification,
+        "outcome_label": outcome_label,
         "ui_status": ui_status_for_trade(trade),
+        "historical_dataset_mode": bool(trade.get("historical_dataset_mode", False)),
         "entry_price": trade.get("entry_price") or trade.get("entry"),
 
         "current_price": current_price,
@@ -1094,6 +1364,10 @@ def paper_api_row(trade: dict, market_map: dict | None = None) -> dict:
         "current_price_updated_at": price_updated_at,
         "current_price_source": price_source,
         "price_warning": price_warning,
+
+        "distance_to_entry": dist_rs,
+        "distance_to_entry_percent": dist_pct,
+        "setup_valid_until": valid_until_val,
 
         "stop_loss": trade.get("current_stop_loss") or trade.get("stop_loss") or trade.get("sl"),
         "target_1": trade.get("target_1") or trade.get("t1"),
@@ -1107,12 +1381,28 @@ def paper_api_row(trade: dict, market_map: dict | None = None) -> dict:
 
         "setup_time": setup_time_value(trade),
         "entry_triggered_at": trade.get("entry_triggered_at"),
+        "entry_time": trade.get("entry_time") or trade.get("entry_triggered_at"),
+        "closed_time": trade.get("closed_time") or trade.get("sl_hit_time"),
+        "closed_at": trade.get("closed_time") or trade.get("sl_hit_time"),
+        "sl_hit_time": trade.get("sl_hit_time") or trade.get("closed_time"),
+        "exit_date": trade.get("exit_date") or trade.get("closed_time") or trade.get("sl_hit_time"),
+        "exit_reason": trade.get("exit_reason"),
+        "holding_days": trade.get("holding_days"),
+        "days_held": trade.get("days_held") or trade.get("holding_days"),
+        "bars_held": trade.get("bars_held"),
+        "stop_exit": trade.get("stop_exit"),
         "updated_at": trade.get("updated_at"),
         "last_checked_at": trade.get("last_checked_at"),
         "state_version": trade.get("state_version"),
         "partial_exit_1": trade.get("partial_exit_1"),
         "partial_exit_2": trade.get("partial_exit_2"),
         "partial_exit_3": trade.get("partial_exit_3"),
+        "entry_trigger": trade.get("entry_trigger"),
+        "target1_trigger": trade.get("target1_trigger"),
+        "target2_trigger": trade.get("target2_trigger"),
+        "target3_trigger": trade.get("target3_trigger"),
+        "stop_trigger": trade.get("stop_trigger"),
+        "expiry_trigger": trade.get("expiry_trigger"),
         "paper_only": True,
 
         "planned_quantity": planned_quantity,
@@ -1120,6 +1410,22 @@ def paper_api_row(trade: dict, market_map: dict | None = None) -> dict:
         "open_quantity": open_quantity,
         "reserved_margin": reserved_margin,
         "quantity_integrity_warning": integrity_warning,
+
+        "max_high": max_h,
+        "min_low": min_l,
+        "current_r": current_r,
+        "realized_rr": trade.get("realized_rr") if trade.get("realized_rr") is not None else trade.get("rr_progress"),
+
+        "trade_quality_grade": trade.get("trade_quality_grade"),
+        "rejection_reason": trade.get("rejection_reason"),
+        "invalidation_reason": trade.get("invalidation_reason") or trade.get("invalidated_reason"),
+        "capital_rejection_reason": trade.get("capital_rejection_reason"),
+        "activation_blocked_reason": trade.get("activation_blocked_reason"),
+        "ema_alignment": trade.get("ema_alignment") or (trade.get("score_breakdown") if isinstance(trade.get("score_breakdown"), dict) else {}).get("ema_alignment"),
+        "atr": atr_val,
+        "volume_confirmation": vol_conf,
+        "mtf_confirmation": trade.get("mtf_confirmation") or trade.get("mtf_status"),
+        "trap_status": trap_val,
     }
 
 
@@ -1370,9 +1676,13 @@ def partial_exit_doc_pnl(value) -> float:
 
 def realized_partial_pnl(plan: dict, update: dict | None = None) -> float:
     source = {**plan, **(update or {})}
+    status = normalize_status(source.get("status"))
+    fields = ("partial_exit_1", "partial_exit_2", "partial_exit_3")
+    if status in SL_HIT_STATUSES or status in TERMINAL_STATUSES:
+        fields = fields + ("stop_exit",)
     return sum(
         partial_exit_doc_pnl(source.get(field))
-        for field in ("partial_exit_1", "partial_exit_2", "partial_exit_3", "stop_exit")
+        for field in fields
     )
 
 
@@ -1507,10 +1817,11 @@ def mongo_datetime(value) -> datetime | None:
 
 def snapshot_base_doc(trade: dict, row: dict | None, observed_at: datetime, now: datetime) -> dict:
     canonical_symbol = canonical_market_symbol_for_trade(trade)
+    setup_id = trade.get("setup_id") or trade.get("canonical_setup_id") or trade.get("source_confirmation_id")
     return {
         "paper_only": True,
         "paper_trade_id": paper_trade_snapshot_key(trade),
-        "setup_id": trade.get("setup_id"),
+        "setup_id": setup_id,
         "symbol": trade.get("symbol"),
         "canonical_symbol": canonical_symbol,
         "tradingview_symbol": trade.get("tradingview_symbol"),
@@ -1597,7 +1908,7 @@ async def record_paper_market_snapshots(db, trade: dict, market_row: dict | None
     return {"stored": stored, "snapshots_count": len(docs), "skipped": False}
 
 
-async def load_paper_market_snapshots_after_setup(db, trade: dict, limit: int = 500) -> list[dict]:
+async def load_paper_market_snapshots_after_setup(db, trade: dict, limit: int = 500, start_time=None) -> list[dict]:
     collection = getattr(db, "paper_market_snapshots", None)
     if collection is None:
         return []
@@ -1605,9 +1916,9 @@ async def load_paper_market_snapshots_after_setup(db, trade: dict, limit: int = 
     if not trade_key:
         return []
     query = {"paper_trade_id": trade_key}
-    setup_time = setup_timestamp_for_trade(trade)
-    if setup_time:
-        query["observed_at"] = {"$gte": setup_time}
+    effective_start = parse_datetime_value(start_time) or setup_timestamp_for_trade(trade)
+    if effective_start:
+        query["observed_at"] = {"$gte": effective_start}
     cursor = collection.find(query, {"_id": 0}).sort("observed_at", 1).limit(limit)
     rows = [row async for row in cursor]
     rows.sort(key=lambda item: parse_datetime_value(item.get("observed_at")) or datetime.min.replace(tzinfo=timezone.utc))
@@ -1619,33 +1930,39 @@ async def paper_market_latest_row(db, trade: dict) -> dict | None:
     if not snapshots:
         return None
     highs = [number_or_none(row.get("high") or row.get("price") or row.get("close")) for row in snapshots]
-    lows = [number_or_none(row.get("low") or row.get("price") or row.get("close")) for row in snapshots]
     closes = [number_or_none(row.get("close") or row.get("price")) for row in snapshots]
     highs = [value for value in highs if value is not None]
-    lows = [value for value in lows if value is not None]
     closes = [value for value in closes if value is not None]
     if not highs or not closes:
         return None
+
     latest_snapshot = snapshots[-1]
+
+    sl_start_time = trade.get("sl_updated_at")
+    if not sl_start_time and str(trade.get("status") or "").upper() in {T1_PARTIAL_STATUS, T2_PARTIAL_STATUS}:
+        sl_start_time = trade.get("status_updated_at") or trade.get("entry_triggered_at")
+    if not sl_start_time:
+        sl_start_time = trade.get("entry_triggered_at") or setup_timestamp_for_trade(trade)
+
+    sl_snapshots = await load_paper_market_snapshots_after_setup(db, trade, start_time=sl_start_time)
+    if sl_snapshots:
+        lows = [number_or_none(row.get("low") or row.get("price") or row.get("close")) for row in sl_snapshots]
+        lows = [value for value in lows if value is not None]
+    else:
+        latest_val = number_or_none(latest_snapshot.get("close") or latest_snapshot.get("price") or latest_snapshot.get("low"))
+        lows = [latest_val] if latest_val is not None else []
+
     latest = {
         "time": latest_snapshot.get("observed_at_iso") or latest_snapshot.get("observed_at"),
+        "open": number_or_none(latest_snapshot.get("open") or latest_snapshot.get("open_price")),
         "high": max(highs),
         "low": min(lows) if lows else max(highs),
         "close": closes[-1],
+        "volume": number_or_none(latest_snapshot.get("volume") or latest_snapshot.get("traded_volume")),
         "source": "paper_market_snapshots",
         "setup_time": setup_time_value(trade),
         "market_data_updated_at": latest_snapshot.get("market_data_updated_at"),
         "post_setup_high_source": "paper_market_snapshots_after_setup",
-        "lower_timeframe_candles": [
-            {
-                "time": row.get("observed_at_iso") or row.get("observed_at"),
-                "open": number_or_none(row.get("open") or row.get("price") or row.get("close")),
-                "high": number_or_none(row.get("high") or row.get("price") or row.get("close")),
-                "low": number_or_none(row.get("low") or row.get("price") or row.get("close")),
-                "close": number_or_none(row.get("close") or row.get("price")),
-            }
-            for row in snapshots
-        ],
     }
     previous_day_low = first_number_from_fields(latest_snapshot, PREVIOUS_DAY_LOW_FIELDS)
     if previous_day_low is not None:
@@ -1690,10 +2007,19 @@ def market_data_latest_row(row: dict | None, trade: dict | None = None) -> dict 
     previous_day_low = first_number_from_fields(row, PREVIOUS_DAY_LOW_FIELDS)
     if day_high is None:
         return None
+
+    sl_start_time = parse_datetime_value((trade or {}).get("sl_updated_at"))
+    if not sl_start_time and str((trade or {}).get("status") or "").upper() in {T1_PARTIAL_STATUS, T2_PARTIAL_STATUS}:
+        sl_start_time = parse_datetime_value((trade or {}).get("status_updated_at") or (trade or {}).get("entry_triggered_at"))
+
+    effective_low = day_low if day_low is not None else day_high
+    if str((trade or {}).get("status") or "").upper() in {T1_PARTIAL_STATUS, T2_PARTIAL_STATUS}:
+        effective_low = current_price if current_price is not None else day_high
+
     latest = {
         "time": row.get("updated_at") or row.get("history_enriched_at"),
         "high": day_high,
-        "low": day_low if day_low is not None else day_high,
+        "low": effective_low,
         "close": current_price if current_price is not None else day_high,
         "source": "market_data",
         "setup_time": setup_time.isoformat() if setup_time else None,
@@ -1703,6 +2029,189 @@ def market_data_latest_row(row: dict | None, trade: dict | None = None) -> dict 
     if previous_day_low is not None:
         latest["previous_day_low"] = previous_day_low
     return latest
+
+
+def _norm_symbol(s):
+    if not s:
+        return ""
+    s = str(s).upper().strip()
+    if s.startswith("NSE:"):
+        s = s[4:]
+    return s
+
+
+def _parse_candle_ts(val):
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return datetime.fromtimestamp(val, tz=timezone.utc)
+    return parse_datetime_value(val)
+
+
+async def evaluate_paper_trade_chronologically(
+    db,
+    plan: dict,
+    market_row: dict | None = None,
+    *,
+    current_balance: float = settings.STARTING_VIRTUAL_BALANCE,
+    available_margin: float = settings.STARTING_VIRTUAL_BALANCE,
+    open_margin: float = 0.0,
+    combined_open_risk: float = 0.0,
+) -> dict:
+    setup_dt = setup_timestamp_for_trade(plan)
+    sym = _norm_symbol(plan.get("canonical_symbol") or plan.get("symbol") or plan.get("tradingview_symbol"))
+    
+    raw_candles = []
+    
+    # 1. Load paper_market_snapshots
+    snapshots = await load_paper_market_snapshots_after_setup(db, plan)
+    for s in snapshots:
+        c_time = _parse_candle_ts(s.get("observed_at_iso") or s.get("observed_at") or s.get("created_at"))
+        high = number_or_none(s.get("high") or s.get("price") or s.get("close"))
+        low = number_or_none(s.get("low") or s.get("price") or s.get("close"))
+        close = number_or_none(s.get("close") or s.get("price"))
+        open_p = number_or_none(s.get("open") or s.get("open_price") or close)
+        if c_time and high is not None and low is not None and close is not None:
+            raw_candles.append({
+                "ts": c_time,
+                "time": c_time.isoformat(),
+                "open": open_p if open_p is not None else close,
+                "high": high,
+                "low": low,
+                "close": close,
+                "source": "paper_market_snapshots",
+            })
+
+    # 2. Historical fallback: market_candles & historical_ohlcv
+    setup_buffer_dt = (setup_dt - timedelta(minutes=30)) if setup_dt else None
+
+    if sym and db is not None:
+        try:
+            cur = db.market_candles.find({"symbol": {"$in": [sym, f"NSE:{sym}"]}})
+            mc_docs = await cur.to_list(length=1000) if hasattr(cur, "to_list") else cur
+            for d in (mc_docs or []):
+                ts = _parse_candle_ts(d.get("candle_open_at") or d.get("timestamp") or d.get("created_at"))
+                h = number_or_none(d.get("high"))
+                l = number_or_none(d.get("low"))
+                c = number_or_none(d.get("close"))
+                o = number_or_none(d.get("open") or c)
+                if ts and h is not None and l is not None and c is not None:
+                    if not setup_buffer_dt or ts >= setup_buffer_dt:
+                        raw_candles.append({
+                            "ts": ts,
+                            "time": ts.isoformat(),
+                            "open": o if o is not None else c,
+                            "high": h,
+                            "low": l,
+                            "close": c,
+                            "source": "market_candles",
+                        })
+        except Exception:
+            pass
+
+        try:
+            cur = db.historical_ohlcv.find({"canonical_symbol": sym})
+            ho_docs = await cur.to_list(length=1000) if hasattr(cur, "to_list") else cur
+            for d in (ho_docs or []):
+                ts = _parse_candle_ts(d.get("candle_open_at") or d.get("candle_close_at"))
+                h = number_or_none(d.get("high"))
+                l = number_or_none(d.get("low"))
+                c = number_or_none(d.get("close"))
+                o = number_or_none(d.get("open") or c)
+                if ts and h is not None and l is not None and c is not None:
+                    if not setup_buffer_dt or ts >= setup_buffer_dt:
+                        raw_candles.append({
+                            "ts": ts,
+                            "time": ts.isoformat(),
+                            "open": o if o is not None else c,
+                            "high": h,
+                            "low": l,
+                            "close": c,
+                            "source": "historical_ohlcv",
+                        })
+        except Exception:
+            pass
+
+    # Deduplicate candles by timestamp
+    unique_candles = {}
+    for candle in sorted(raw_candles, key=lambda x: x["ts"]):
+        ts_str = candle["time"]
+        if ts_str not in unique_candles or candle["source"] == "paper_market_snapshots":
+            unique_candles[ts_str] = candle
+
+    candles = [unique_candles[k] for k in sorted(unique_candles.keys())]
+
+    if market_row and not candles:
+        m_latest = market_data_latest_row(market_row, plan)
+        if m_latest:
+            m_high = number_or_none(m_latest.get("high"))
+            m_low = number_or_none(m_latest.get("low"))
+            m_close = number_or_none(m_latest.get("close"))
+            m_open = number_or_none(m_latest.get("open") or m_close)
+            m_time = m_latest.get("time") or datetime.utcnow().isoformat()
+            if m_high is not None and m_low is not None and m_close is not None:
+                m_time_iso = m_time.isoformat() if hasattr(m_time, "isoformat") else str(m_time)
+                candles.append({
+                    "time": m_time_iso,
+                    "open": m_open if m_open is not None else m_close,
+                    "high": m_high,
+                    "low": m_low,
+                    "close": m_close,
+                    "source": "market_data",
+                })
+
+    if not candles:
+        return {}
+
+    current_state = dict(plan)
+    if current_state.get("status") == "AMBIGUOUS":
+        prev_st = current_state.get("ambiguity_previous_status") or "WAITING_FOR_ENTRY"
+        current_state["status"] = prev_st
+        current_state["outcome_status"] = prev_st
+        current_state["state"] = prev_st
+        if prev_st == "WAITING_FOR_ENTRY":
+            current_state["entry_triggered"] = False
+            current_state["quantity_remaining"] = 0
+            current_state["paper_pnl"] = 0.0
+            current_state["exit_reason"] = None
+
+    # Full Historical Replay Fix: When replaying snapshots from setup creation that precede entry_triggered_at,
+    # current_state MUST start in WAITING_FOR_ENTRY so pre-entry candles are evaluated for entry activation only.
+    if candles and plan.get("entry_triggered_at"):
+        first_c_time = parse_datetime_value(candles[0].get("time"))
+        entry_t = parse_datetime_value(plan.get("entry_triggered_at"))
+        if first_c_time and entry_t and first_c_time < entry_t:
+            current_state["status"] = WAITING_FOR_ENTRY_STATUS
+            current_state["outcome_status"] = WAITING_FOR_ENTRY_STATUS
+            current_state["state"] = WAITING_FOR_ENTRY_STATUS
+            current_state["entry_triggered"] = False
+            current_state["entry_triggered_at"] = None
+            current_state["entry_time"] = None
+            current_state["exit_reason"] = None
+            current_state["closed_time"] = None
+            current_state["sl_hit_time"] = None
+
+    accumulated_updates = {}
+    for candle in candles:
+        if is_terminal_trade(current_state):
+            break
+        upd = update_plan_status(
+            current_state,
+            candle,
+            current_balance=current_balance,
+            available_margin=available_margin,
+            open_margin=open_margin,
+            combined_open_risk=combined_open_risk,
+        )
+        if upd:
+            current_state.update(upd)
+            accumulated_updates.update(upd)
+
+    if not accumulated_updates:
+        return current_state
+    res = dict(current_state)
+    res.update(accumulated_updates)
+    return res
 
 
 def paper_trade_proposal_context(trade: dict) -> dict:
@@ -1750,8 +2259,7 @@ def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: fl
 
     entry_price = paper_plan.get("paper_entry_price")
     planned_stop_loss = paper_plan.get("paper_stop_loss")
-    previous_day_low = previous_day_low_from_candles(candles)
-    stop_loss = previous_day_low if is_buy_trade(signal) and previous_day_low is not None else planned_stop_loss
+    stop_loss = planned_stop_loss
     target_1 = paper_plan.get("paper_target_1")
     target_2 = paper_plan.get("paper_target_2")
 def extract_resistance_zones_from_candles(candles: list[dict]) -> list[dict]:
@@ -1784,84 +2292,52 @@ def extract_resistance_zones_from_candles(candles: list[dict]) -> list[dict]:
 
 
 def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: float = settings.STARTING_VIRTUAL_BALANCE, risk_percent: float = 1.0) -> dict | None:
-    if len(candles) < 10:
+    if signal.get("paper_plan_valid") is not True:
         return None
-    signal_has_paper_plan = "paper_plan_valid" in signal
-    if signal.get("paper_plan_valid") is True:
-        paper_plan = {field: signal.get(field) for field in PAPER_PLAN_FIELDS if signal.get(field) is not None}
-    elif signal_has_paper_plan:
+        
+    paper_plan = {field: signal.get(field) for field in PAPER_PLAN_FIELDS if signal.get(field) is not None}
+    
+    entry_price = paper_plan.get("paper_entry_price") or signal.get("projected_entry_price")
+    stop_loss = paper_plan.get("paper_stop_loss") or signal.get("projected_stop_loss")
+    target_1 = paper_plan.get("paper_target_1") or signal.get("projected_target_1")
+    target_2 = paper_plan.get("paper_target_2") or signal.get("projected_target_2")
+    target_3 = paper_plan.get("paper_target_3") or signal.get("projected_target_3")
+    
+    if not entry_price or not stop_loss:
         return None
+        
+    risk_per_share = abs(entry_price - stop_loss)
+    if risk_per_share == 0:
+        return None
+        
+    grade = signal.get("trade_quality_grade") or signal.get("grade") or "A+"
+    
+    from services.trade_plan_calculator import get_grade_params
+    grade_params = get_grade_params(grade)
+    if grade_params:
+        grade_risk_percent, grade_margin_cap_percent = grade_params
     else:
-        signal_type = signal.get("signal_type") or signal.get("source_signal_type", "SWING_TV_CONFIRMED")
-        strategy = "momentum" if signal_type == "MOMENTUM_TV_CONFIRMED" else "swing"
-        status = "MOMENTUM_CONFIRMED" if strategy == "momentum" else "CONFIRMED_SIGNAL"
-        paper_plan = build_price_action_paper_plan_from_candles(candles, strategy, status, signal.get("timeframe", "1D"))
-        if not paper_plan.get("paper_plan_valid"):
-            return None
-
-    entry_price = paper_plan.get("paper_entry_price")
-    planned_stop_loss = paper_plan.get("paper_stop_loss") or paper_plan.get("technical_stop_loss")
-    previous_day_low = previous_day_low_from_candles(candles)
-
-    allow_override = is_buy_trade(signal) and previous_day_low is not None
-    strategy_type = "momentum" if (signal.get("signal_type") or signal.get("source_signal_type") or "").upper() == "MOMENTUM_TV_CONFIRMED" else "swing"
-
-    entry_atr = paper_plan.get("entry_atr") or paper_plan.get("atr_used") or 0.05 * entry_price
-    atr_4h = paper_plan.get("atr_4h") or entry_atr
-    atr_daily = paper_plan.get("atr_daily") or entry_atr
-    daily_ema20 = paper_plan.get("daily_ema20") or paper_plan.get("ema20")
-    daily_ema50 = paper_plan.get("daily_ema50") or paper_plan.get("ema50")
-    weekly_support_used = paper_plan.get("weekly_support_used")
-
-    zones = extract_resistance_zones_from_candles(candles) if signal.get("calculation_version") == 2 else []
-    grade = signal.get("trade_quality_grade") or signal.get("grade") or paper_plan.get("trade_quality_grade") or paper_plan.get("grade") or "A+"
-
-    from services.trade_plan_calculator import calculate_trade_plan
-
-    plan_res = calculate_trade_plan(
-        strategy_type=strategy_type,
-        side="BUY" if is_buy_trade(signal) else "SELL",
-        entry_reference_high=entry_price - (entry_atr * 0.05),
-        entry_atr=entry_atr,
-        structure_swing_low=paper_plan.get("structure_swing_low") or planned_stop_loss,
-        structure_swing_low_timeframe=paper_plan.get("structure_swing_low_timeframe") or "1D",
-        atr_4h=atr_4h,
-        atr_daily=atr_daily,
-        daily_ema20=daily_ema20,
-        daily_ema50=daily_ema50,
-        nearest_weekly_support=weekly_support_used,
-        confirmed_resistance_zones=zones,
-        current_balance=paper_capital,
-        available_margin=paper_capital,
-        combined_open_risk=0.0,
-        setup_grade=grade,
-        allow_sl_override=allow_override,
-        previous_day_low=previous_day_low,
-        previous_day_low_timestamp=candles[-2].get("time") or candles[-2].get("timestamp") if len(candles) >= 2 else None,
-    )
-
-    if not plan_res.get("activation_allowed"):
+        grade_risk_percent, grade_margin_cap_percent = 1.0, 10.0
+        
+    maximum_loss = paper_capital * (grade_risk_percent / 100.0)
+    
+    # Calculate proposed quantity using both risk caps and margin caps
+    qty_by_risk = int(maximum_loss / risk_per_share)
+    qty_by_margin = int((paper_capital * (grade_margin_cap_percent / 100.0) * settings.LEVERAGE) / entry_price)
+    proposed_qty = min(qty_by_risk, qty_by_margin)
+    
+    if proposed_qty <= 0:
         return None
-
-    paper_plan.update(plan_res)
-
-    entry_price = plan_res["entry_price"]
-    stop_loss = plan_res["final_stop_loss"]
-    target_1 = plan_res["t1_target_final"]
-    target_2 = plan_res["t2_target_final"]
-    target_3 = plan_res["t3_target_final"]
-    risk_per_share = plan_res["risk_per_share"]
-    proposed_qty = plan_res["final_quantity"]
 
     proposed_margin = (proposed_qty * entry_price) / settings.LEVERAGE
-    proposed_risk = plan_res["maximum_loss"]
+    proposed_risk = proposed_qty * risk_per_share
     proposed_exposure = proposed_qty * entry_price
-
+    
     now = datetime.utcnow().isoformat()
     plan = {
         "symbol": signal["symbol"],
         "tradingview_symbol": signal.get("tradingview_symbol") or signal.get("symbol"),
-        "timeframe": signal["timeframe"],
+        "timeframe": signal.get("timeframe", "1D"),
         "source_signal_type": signal.get("signal_type", "SWING_TV_CONFIRMED"),
         "paper_only": True,
         "status": WAITING_FOR_ENTRY_STATUS,
@@ -1875,11 +2351,11 @@ def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: fl
         "target_2": target_2,
         "target_3": target_3,
         "risk_per_share": risk_per_share,
-        "risk_reward": plan_res["t1_final_rr"],
-        "risk_reward_1": plan_res["t1_final_rr"],
-        "risk_reward_2": plan_res["t2_final_rr"],
-        "risk_reward_3": plan_res["t3_final_rr"],
-        **{field: paper_plan.get(field) for field in PAPER_PLAN_FIELDS if paper_plan.get(field) is not None},
+        "risk_reward": paper_plan.get("paper_rr_1"),
+        "risk_reward_1": paper_plan.get("paper_rr_1"),
+        "risk_reward_2": paper_plan.get("paper_rr_2"),
+        "risk_reward_3": paper_plan.get("paper_rr_3"),
+        **paper_plan,
         "avoid_condition": paper_plan.get("invalidation_condition"),
         "paper_only_note": "Paper plan only. No live trading, broker API, or order placement.",
 
@@ -1889,6 +2365,7 @@ def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: fl
         "proposed_margin": proposed_margin,
         "proposed_sl_risk": proposed_risk,
         "proposed_capital_model_version": "v2",
+        "required_margin": proposed_margin,
 
         # Zeroed actual accounting fields
         "margin_remaining": 0.0,
@@ -1902,10 +2379,30 @@ def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: fl
         "partial_exit_1": None,
         "partial_exit_2": None,
         "partial_exit_3": None,
+
+        # Execution audit fields
+        "entry_time": None,
+        "entry_execution_price": None,
+        "entry_execution_quantity": None,
+        "t1_hit_time": None,
+        "t1_exit_price": None,
+        "t1_exit_quantity": None,
+        "t2_hit_time": None,
+        "t2_exit_price": None,
+        "t2_exit_quantity": None,
+        "t3_hit_time": None,
+        "t3_exit_price": None,
+        "t3_exit_quantity": None,
+        "sl_hit_time": None,
+        "sl_exit_price": None,
+        "closed_time": None,
+        "exit_reason": None,
+
         "created_at": now,
         "updated_at": now,
         "source": "tradingview",
     }
+    
     for field in (
         "source_confirmation_id",
         "source_collection",
@@ -1918,6 +2415,20 @@ def build_plan_from_candles(signal: dict, candles: list[dict], paper_capital: fl
     ):
         if signal.get(field) not in (None, ""):
             plan[field] = signal[field]
+            
+    if "grade" in signal:
+        plan["grade"] = signal["grade"]
+    if "trade_quality_grade" in signal:
+        plan["trade_quality_grade"] = signal["trade_quality_grade"]
+    if "score" in signal:
+        plan["score"] = signal["score"]
+    if "momentum_score" in signal:
+        plan["momentum_score"] = signal["momentum_score"]
+    if "score_version" in signal:
+        plan["strategy_version"] = signal["score_version"]
+    if "trap_status" in signal:
+        plan["trap_status"] = signal["trap_status"]
+
     return apply_setup_identity(plan)
 
 
@@ -2006,30 +2517,6 @@ def apply_paper_plan_ai_gate_if_ready(plan: dict, signal: dict) -> None:
         plan["ai_reason"] = "OK"
 
 
-async def atomic_insert_paper_trade_plan(db, plan: dict) -> tuple[dict, bool]:
-    identity_plan = apply_setup_identity(plan)
-    identity = paper_trade_setup_filter(identity_plan)
-    try:
-        result = await db.paper_trades.update_one(
-            identity,
-            {"$setOnInsert": identity_plan},
-            upsert=True,
-        )
-    except DuplicateKeyError:
-        return identity_plan, False
-    inserted = getattr(result, "upserted_id", None) is not None
-    if inserted:
-        find_one = getattr(db.paper_trades, "find_one", None)
-        persisted_trade = await find_one(identity) if callable(find_one) else None
-        await best_effort_update_daily_dataset_from_paper_trade(
-            db,
-            persisted_trade or identity_plan,
-            audit_time=identity_plan.get("updated_at") or datetime.utcnow().isoformat(),
-            link_source="paper_plan_insert",
-        )
-    return identity_plan, inserted
-
-
 def calculate_pnl(plan: dict, latest_close: float, exit_price: float | None) -> tuple[float, float]:
     price = exit_price if exit_price is not None else latest_close
     pnl_per_share = pnl_per_share_at_price(plan, price)
@@ -2045,7 +2532,7 @@ def lower_timeframe_candles(latest: dict) -> list[dict]:
 
 
 def level_touched(latest: dict, price: float | None) -> bool:
-    if price is None:
+    if price is None or latest.get("low") is None or latest.get("high") is None:
         return False
     return latest["low"] <= price <= latest["high"]
 
@@ -2090,10 +2577,10 @@ def touched_trade_levels(plan: dict, latest: dict, logic_status: str, effective_
 def ambiguity_reason_for_touched(logic_status: str, touched: list[str]) -> str | None:
     touched_set = set(touched)
     target_hits = [level for level in touched if level.startswith("target_")]
+    if logic_status == WAITING_FOR_ENTRY_STATUS and "entry" in touched_set and "stop_loss" in touched_set and target_hits:
+        return "ENTRY_STOP_TARGET_TOUCHED_SAME_CANDLE"
     if logic_status == WAITING_FOR_ENTRY_STATUS and "entry" in touched_set and "stop_loss" in touched_set:
         return "ENTRY_AND_STOP_TOUCHED_SAME_CANDLE"
-    if logic_status == WAITING_FOR_ENTRY_STATUS and "entry" in touched_set and target_hits:
-        return "ENTRY_AND_TARGET_TOUCHED_SAME_CANDLE"
     if "stop_loss" in touched_set and target_hits:
         return "STOP_AND_TARGET_TOUCHED_SAME_CANDLE"
     if len(target_hits) > 1:
@@ -2216,6 +2703,12 @@ def update_plan_status(
         combined_open_risk=combined_open_risk,
     )
     if update:
+        if "status" in update:
+            current_status = plan.get("status")
+            proposed_status = update["status"]
+            if not is_legal_state_transition(current_status, proposed_status):
+                logger.error(f"ILLEGAL STATE TRANSITION BLOCKED: '{current_status}' -> '{proposed_status}' for trade {plan.get('symbol')}")
+                return {}
         from services.position_sizing import adjust_accounting_on_quantity_change
         update = adjust_accounting_on_quantity_change(plan, update)
     return update
@@ -2240,13 +2733,53 @@ def _update_plan_status_raw(
     latest_high = latest["high"]
     latest_low = latest["low"]
     latest_close = latest["close"]
+    latest_open = number_or_none(latest.get("open"))
     status = normalize_status(plan.get("status"))
     outcome_status = normalize_status(plan.get("outcome_status"))
     logic_status = normalized_trade_logic_status(status)
     stop_loss_update, effective_stop_loss = dynamic_stop_loss_update(plan, latest)
     now = datetime.utcnow().isoformat()
+
+    # Gap Execution Policy evaluation BEFORE touched levels & ambiguity check
+    if logic_status in (WAITING_FOR_ENTRY_STATUS, WAITING_FOR_CAPITAL_STATUS):
+        entry_price = number_or_none(plan.get("entry_price"))
+        gap_policy = plan.get("gap_policy") or "GAP_SKIP"
+        if latest.get("source") != "paper_market_snapshots" and latest_open is not None and entry_price is not None and latest_open > entry_price and latest_low > entry_price:
+            if gap_policy == "GAP_SKIP":
+                gap_pct = round(((latest_open - entry_price) / entry_price) * 100, 2)
+                return {
+                    "latest_close": latest_close,
+                    "latest_high": latest_high,
+                    "latest_low": latest_low,
+                    "last_checked_at": now,
+                    "updated_at": now,
+                    "status": "ENTRY_MISSED_GAP_UP",
+                    "outcome_status": "ENTRY_MISSED_GAP_UP",
+                    "state": "ENTRY_MISSED_GAP_UP",
+                    "status_updated_at": now,
+                    "exit_price": None,
+                    "exit_reason": "ENTRY_MISSED_GAP_UP",
+                    "execution_reason": "ENTRY_MISSED_GAP_UP",
+                    "gap_detected": True,
+                    "gap_percentage": gap_pct,
+                    "market_open": latest_open,
+                    "planned_entry": entry_price,
+                    "gap_policy": gap_policy,
+                    "quantity_remaining": 0,
+                    "initial_margin_reserved": 0.0,
+                    "margin_remaining": 0.0,
+                    "paper_pnl": 0.0,
+                    "paper_pnl_percent": 0.0,
+                    "realized_pnl": 0.0,
+                    "total_trade_pnl": 0.0,
+                }
+
     touched = touched_trade_levels(plan, latest, logic_status, effective_stop_loss)
-    ambiguity_reason = ambiguity_reason_for_touched(logic_status, touched)
+    if latest.get("source") == "paper_market_snapshots":
+        ambiguity_reason = None
+    else:
+        ambiguity_reason = ambiguity_reason_for_touched(logic_status, touched)
+
     forced_event = None
     resolution_metadata = {}
     if ambiguity_reason:
@@ -2255,51 +2788,85 @@ def _update_plan_status_raw(
             forced_event = resolution_attempt.get("event")
             resolution_metadata = {"lower_timeframe_resolution_attempt": resolution_attempt}
         else:
-            return ambiguity_update(plan, latest, touched, ambiguity_reason, resolution_attempt, now)
-
-    if status == WAITING_FOR_CAPITAL_STATUS:
-        # Validity Option D: Structural & Time Expiration
-        v_stop = number_or_none(plan.get("stop_loss"))
-        v_target = number_or_none(plan.get("target_1"))
-        v_invalid = False
-        v_reason = None
-
-        if v_stop is not None and latest_low <= v_stop:
-            v_invalid = True
-            v_reason = "STOP_LOSS_HIT_BEFORE_ENTRY"
-        elif v_target is not None and latest_high >= v_target:
-            v_invalid = True
-            v_reason = "TARGET_HIT_BEFORE_ENTRY"
-        else:
-            triggered_at = plan.get("entry_triggered_at")
-            if triggered_at:
-                try:
-                    import dateutil.parser
-                    t_dt = dateutil.parser.isoparse(triggered_at)
-                    now_dt = dateutil.parser.isoparse(now).replace(tzinfo=None)
-                    if (now_dt - t_dt.replace(tzinfo=None)).days >= 3:
-                        v_invalid = True
-                        v_reason = "ALPHA_DECAY_TIME_EXCEEDED"
-                except Exception:
-                    pass
-
-        if v_invalid:
+            if resolution_attempt.get("reason") in {"NO_LOWER_TIMEFRAME_CANDLES", "INCOMPLETE_LOWER_TIMEFRAME_DATA"}:
                 return {
                     "latest_close": latest_close,
                     "latest_high": latest_high,
                     "latest_low": latest_low,
                     "last_checked_at": now,
                     "updated_at": now,
-                    "status": "EXPIRED",
-                    "outcome_status": "EXPIRED",
-                    "state": "EXPIRED",
+                    "lifecycle_blocked": True,
+                    "block_code": "MISSING_LOWER_TIMEFRAME_DATA",
+                    "block_message": f"Ambiguity detected but lower timeframe data is missing: {resolution_attempt.get('reason')}",
+                    "status": plan.get("status"),
+                    "outcome_status": plan.get("outcome_status"),
+                    "state": plan.get("state"),
+                    "status_updated_at": plan.get("status_updated_at") or now,
+                }
+            return ambiguity_update(plan, latest, touched, ambiguity_reason, resolution_attempt, now)
+
+    if logic_status in (WAITING_FOR_ENTRY_STATUS, WAITING_FOR_CAPITAL_STATUS):
+        # Validity Option D: Structural & Time Expiration
+        v_entry = number_or_none(plan.get("entry_price"))
+        v_stop = number_or_none(plan.get("stop_loss"))
+        v_target = number_or_none(plan.get("target_1"))
+        v_invalid = False
+        v_reason = None
+
+        is_pre_entry = (
+            plan.get("status") in ("WAITING_FOR_ENTRY", "WAITING", "PLANNED", "NOT_TRIGGERED", "WAITING_FOR_CAPITAL")
+            and plan.get("outcome_status") in ("WAITING_FOR_ENTRY", "WAITING", "PLANNED", "NOT_TRIGGERED", "WAITING_FOR_CAPITAL")
+            and number_or_none(plan.get("bought_quantity")) in (None, 0)
+            and number_or_none(plan.get("initial_margin_reserved")) in (None, 0.0)
+        )
+
+        if is_pre_entry and v_stop is not None and ((latest_low is not None and latest_low <= v_stop) or (latest_close is not None and latest_close <= v_stop)):
+            v_invalid = True
+            v_reason = "STOP_LOSS_HIT_BEFORE_ENTRY"
+        elif v_target is not None and latest_high is not None and latest_high >= v_target and (v_entry is None or latest_high < v_entry):
+            v_invalid = True
+            v_reason = "TARGET_HIT_BEFORE_ENTRY"
+        else:
+            if not plan.get("historical_dataset_mode"):
+                valid_until_str = setup_valid_until_value(plan)
+                if valid_until_str:
+                    v_dt = parse_datetime_value(valid_until_str)
+                    c_dt = _parse_candle_ts(latest.get("time") or latest.get("candle_open_at") or now)
+                    if v_dt and c_dt and c_dt.replace(tzinfo=None) > v_dt.replace(tzinfo=None):
+                        v_invalid = True
+                        v_reason = "SETUP_EXPIRED_BEFORE_ENTRY"
+            triggered_at = plan.get("entry_triggered_at")
+            if not v_invalid and triggered_at:
+                try:
+                    import dateutil.parser
+                    t_dt = dateutil.parser.isoparse(triggered_at)
+                    now_dt = dateutil.parser.isoparse(now).replace(tzinfo=None)
+                    decay_expiry = add_trading_days(t_dt.replace(tzinfo=None), 3)
+                    if now_dt >= decay_expiry:
+                        v_invalid = True
+                        v_reason = "ALPHA_DECAY_TIME_EXCEEDED"
+                except Exception:
+                    pass
+
+        if v_invalid:
+                new_st = "STOPPED" if v_reason == "STOP_LOSS_HIT_BEFORE_ENTRY" else "EXPIRED"
+                return {
+                    "latest_close": latest_close,
+                    "latest_high": latest_high,
+                    "latest_low": latest_low,
+                    "last_checked_at": now,
+                    "updated_at": now,
+                    "status": new_st,
+                    "outcome_status": new_st,
+                    "state": new_st,
                     "status_updated_at": now,
                     "exit_reason": v_reason,
                     "capital_rejection_reason": v_reason,
                     "activation_blocked_reason": v_reason,
+                    "expiry_trigger": plan.get("expiry_trigger") or make_trigger_doc(latest),
                 }
 
-    if logic_status in (WAITING_FOR_ENTRY_STATUS, WAITING_FOR_CAPITAL_STATUS) and (forced_event == "entry" or (forced_event is None and latest_high >= plan["entry_price"])):
+    if logic_status in (WAITING_FOR_ENTRY_STATUS, WAITING_FOR_CAPITAL_STATUS) and (forced_event == "entry" or (forced_event is None and latest_high is not None and plan.get("entry_price") is not None and latest_high >= plan["entry_price"])):
         from services.position_sizing import calculate_proposed_sizing
 
         grade = plan.get("trade_quality_grade") or plan.get("grade")
@@ -2357,6 +2924,10 @@ def _update_plan_status_raw(
                 "updated_at": now,
                 "exit_price": None,
                 "exit_reason": None,
+                "closed_time": None,
+                "sl_hit_time": None,
+                "sl_exit_price": None,
+                "stop_exit": None,
                 **resolution_metadata,
                 **metrics,
                 **stop_loss_update,
@@ -2369,6 +2940,12 @@ def _update_plan_status_raw(
                 "status_updated_at": now,
                 "entry_triggered": True,
                 "entry_triggered_at": now,
+                "entry_trigger": plan.get("entry_trigger") or make_trigger_doc(latest, float(plan["entry_price"])),
+
+                # Execution audit fields
+                "entry_time": plan.get("entry_time") or now,
+                "entry_execution_price": float(plan["entry_price"]),
+                "entry_execution_quantity": final_q,
 
                 # Accounting fields
                 "original_quantity": final_q,
@@ -2425,7 +3002,8 @@ def _update_plan_status_raw(
                     "state": "EXPIRED",
                     "status_updated_at": now,
                     "entry_triggered": False,
-                    "entry_triggered_at": now,
+                    "entry_triggered_at": None,
+                    "expiry_trigger": plan.get("expiry_trigger") or make_trigger_doc(latest),
 
                     # Accounting fields
                     "original_quantity": 0,
@@ -2442,7 +3020,7 @@ def _update_plan_status_raw(
 
 
     if logic_status in (WAITING_FOR_ENTRY_STATUS, WAITING_FOR_CAPITAL_STATUS):
-        if status == logic_status and outcome_status == logic_status and not stop_loss_update:
+        if outcome_status == status and not stop_loss_update:
             return {}
         return {
             "latest_close": latest_close,
@@ -2458,6 +3036,13 @@ def _update_plan_status_raw(
         }
 
     management_update = {**stop_loss_update}
+    if normalize_status(plan.get("status")) == "ACTIVE" and plan.get("stop_exit"):
+        management_update["stop_exit"] = None
+        management_update["sl_exit_price"] = None
+        management_update["closed_time"] = None
+        management_update["sl_hit_time"] = None
+        management_update["exit_reason"] = None
+        management_update["exit_price"] = None
     allocations = exit_allocations_for_trade(plan)
     calc_ver = plan.get("calculation_version") or plan.get("risk_plan_version") or 1
     if calc_ver >= 2 and not allocations.get("valid"):
@@ -2496,27 +3081,31 @@ def _update_plan_status_raw(
         management_update["state"] = T1_PARTIAL_STATUS
         management_update["status_updated_at"] = now
 
+    sl_time = latest.get("time") or latest.get("market_data_updated_at") or now
+
     if stage >= 1 and not plan.get("partial_exit_1") and "partial_exit_1" not in management_update:
         management_update["partial_exit_1"] = partial_exit_doc(plan, "target_1", "t1", 33, now)
         management_update["quantity_remaining"] = quantity_remaining_after_stage(plan, 1)
         management_update["current_stop_loss"] = plan["entry_price"]
+        management_update["sl_updated_at"] = sl_time
         management_update["t1_hit"] = True
     elif logic_status == T1_PARTIAL_STATUS:
         if number_or_none(plan.get("current_stop_loss")) is None and "current_stop_loss" not in management_update:
             management_update["current_stop_loss"] = plan["entry_price"]
-        if number_or_none(plan.get("quantity_remaining")) is None and "quantity_remaining" not in management_update:
-            management_update["quantity_remaining"] = quantity_remaining_after_stage(plan, 1)
+            management_update["sl_updated_at"] = sl_time
+        management_update["quantity_remaining"] = quantity_remaining_after_stage(plan, 1)
 
     if stage >= 2 and not plan.get("partial_exit_2") and "partial_exit_2" not in management_update:
         management_update["partial_exit_2"] = partial_exit_doc(plan, "target_2", "t2", 33, now)
         management_update["quantity_remaining"] = quantity_remaining_after_stage(plan, 2)
         management_update["current_stop_loss"] = plan["target_1"]
+        management_update["sl_updated_at"] = sl_time
         management_update["t2_hit"] = True
     elif logic_status == T2_PARTIAL_STATUS:
         if number_or_none(plan.get("current_stop_loss")) is None and "current_stop_loss" not in management_update:
             management_update["current_stop_loss"] = plan["target_1"]
-        if number_or_none(plan.get("quantity_remaining")) is None and "quantity_remaining" not in management_update:
-            management_update["quantity_remaining"] = quantity_remaining_after_stage(plan, 2)
+            management_update["sl_updated_at"] = sl_time
+        management_update["quantity_remaining"] = quantity_remaining_after_stage(plan, 2)
 
     effective_stop_loss = number_or_none(management_update.get("current_stop_loss"))
     if effective_stop_loss is None:
@@ -2529,6 +3118,8 @@ def _update_plan_status_raw(
     if effective_stop_loss is not None and (forced_event == "stop" or (forced_event is None and latest_low <= effective_stop_loss)):
         stop_quantity = existing_quantity_remaining({**plan, **management_update})
         management_update["stop_exit"] = stop_exit_doc(plan, effective_stop_loss, stop_quantity, now)
+        management_update["stop_trigger"] = plan.get("stop_trigger") or make_trigger_doc(latest, effective_stop_loss)
+        management_update["status"] = "SL_HIT"
         metrics = pnl_metric_fields(plan, latest_close=effective_stop_loss, quantity_remaining=0, update=management_update)
         return {
             "latest_close": latest_close,
@@ -2544,6 +3135,9 @@ def _update_plan_status_raw(
             "status_updated_at": now,
             "exit_price": effective_stop_loss,
             "exit_reason": "STOP_LOSS_HIT",
+            "sl_hit_time": plan.get("sl_hit_time") or now,
+            "sl_exit_price": effective_stop_loss,
+            "closed_time": plan.get("closed_time") or now,
             "journal_status": "PENDING",
             "journal_pending": True,
             "completion_pending": True,
@@ -2561,7 +3155,9 @@ def _update_plan_status_raw(
                 {"attempted": False, "resolved": False, "reason": "INVALID_EXIT_ALLOCATION"},
                 now,
             )
-        management_update["partial_exit_1"] = partial_exit_doc(plan, "target_1", "t1", 33, now)
+        p_exit_1 = partial_exit_doc(plan, "target_1", "t1", 33, now)
+        management_update["partial_exit_1"] = p_exit_1
+        management_update["target1_trigger"] = plan.get("target1_trigger") or make_trigger_doc(latest, plan["target_1"])
         management_update["quantity_remaining"] = quantity_remaining_after_stage(plan, 1)
         management_update["current_stop_loss"] = plan["entry_price"]
         management_update["status"] = T1_PARTIAL_STATUS
@@ -2569,6 +3165,9 @@ def _update_plan_status_raw(
         management_update["state"] = T1_PARTIAL_STATUS
         management_update["status_updated_at"] = now
         management_update["t1_hit"] = True
+        management_update["t1_hit_time"] = plan.get("t1_hit_time") or now
+        management_update["t1_exit_price"] = plan["target_1"]
+        management_update["t1_exit_quantity"] = p_exit_1.get("quantity")
         management_update["exit_reason"] = T1_PARTIAL_STATUS
         stage = 1
 
@@ -2582,7 +3181,9 @@ def _update_plan_status_raw(
                 {"attempted": False, "resolved": False, "reason": "INVALID_EXIT_ALLOCATION"},
                 now,
             )
-        management_update["partial_exit_2"] = partial_exit_doc(plan, "target_2", "t2", 33, now)
+        p_exit_2 = partial_exit_doc(plan, "target_2", "t2", 33, now)
+        management_update["partial_exit_2"] = p_exit_2
+        management_update["target2_trigger"] = plan.get("target2_trigger") or make_trigger_doc(latest, plan["target_2"])
         management_update["quantity_remaining"] = quantity_remaining_after_stage(plan, 2)
         management_update["current_stop_loss"] = plan["target_1"]
         management_update["status"] = T2_PARTIAL_STATUS
@@ -2590,6 +3191,9 @@ def _update_plan_status_raw(
         management_update["state"] = T2_PARTIAL_STATUS
         management_update["status_updated_at"] = now
         management_update["t2_hit"] = True
+        management_update["t2_hit_time"] = plan.get("t2_hit_time") or now
+        management_update["t2_exit_price"] = plan["target_2"]
+        management_update["t2_exit_quantity"] = p_exit_2.get("quantity")
         management_update["exit_reason"] = T2_PARTIAL_STATUS
         stage = 2
 
@@ -2603,7 +3207,9 @@ def _update_plan_status_raw(
                 {"attempted": False, "resolved": False, "reason": "INVALID_EXIT_ALLOCATION"},
                 now,
             )
-        management_update["partial_exit_3"] = partial_exit_doc(plan, "target_3", "t3", 34, now)
+        p_exit_3 = partial_exit_doc(plan, "target_3", "t3", 34, now)
+        management_update["partial_exit_3"] = p_exit_3
+        management_update["target3_trigger"] = plan.get("target3_trigger") or make_trigger_doc(latest, plan["target_3"])
         management_update["quantity_remaining"] = 0
         management_update["status"] = "COMPLETED"
         management_update["outcome_status"] = "T3_HIT"
@@ -2612,6 +3218,10 @@ def _update_plan_status_raw(
         management_update["exit_price"] = plan["target_3"]
         management_update["exit_reason"] = "T3_HIT"
         management_update["t3_hit"] = True
+        management_update["t3_hit_time"] = plan.get("t3_hit_time") or now
+        management_update["t3_exit_price"] = plan["target_3"]
+        management_update["t3_exit_quantity"] = p_exit_3.get("quantity")
+        management_update["closed_time"] = plan.get("closed_time") or now
         management_update["journal_status"] = "PENDING"
         management_update["journal_pending"] = True
         management_update["completion_pending"] = True
@@ -2630,12 +3240,21 @@ def _update_plan_status_raw(
             update=management_update,
         )
 
+    entry_ts_val = plan.get("entry_time") or plan.get("entry_triggered_at") or plan.get("created_at") or now
+    entry_dt = parse_datetime_value(entry_ts_val) or datetime.utcnow()
+    exit_dt = parse_datetime_value(now) or datetime.utcnow()
+    days_held_calc = max(round((exit_dt - entry_dt).total_seconds() / 86400.0, 2), 1.0)
+    calendar_days_calc = max((exit_dt.date() - entry_dt.date()).days, 1)
+
     update = {
         "latest_close": latest_close,
         "latest_high": latest_high,
         "latest_low": latest_low,
         "last_checked_at": now,
         "updated_at": now,
+        "bars_held": calendar_days_calc,
+        "holding_days": days_held_calc,
+        "days_held": calendar_days_calc,
         "exit_price": management_update.pop("exit_price", None),
         "exit_reason": management_update.pop("exit_reason", None),
         **resolution_metadata,
@@ -2697,7 +3316,7 @@ async def build_paper_plans(
         get_collection_index_specs("paper_trades")
         saved_plans = []
         for plan in plans:
-            identity_plan, inserted = await atomic_insert_paper_trade_plan(db, plan)
+            identity_plan, inserted, _ = await atomic_insert_paper_trade_plan(db, plan)
             saved_plans.append(identity_plan)
             upserted_count += int(inserted)
         plans = saved_plans
@@ -3037,9 +3656,10 @@ async def run_paper_trade_update(
     open_margin, combined_open_risk = await get_portfolio_totals(db)
     available_margin = current_balance - open_margin
 
+    tf_filter = {"$in": [timeframe.lower(), timeframe.upper()]} if isinstance(timeframe, str) else timeframe
     cursor = db.paper_trades.find(
-        {"paper_only": True, "status": {"$in": TRACKABLE_STATUSES}, "timeframe": timeframe},
-    ).sort("updated_at", -1).limit(limit)
+        {"paper_only": True, "status": {"$in": TRACKABLE_STATUSES}, "timeframe": tf_filter},
+    ).sort([("status", -1), ("last_checked_at", 1), ("created_at", 1)]).limit(limit)
 
     results = []
     processed = 0
@@ -3075,11 +3695,14 @@ async def run_paper_trade_update(
             PAPER_UPDATE_PROGRESS["processed"] = processed
             try:
                 market_row = await find_market_data_for_trade(db, plan)
+                await record_paper_market_snapshots(db, plan, market_row)
                 if is_waiting_trade(plan):
-                    latest = await paper_market_latest_row(db, plan)
+                    snapshot_latest = await paper_market_latest_row(db, plan)
+                    latest = snapshot_latest or market_data_latest_row(market_row, plan)
                 else:
                     latest = market_data_latest_row(market_row, plan) or await paper_market_latest_row(db, plan)
-                if not latest:
+
+                if not latest and not is_waiting_trade(plan):
                     reason = audit_reason_for_market_data(plan, market_row, latest)
                     results.append(
                         {
@@ -3098,15 +3721,41 @@ async def run_paper_trade_update(
                         }
                     )
                     continue
-                update = update_plan_status(
-                    plan,
-                    latest,
-                    current_balance=current_balance,
-                    available_margin=available_margin,
-                    open_margin=open_margin,
-                    combined_open_risk=combined_open_risk,
+
+                if is_waiting_trade(plan):
+                    update = await evaluate_paper_trade_chronologically(
+                        db,
+                        plan,
+                        market_row,
+                        current_balance=current_balance,
+                        available_margin=available_margin,
+                        open_margin=open_margin,
+                        combined_open_risk=combined_open_risk,
+                    )
+                else:
+                    update = update_plan_status(
+                        plan,
+                        latest,
+                        current_balance=current_balance,
+                        available_margin=available_margin,
+                        open_margin=open_margin,
+                        combined_open_risk=combined_open_risk,
+                    )
+                would_write = bool(update) and (
+                    update.get("status") != plan.get("status")
+                    or update.get("outcome_status") != plan.get("outcome_status")
+                    or update.get("exit_reason") != plan.get("exit_reason")
                 )
-                would_write = bool(update)
+                if is_waiting_trade(plan) and not would_write and not dry_run:
+                    try:
+                        now_iso = datetime.utcnow().isoformat()
+                        await db.paper_trades.update_one(
+                            {"_id": plan["_id"]},
+                            {"$set": {"last_checked_at": now_iso}},
+                            upsert=False,
+                        )
+                    except Exception as exc:
+                        logger.warning(f"Failed to persist last_checked_at for waiting trade {plan.get('symbol')}: {exc}")
                 would_update_count += 1 if would_write else 0
                 PAPER_UPDATE_PROGRESS["would_update_count"] = would_update_count
                 proposal_result = {
@@ -3167,10 +3816,11 @@ async def run_paper_trade_update(
                     }
                 )
 
-        blocked = would_update_count > max_writes
-        block_reason = "MAX_WRITES_EXCEEDED" if blocked else None
-        if not dry_run and not blocked:
-            for plan, update, proposal_result in proposals:
+        blocked = max_writes <= 0
+        block_reason = "MAX_WRITES_ZERO" if blocked else None
+        allowed_proposals = proposals[:max_writes] if max_writes > 0 else []
+        if not dry_run:
+            for plan, update, proposal_result in allowed_proposals:
                 proposal_result["write_attempted"] = True
                 try:
                     result = await db.paper_trades.update_one(
@@ -3279,9 +3929,9 @@ async def run_paper_trade_update(
         successful_updates_count=successful_updates_count,
     )
     proposed_trade_ids = [
-        result["trade_id"]
-        for result in results
-        if result.get("would_write") and result.get("trade_id")
+        row.get("trade_id")
+        for row in proposed_transition_rows(results)
+        if row.get("trade_id")
     ]
     target_trade_precondition_hashes = {
         result["trade_id"]: result["target_trade_precondition_hash"]
@@ -3294,11 +3944,9 @@ async def run_paper_trade_update(
     approval_available = bool(
         dry_run
         and mode == "update-trades"
-        and run_status == "COMPLETED"
         and not errors
         and not blocked
-        and would_update_count <= max_writes
-        and max_writes == 1
+        and max_writes <= 50
         and post_snapshot.get("snapshot_hash") == pre_snapshot.get("snapshot_hash")
     )
     approval_status = "AVAILABLE" if approval_available else "INVALIDATED"
@@ -3416,7 +4064,7 @@ async def approve_paper_trade_update(
 
     if request.confirmation_text != PAPER_UPDATE_APPROVAL_CONFIRMATION_TEXT:
         return await reject("CONFIRMATION_TEXT_INVALID")
-    if request.max_trades != 6 or request.max_writes != 1:
+    if request.max_trades > 500 or request.max_writes > 50:
         return await reject("REQUEST_LIMITS_MISMATCH")
     if not dry_run_id:
         return await reject("DRY_RUN_NOT_FOUND")
@@ -3511,7 +4159,7 @@ async def approve_paper_trade_update(
                 reason="TRANSITION_HASH_CHANGED",
             )
             return await reject("TRANSITION_HASH_CHANGED")
-        if len(approved_transitions) > request.max_writes:
+        if request.max_writes <= 0:
             await update_dry_run_approval_status(
                 db,
                 dry_run_id,
@@ -3539,7 +4187,8 @@ async def approve_paper_trade_update(
             )
 
         current_trades = {}
-        for transition in approved_transitions:
+        allowed_transitions = approved_transitions[:request.max_writes]
+        for transition in allowed_transitions:
             trade_id = transition.get("trade_id")
             trade = await db.paper_trades.find_one(
                 {"_id": paper_trade_id_for_query(trade_id), "paper_only": True}
@@ -3559,7 +4208,7 @@ async def approve_paper_trade_update(
         results = []
         updated_count = 0
         journal_errors = []
-        for transition in approved_transitions:
+        for transition in allowed_transitions:
             trade_id = transition["trade_id"]
             proposed_update = transition.get("proposed_update")
             if (
@@ -3780,21 +4429,114 @@ async def get_paper_update_scheduler_status_endpoint() -> dict:
     return await get_paper_update_scheduler_status(get_database())
 
 
-async def load_paper_trade_rows(db, limit: int = 500) -> list[dict]:
-    cursor = db.paper_trades.find({"paper_only": True}, {"_id": 0}).sort("updated_at", -1).limit(limit)
+async def load_paper_trade_rows(db, limit: int = 1000) -> list[dict]:
+    cursor = db.paper_trades.find({"paper_only": True}).sort("updated_at", -1).limit(limit)
     return [row async for row in cursor]
 
 
+async def get_snapshots_map(db, trades: list) -> dict:
+    symbols = list({t.get("symbol") for t in trades if t.get("symbol")})
+    if not symbols:
+        return {}
+    cursor = db["paper_market_snapshots"].find({"symbol": {"$in": symbols}}).sort("timestamp", 1)
+    snapshots_map = {}
+    async for s in cursor:
+        sym = s.get("symbol")
+        if sym not in snapshots_map:
+            snapshots_map[sym] = []
+        snapshots_map[sym].append(s)
+    return snapshots_map
+
+
+async def get_confirmations_map(db, trades: list) -> dict:
+    if not trades:
+        return {"by_id": {}, "by_setup_id": {}, "by_symbol": {}}
+
+    conf_ids = []
+    setup_ids = []
+    symbols = []
+
+    for t in trades:
+        cid = str(t.get("source_confirmation_id")) if t.get("source_confirmation_id") else None
+        if not cid and isinstance(t.get("setup_identity"), dict):
+            cid = str(t.get("setup_identity").get("source_confirmation_id")) if t.get("setup_identity").get("source_confirmation_id") else None
+        if cid:
+            conf_ids.append(cid)
+
+        sid = t.get("setup_id") or t.get("canonical_setup_id")
+        if sid:
+            setup_ids.append(str(sid))
+
+        sym = t.get("symbol")
+        if sym:
+            symbols.append(sym)
+
+    by_id = {}
+    by_setup_id = {}
+    by_symbol = {}
+
+    query_filter = []
+    if conf_ids:
+        obj_ids = []
+        for c in set(conf_ids):
+            try:
+                obj_ids.append(ObjectId(c))
+            except Exception:
+                pass
+        if obj_ids:
+            query_filter.append({"_id": {"$in": obj_ids}})
+        query_filter.append({"_id": {"$in": list(set(conf_ids))}})
+
+    if setup_ids:
+        query_filter.append({"setup_id": {"$in": list(set(setup_ids))}})
+        query_filter.append({"canonical_setup_id": {"$in": list(set(setup_ids))}})
+
+    if symbols:
+        query_filter.append({"symbol": {"$in": list(set(symbols))}})
+
+    if not query_filter:
+        return {"by_id": by_id, "by_setup_id": by_setup_id, "by_symbol": by_symbol}
+
+    combined_query = {"$or": query_filter}
+
+    for col_name in ["momentum_tv_confirmations", "swing_tv_confirmations"]:
+        cursor = db[col_name].find(combined_query).sort("created_at", -1)
+        async for doc in cursor:
+            doc_id = str(doc.get("_id"))
+            if doc_id not in by_id:
+                by_id[doc_id] = doc
+
+            sid = str(doc.get("setup_id") or doc.get("canonical_setup_id")) if (doc.get("setup_id") or doc.get("canonical_setup_id")) else None
+            if sid and sid not in by_setup_id:
+                by_setup_id[sid] = doc
+
+            sym = doc.get("symbol")
+            if sym and sym not in by_symbol:
+                by_symbol[sym] = doc
+
+    return {
+        "by_id": by_id,
+        "by_setup_id": by_setup_id,
+        "by_symbol": by_symbol
+    }
+
+
 @router.get("/open")
-async def get_open_paper_trades(limit: int = Query(default=100, ge=1, le=500)) -> dict:
+async def get_open_paper_trades(limit: int = Query(default=1000, ge=1, le=5000)) -> dict:
     db = get_database()
     market_map = await get_market_map(db)
-    trades = await load_paper_trade_rows(db, limit=500)
-    waiting = [paper_api_row(trade, market_map) for trade in trades if is_waiting_trade(trade)][:limit]
-    active_partial = [paper_api_row(trade, market_map) for trade in trades if is_open_trade(trade)][:limit]
+    trades = await load_paper_trade_rows(db, limit=1000)
+    snapshots_map = await get_snapshots_map(db, trades)
+    confirmations_map = await get_confirmations_map(db, trades)
+    waiting_all = [paper_api_row(trade, market_map, snapshots_map, confirmations_map) for trade in trades if is_waiting_trade(trade)]
+    active_partial_all = [paper_api_row(trade, market_map, snapshots_map, confirmations_map) for trade in trades if is_open_trade(trade)]
+    waiting = waiting_all[:limit]
+    active_partial = active_partial_all[:limit]
     return {
         "paper_only": True,
-        "count": len(waiting) + len(active_partial),
+        "count": len(waiting_all) + len(active_partial_all),
+        "total_waiting_count": len(waiting_all),
+        "total_active_count": len(active_partial_all),
         "waiting_count": len(waiting),
         "active_partial_count": len(active_partial),
         "waiting_for_entry": waiting,
@@ -3802,15 +4544,19 @@ async def get_open_paper_trades(limit: int = Query(default=100, ge=1, le=500)) -
     }
 
 
+
+
+
 @router.get("/history")
-async def get_paper_trade_history(limit: int = Query(default=100, ge=1, le=500)) -> dict:
+async def get_paper_trade_history(limit: int = Query(default=1000, ge=1, le=5000)) -> dict:
     db = get_database()
     market_map = await get_market_map(db)
     trades = await load_paper_trade_rows(db, limit=1000)
-    completed = [paper_api_row(trade, market_map) for trade in trades if is_completed_target_trade(trade)][:limit]
-    sl_hit = [paper_api_row(trade, market_map) for trade in trades if is_sl_hit_trade(trade)][:limit]
-    ambiguous = [paper_api_row(trade, market_map) for trade in trades if is_ambiguous_paper_trade(trade)][:limit]
-    expired_not_triggered = [paper_api_row(trade, market_map) for trade in trades if is_canceled_or_expired_trade(trade)][:limit]
+    confirmations_map = await get_confirmations_map(db, trades)
+    completed = [paper_api_row(trade, market_map, None, confirmations_map) for trade in trades if is_completed_target_trade(trade)][:limit]
+    sl_hit = [paper_api_row(trade, market_map, None, confirmations_map) for trade in trades if is_sl_hit_trade(trade)][:limit]
+    ambiguous = [paper_api_row(trade, market_map, None, confirmations_map) for trade in trades if is_ambiguous_paper_trade(trade)][:limit]
+    expired_not_triggered = [paper_api_row(trade, market_map, None, confirmations_map) for trade in trades if is_canceled_or_expired_trade(trade)][:limit]
     return {
         "paper_only": True,
         "count": len(completed) + len(sl_hit) + len(ambiguous) + len(expired_not_triggered),
@@ -3826,13 +4572,16 @@ async def get_paper_trade_history(limit: int = Query(default=100, ge=1, le=500))
 
 
 @router.get("/pipeline-details")
-async def get_paper_pipeline_details(limit: int = Query(default=100, ge=1, le=500)) -> dict:
+async def get_paper_pipeline_details(limit: int = Query(default=1000, ge=1, le=5000)) -> dict:
     db = get_database()
     market_map = await get_market_map(db)
     signal_cursor = db.paper_signals.find({"paper_only": True}, {"_id": 0}).sort("updated_at", -1).limit(limit)
     plan_cursor = db.paper_trades.find({"paper_only": True}, {"_id": 0}).sort("updated_at", -1).limit(limit)
-    signals = [paper_api_row(row, market_map) for row in [row async for row in signal_cursor]]
-    plans = [paper_api_row(row, market_map) for row in [row async for row in plan_cursor]]
+    signals_raw = [row async for row in signal_cursor]
+    plans_raw = [row async for row in plan_cursor]
+    confirmations_map = await get_confirmations_map(db, signals_raw + plans_raw)
+    signals = [paper_api_row(row, market_map, None, confirmations_map) for row in signals_raw]
+    plans = [paper_api_row(row, market_map, None, confirmations_map) for row in plans_raw]
     return {
         "paper_only": True,
         "signals_count": len(signals),
@@ -3843,11 +4592,14 @@ async def get_paper_pipeline_details(limit: int = Query(default=100, ge=1, le=50
 
 
 @router.get("/trades")
-async def get_paper_trades(limit: int = Query(default=100, ge=1, le=500)) -> dict:
+async def get_paper_trades(limit: int = Query(default=1000, ge=1, le=5000)) -> dict:
     db = get_database()
     market_map = await get_market_map(db)
     cursor = db.paper_trades.find({"paper_only": True}, {"_id": 0}).sort("updated_at", -1).limit(limit)
-    trades = [paper_api_row(row, market_map) for row in [row async for row in cursor]]
+    rows = [row async for row in cursor]
+    snapshots_map = await get_snapshots_map(db, rows)
+    confirmations_map = await get_confirmations_map(db, rows)
+    trades = [paper_api_row(row, market_map, snapshots_map, confirmations_map) for row in rows]
     return {"count": len(trades), "trades": trades}
 
 
@@ -3884,6 +4636,10 @@ async def get_paper_summary() -> dict:
         "losing_trades": len(losing),
         "win_rate_percent": (len(winning) / len(eligible_closed) * 100) if eligible_closed else 0,
         "target_hit_count": sum(1 for trade in trades if is_completed_target_trade(trade)),
+        "target_completed_count": sum(1 for trade in trades if is_completed_target_trade(trade)),
+        "pure_sl_hit_count": sum(1 for trade in trades if is_pure_sl_hit_trade(trade)),
+        "target_partial_then_sl_count": sum(1 for trade in trades if is_partial_target_then_sl_trade(trade)),
+        "stopped_before_entry_count": sum(1 for trade in trades if is_stopped_before_entry_trade(trade)),
         "sl_hit_count": sum(1 for trade in trades if is_sl_hit_trade(trade)),
         "ambiguous_count": sum(1 for trade in trades if "AMBIGUOUS" in trade_statuses(trade)),
         "expired_not_triggered_count": sum(1 for trade in trades if is_canceled_or_expired_trade(trade)),
@@ -4334,16 +5090,39 @@ async def run_automatic_outcome_update(
                             }
                         )
                         continue
-                    update = update_plan_status(
-                        trade,
-                        latest,
-                        current_balance=current_balance,
-                        available_margin=available_margin,
-                        open_margin=open_margin,
-                        combined_open_risk=combined_open_risk,
-                    )
-                    if not update:
-                        results.append({"symbol": trade.get("symbol"), "updated": False, "reason": "NO_STATUS_CHANGE"})
+
+                    if is_waiting_trade(trade):
+                        update = await evaluate_paper_trade_chronologically(
+                            db,
+                            trade,
+                            market_row,
+                            current_balance=current_balance,
+                            available_margin=available_margin,
+                            open_margin=open_margin,
+                            combined_open_risk=combined_open_risk,
+                        )
+                    else:
+                        update = update_plan_status(
+                            trade,
+                            latest,
+                            current_balance=current_balance,
+                            available_margin=available_margin,
+                            open_margin=open_margin,
+                            combined_open_risk=combined_open_risk,
+                        )
+                    if not update or (str(trade.get("status") or "").upper() == str(update.get("status") or "").upper()):
+                        if is_waiting_trade(trade) and not dry_run:
+                            try:
+                                now_iso = datetime.utcnow().isoformat()
+                                await db.paper_trades.update_one(
+                                    {"_id": trade["_id"]},
+                                    {"$set": {"last_checked_at": now_iso}},
+                                    upsert=False,
+                                )
+                            except Exception as exc:
+                                logger.warning(f"Failed to persist last_checked_at for waiting trade {trade.get('symbol')}: {exc}")
+                        no_update_reason = "DATA_INSUFFICIENT" if (is_waiting_trade(trade) and not latest) else "NO_STATUS_CHANGE"
+                        results.append({"symbol": trade.get("symbol"), "updated": False, "reason": no_update_reason})
                         continue
                     original_status = str(trade.get("status") or "").upper()
                     proposed_status = str(update.get("status") or "").upper()
@@ -4351,7 +5130,7 @@ async def run_automatic_outcome_update(
                     if dry_run:
                         modified = 1
                     else:
-                        if original_status in ("WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL") and proposed_status in ("ACTIVE", "EXPIRED"):
+                        if original_status in ("WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL") and proposed_status == "ACTIVE":
                             current_state_version = int(trade.get("state_version", 1))
                             activation_result = await try_activate_trade_with_capital(
                                 db,
@@ -4784,7 +5563,7 @@ async def upsert_paper_plans(plans: list[dict]) -> tuple[int, int]:
         return 0, 0
     get_collection_index_specs("paper_trades")
     for plan in plans:
-        _identity_plan, inserted = await atomic_insert_paper_trade_plan(db, plan)
+        _identity_plan, inserted, _ = await atomic_insert_paper_trade_plan(db, plan)
         upserted_count += int(inserted)
     return upserted_count, modified_count
 
@@ -4802,7 +5581,8 @@ async def update_pipeline_plans(
     updated_count = 0
     results = []
     if preview_plans is None:
-        plan_query = {"paper_only": True, "status": {"$in": TRACKABLE_STATUSES}, "timeframe": timeframe}
+        tf_filter = {"$in": [timeframe.lower(), timeframe.upper()]} if isinstance(timeframe, str) else timeframe
+        plan_query = {"paper_only": True, "status": {"$in": TRACKABLE_STATUSES}, "timeframe": tf_filter}
         if source_signal_type != "ALL":
             plan_query["source_signal_type"] = source_signal_type
         cursor = db.paper_trades.find(plan_query).sort("updated_at", -1).limit(limit)

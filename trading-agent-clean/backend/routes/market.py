@@ -33,6 +33,7 @@ from nse_client import fetch_broad_market_nse_quotes, fetch_nse_index_quotes
 from nse_universe import get_supported_indexes, get_universe_result
 from routes.staleness import is_score_stale
 from security.operator_intent import OPERATOR_INTENT_HEADER, require_operator_intent_value
+from routes.scan import sync_scan_rows_from_market_data
 from services.pipeline_run_lock import (
     PipelineLockLost,
     PipelineRunBusy,
@@ -1051,9 +1052,28 @@ async def _load_all_market_data_real(
     mongo_upsert_seconds = seconds_since(mongo_timer)
 
     finished_at = utc_now_iso()
+    scan_run_id = await sync_scan_rows_from_market_data(
+        db,
+        rows=rows_to_write,
+        selected_index=clean_index,
+        force_refresh=force_refresh,
+        now=finished_at,
+        lease=lease,
+    )
+
+    # --- Auto-refresh market context after BROAD_MARKET_750 market load ---
+    if clean_index == "BROAD_MARKET_750" and rows_to_write:
+        try:
+            from routes.scan import _refresh_market_context
+            await _refresh_market_context(db, rows_to_write, finished_at)
+        except Exception:
+            logger.warning("Market context refresh failed after market_load_all", exc_info=True)
+
+
     duration_seconds = seconds_since(total_timer)
     response = {
         "index_name": clean_index,
+        "scan_run_id": scan_run_id,
         "universe_count": universe["count"],
         "processed": processed,
         "dry_run": False,

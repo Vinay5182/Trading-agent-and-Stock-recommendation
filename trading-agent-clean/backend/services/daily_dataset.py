@@ -150,15 +150,16 @@ WAIT_RETEST_SOURCE_STATUSES = {"WAIT_FOR_RETEST", "WAIT_RETEST", "RETEST_WAIT"}
 REJECTED_SOURCE_STATUSES = {"REJECTED", "STRATEGY_REJECTED", "NO_TRADE", "AVOID", "BLOCKED"}
 TECHNICAL_FAILED_SOURCE_STATUSES = {"TECHNICAL_FAILED", "TECHNICAL_FAILURE", "TV_CONFIRMATION_EXCEPTION"}
 TRADE_PLAN_FIELD_ALIASES = {
-    "entry_price": ("paper_entry_price", "entry_price", "entry"),
-    "stop_loss": ("paper_stop_loss", "stop_loss", "sl"),
-    "target_1": ("paper_target_1", "target_1", "t1"),
-    "target_2": ("paper_target_2", "target_2", "t2"),
-    "target_3": ("paper_target_3", "target_3", "t3"),
-    "risk_reward_1": ("paper_rr_1", "risk_reward_1", "rr", "risk_reward"),
-    "risk_reward_2": ("paper_rr_2", "risk_reward_2"),
-    "risk_reward_3": ("paper_rr_3", "risk_reward_3"),
+    "entry_price": ("paper_entry_price", "entry_price", "projected_entry_price", "entry", "current_price", "open_price"),
+    "stop_loss": ("paper_stop_loss", "stop_loss", "projected_stop_loss", "sl"),
+    "target_1": ("paper_target_1", "target_1", "projected_target_1", "t1"),
+    "target_2": ("paper_target_2", "target_2", "projected_target_2", "t2"),
+    "target_3": ("paper_target_3", "target_3", "projected_target_3", "t3"),
+    "risk_reward_1": ("paper_rr_1", "risk_reward_1", "projected_rr_1", "rr", "risk_reward"),
+    "risk_reward_2": ("paper_rr_2", "risk_reward_2", "projected_rr_2"),
+    "risk_reward_3": ("paper_rr_3", "risk_reward_3", "projected_rr_3"),
     "position_side": ("position_side", "side", "direction"),
+    "atr": ("atr_14", "atr", "volatility_atr"),
 }
 RISK_FLAG_FIELDS = (
     "fake_breakout_risk",
@@ -168,7 +169,7 @@ RISK_FLAG_FIELDS = (
     "trap_reason",
     "trap_summary",
 )
-PAPER_TRADE_ID_FIELDS = ("paper_trade_id", "_id", "id")
+PAPER_TRADE_ID_FIELDS = ("_id", "paper_trade_id", "setup_id", "id")
 PAPER_SIGNAL_ID_FIELDS = ("paper_signal_id", "signal_id", "source_signal_id")
 PAPER_SETUP_ID_FIELDS = ("setup_id", "canonical_setup_id")
 PAPER_CANDIDATE_ID_FIELDS = ("candidate_id", "scored_candidate_id")
@@ -630,7 +631,7 @@ def build_daily_dataset_candidate_row(
             "trade_quality_grade": GRADE_NO_GRADE,
             "trap_status": TRAP_UNKNOWN,
         },
-        "trade_plan_snapshot": {},
+        "trade_plan_snapshot": normalize_trade_plan_snapshot(scored_candidate),
         "paper_trade_link": {"link_status": PAPER_LINK_PENDING},
         "lifecycle_snapshot": {"lifecycle_status": LIFECYCLE_NOT_STARTED},
         "future_outcome": {"outcome_state": OUTCOME_NOT_READY},
@@ -886,6 +887,68 @@ def normalize_trade_plan_snapshot(confirmation: Mapping[str, Any]) -> dict[str, 
         value = _first_present_from_aliases(confirmation, aliases)
         if value not in (None, ""):
             snapshot[output_field] = _safe_json_value(value)
+
+    entry = _first_number(
+        snapshot.get("entry_price"),
+        _first_present_from_aliases(confirmation, ("paper_entry_price", "entry_price", "projected_entry_price", "entry", "current_price", "open_price")),
+    )
+    if entry is not None and entry > 0:
+        snapshot["entry_price"] = round(entry, 2)
+
+        has_explicit_atr = _first_present_from_aliases(confirmation, ("atr_14", "atr", "volatility_atr")) not in (None, "")
+        atr = _first_number(
+            snapshot.get("atr"),
+            _first_present_from_aliases(confirmation, ("atr_14", "atr", "volatility_atr")),
+        )
+        if atr is None or atr <= 0:
+            atr = round(entry * 0.015, 2)
+
+        if has_explicit_atr or "atr" in snapshot:
+            snapshot["atr"] = round(atr, 2)
+
+        sl = _first_number(
+            snapshot.get("stop_loss"),
+            _first_present_from_aliases(confirmation, ("paper_stop_loss", "stop_loss", "projected_stop_loss", "sl")),
+        )
+        if sl is None or sl <= 0 or sl >= entry:
+            sl = round(max(0.01, entry - (1.5 * atr)), 2)
+            snapshot["atr"] = round(atr, 2)
+        snapshot["stop_loss"] = round(sl, 2)
+
+        risk_per_share = max(0.01, entry - sl)
+
+        t1 = _first_number(
+            snapshot.get("target_1"),
+            _first_present_from_aliases(confirmation, ("paper_target_1", "target_1", "projected_target_1", "t1")),
+        )
+        if t1 is None or t1 <= entry:
+            t1 = round(entry + (1.5 * risk_per_share), 2)
+        snapshot["target_1"] = round(t1, 2)
+
+        t2 = _first_number(
+            snapshot.get("target_2"),
+            _first_present_from_aliases(confirmation, ("paper_target_2", "target_2", "projected_target_2", "t2")),
+        )
+        if t2 is None or t2 <= t1:
+            t2 = round(entry + (3.0 * risk_per_share), 2)
+        snapshot["target_2"] = round(t2, 2)
+
+        t3 = _first_number(
+            snapshot.get("target_3"),
+            _first_present_from_aliases(confirmation, ("paper_target_3", "target_3", "projected_target_3", "t3")),
+        )
+        if t3 is None or t3 <= t2:
+            t3 = round(entry + (4.5 * risk_per_share), 2)
+        snapshot["target_3"] = round(t3, 2)
+
+        rr1 = _first_number(
+            snapshot.get("risk_reward_1"),
+            _first_present_from_aliases(confirmation, ("paper_rr_1", "risk_reward_1", "projected_rr_1", "rr", "risk_reward")),
+        )
+        if rr1 is None or rr1 <= 0:
+            rr1 = round((t1 - entry) / risk_per_share, 2) if risk_per_share > 0 else 1.5
+        snapshot["risk_reward_1"] = round(rr1, 2)
+
     if snapshot:
         snapshot["plan_source"] = _safe_json_value(confirmation.get("plan_source") or "tv_confirmation")
     return snapshot
@@ -1497,6 +1560,15 @@ def build_paper_trade_match_queries(paper_trade: Mapping[str, Any]) -> list[dict
                     field,
                 )
 
+        for field in PAPER_TRADE_ID_FIELDS:
+            value = paper_trade.get(field)
+            if value not in (None, ""):
+                _append_match_query(
+                    queries,
+                    _dataset_current_query({"identity.strategy_type": strategy_type, "identity.candidate_key": str(value)}),
+                    field,
+                )
+
         for field in PAPER_CANDIDATE_ID_FIELDS:
             value = paper_trade.get(field)
             if value in (None, ""):
@@ -1711,13 +1783,21 @@ def build_confirmation_match_queries(confirmation: Mapping[str, Any], *, strateg
             )
 
     source_candle_at = _confirmation_source_candle_at(confirmation)
-    if trade_date and symbol and source_candle_at:
+    if trade_date and symbol:
+        if source_candle_at:
+            queries.append(
+                {
+                    "identity.trade_date": trade_date,
+                    "identity.canonical_symbol": symbol,
+                    "identity.strategy_type": clean_strategy,
+                    "identity.source_candle_at": source_candle_at,
+                }
+            )
         queries.append(
             {
                 "identity.trade_date": trade_date,
                 "identity.canonical_symbol": symbol,
                 "identity.strategy_type": clean_strategy,
-                "identity.source_candle_at": source_candle_at,
             }
         )
 
@@ -2783,13 +2863,24 @@ async def get_daily_dataset_rows(
 
     projection = {
         "identity": 1,
-        "decision_snapshot.action": 1,
-        "tv_confirmation_snapshot.status": 1,
-        "lifecycle_snapshot.lifecycle_status": 1,
+        "raw_market_snapshot": 1,
+        "decision_snapshot": 1,
+        "tv_confirmation_snapshot": 1,
+        "trade_plan_snapshot": 1,
+        "lifecycle_snapshot": 1,
         "ml_label": 1,
-        "future_outcome.outcome_state": 1,
+        "future_outcome": 1,
         "audit_metadata": 1,
     }
+
+    def _sanitize_objectids(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {k: _sanitize_objectids(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [_sanitize_objectids(x) for x in obj]
+        elif type(obj).__name__ == "ObjectId":
+            return str(obj)
+        return obj
 
     try:
         find = getattr(collection, "find", None)
@@ -2799,7 +2890,8 @@ async def get_daily_dataset_rows(
                 cursor = cursor.sort([("identity.trade_date", -1), ("identity.dataset_id", 1)])
             if skip > 0 and hasattr(cursor, "skip"):
                 cursor = cursor.skip(skip)
-            return await _cursor_to_list(cursor, limit=limit)
+            raw_rows = await _cursor_to_list(cursor, limit=limit)
+            return _sanitize_objectids(raw_rows)
     except Exception:
         pass
     return []

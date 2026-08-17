@@ -135,7 +135,7 @@ def test_tv_confirmation_upsert_identity_remains_status_aware(monkeypatch):
     }
     assert upsert is True
     assert update["$setOnInsert"] == {"created_at": "2026-07-01T13:12:00.000000Z"}
-    assert update["$unset"] == {"trade_allowed": ""}
+    assert "$unset" not in update
 
 
 def test_serialization_exposes_named_timestamp_fields_without_created_fallback():

@@ -255,6 +255,7 @@ def add_unlinked_candidate(db: FakeDB) -> None:
             "tradingview_symbol": "NSE:UNLINKED",
             "scan_run_id": "scan-unlinked",
             "score": 70,
+            "trend_score": 70,
             "momentum_score": 70,
             "momentum_candidate": True,
             "momentum_status": "MOMENTUM_PRECHECK_PASSED",

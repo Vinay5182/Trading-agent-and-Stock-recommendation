@@ -16,7 +16,7 @@ PIPELINE_RUN_FAILED = "PIPELINE_RUN_FAILED"
 INVALID_SCORE_INPUT = "INVALID_SCORE_INPUT"
 
 LOCK_DOMAIN = "market_pipeline_mutation"
-DEFAULT_LEASE_SECONDS = 15 * 60
+DEFAULT_LEASE_SECONDS = 120
 BUSY_MESSAGE = "Another market pipeline operation is already running."
 
 

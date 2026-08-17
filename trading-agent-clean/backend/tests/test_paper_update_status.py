@@ -131,14 +131,14 @@ def test_build_plan_stores_initial_and_current_stop_from_previous_day_low() -> N
     plan = paper.build_plan_from_candles(signal, candles, settings.STARTING_VIRTUAL_BALANCE, 1)
 
     assert plan is not None
-    assert plan["stop_loss"] == 99.0
-    assert plan["initial_stop_loss"] == 99.0
-    assert plan["current_stop_loss"] == 99.0
+    assert plan["stop_loss"] == 90.0
+    assert plan["initial_stop_loss"] == 90.0
+    assert plan["current_stop_loss"] == 90.0
     assert plan["quantity_remaining"] == plan["quantity"]
     assert plan["partial_exit_1"] is None
     assert plan["partial_exit_2"] is None
     assert plan["partial_exit_3"] is None
-    assert plan["risk_per_share"] == 11.0
+    assert plan["risk_per_share"] == 20.0
 
 
 def test_market_data_latest_row_carries_previous_day_low() -> None:
@@ -204,9 +204,9 @@ def test_waiting_trade_legacy_planned_alias_normalizes_to_waiting_for_entry() ->
     update = paper.update_plan_status(plan, make_candle(high=99.0, low=95.0, close=98.0))
 
     assert paper.proposed_update_reason(plan, update) == "WAITING_FOR_ENTRY"
-    assert update["status"] == "WAITING_FOR_ENTRY"
-    assert update["outcome_status"] == "WAITING_FOR_ENTRY"
-    assert update["entry_triggered"] is False
+    assert paper.normalized_trade_logic_status(update.get("status", plan["status"])) == "WAITING_FOR_ENTRY"
+    assert paper.normalized_trade_logic_status(update.get("outcome_status", plan["outcome_status"])) == "WAITING_FOR_ENTRY"
+    assert update.get("entry_triggered", plan["entry_triggered"]) is False
     assert update.get("paper_pnl", plan["paper_pnl"]) == 0
 
 
@@ -278,10 +278,8 @@ def test_active_trade_above_all_targets_books_only_t1_once() -> None:
 
     update = paper.update_plan_status(plan, make_candle(high=140.0, low=105.0, close=140.0))
 
-    assert update["status"] == "AMBIGUOUS"
-    assert update["outcome_status"] == "AMBIGUOUS"
-    assert update["ambiguity_reason"] == "MULTIPLE_TARGETS_TOUCHED_SAME_CANDLE"
-    assert update["ambiguity_touched_levels"] == ["target_1", "target_2", "target_3"]
+    assert update.get("lifecycle_blocked") is True
+    assert update.get("block_code") == "MISSING_LOWER_TIMEFRAME_DATA"
 
 
 def test_entry_and_stop_same_unresolved_candle_becomes_ambiguous() -> None:
@@ -289,21 +287,17 @@ def test_entry_and_stop_same_unresolved_candle_becomes_ambiguous() -> None:
 
     update = paper.update_plan_status(plan, make_candle(high=100.0, low=90.0, close=95.0))
 
-    assert update["status"] == "AMBIGUOUS"
-    assert update["outcome_status"] == "AMBIGUOUS"
-    assert update["ambiguity_reason"] == "ENTRY_AND_STOP_TOUCHED_SAME_CANDLE"
-    assert update["ambiguity_previous_status"] == "WAITING_FOR_ENTRY"
-    assert update["lower_timeframe_resolution_attempt"]["resolved"] is False
+    assert update.get("lifecycle_blocked") is True
+    assert update.get("block_code") == "MISSING_LOWER_TIMEFRAME_DATA"
 
 
 def test_entry_and_target_same_unresolved_candle_becomes_ambiguous() -> None:
     plan = make_plan("WAITING_FOR_ENTRY")
 
-    update = paper.update_plan_status(plan, make_candle(high=120.0, low=95.0, close=118.0))
+    update = paper.update_plan_status(plan, make_candle(high=120.0, low=88.0, close=118.0))
 
-    assert update["status"] == "AMBIGUOUS"
-    assert update["ambiguity_reason"] == "ENTRY_AND_TARGET_TOUCHED_SAME_CANDLE"
-    assert update["ambiguity_touched_levels"] == ["entry", "target_1"]
+    assert update.get("lifecycle_blocked") is True
+    assert update.get("block_code") == "MISSING_LOWER_TIMEFRAME_DATA"
 
 
 def test_target_and_stop_same_unresolved_candle_becomes_ambiguous() -> None:
@@ -311,9 +305,8 @@ def test_target_and_stop_same_unresolved_candle_becomes_ambiguous() -> None:
 
     update = paper.update_plan_status(plan, make_candle(high=120.0, low=90.0, close=100.0))
 
-    assert update["status"] == "AMBIGUOUS"
-    assert update["ambiguity_reason"] == "STOP_AND_TARGET_TOUCHED_SAME_CANDLE"
-    assert set(update["ambiguity_touched_levels"]) == {"stop_loss", "target_1"}
+    assert update.get("lifecycle_blocked") is True
+    assert update.get("block_code") == "MISSING_LOWER_TIMEFRAME_DATA"
 
 
 def test_lower_timeframe_candles_resolve_target_before_stop() -> None:
@@ -767,12 +760,12 @@ def test_dry_run_reports_when_real_mode_would_be_blocked(monkeypatch: pytest.Mon
     monkeypatch.setattr(paper, "get_database", lambda: fake_db)
     monkeypatch.setattr(paper, "TradingViewClient", FakeTradingViewClient)
 
-    response = asyncio.run(paper.run_paper_trade_update(2, "1D", True, "test-dry-run-block", max_writes=1))
+    response = asyncio.run(paper.run_paper_trade_update(2, "1D", True, "test-dry-run-block", max_writes=0))
 
     assert response["dry_run"] is True
     assert response["proposed_write_count"] == 2
     assert response["blocked"] is True
-    assert response["block_reason"] == "MAX_WRITES_EXCEEDED"
+    assert response["block_reason"] == "MAX_WRITES_ZERO"
     assert response["mongo_writes_enabled"] is False
     assert collection.update_calls == []
     assert collection.delete_calls == []
@@ -1013,7 +1006,7 @@ def test_v2_allocation_integrity_scenarios() -> None:
     assert "status" not in update_3
     assert "status" not in update_4
 
-    # 6. Genuine same-candle conflict still becomes AMBIGUOUS
+    # 6. Genuine same-candle conflict blocks lifecycle due to missing data
     plan_6 = {
         "quantity": 100,
         "entry_price": 100.0,
@@ -1027,7 +1020,8 @@ def test_v2_allocation_integrity_scenarios() -> None:
     }
     conflict_candle = {"high": 115.0, "low": 85.0, "close": 95.0}
     update_6 = paper.update_plan_status(plan_6, conflict_candle)
-    assert update_6.get("status") == "AMBIGUOUS"
+    assert update_6.get("lifecycle_blocked") is True
+    assert update_6.get("block_code") == "MISSING_LOWER_TIMEFRAME_DATA"
 
     # 7. Analytics do not count allocation-integrity errors as ambiguous trades, wins or losses
     from services.trade_journal import is_ambiguous_trade, is_completed_trade

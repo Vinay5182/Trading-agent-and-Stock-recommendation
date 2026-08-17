@@ -62,6 +62,13 @@ class FakeCollection:
             self.rows.append(row)
         return FakeBulkResult()
 
+    async def delete_many(self, query: dict | None = None):
+        if query and "$ne" in query.get("scan_run_id", {}):
+            ne_target = query["scan_run_id"]["$ne"]
+            self.rows = [r for r in self.rows if r.get("scan_run_id") == ne_target]
+        return SimpleNamespace(deleted_count=0)
+
+
     async def update_one(self, query: dict, update: dict, upsert: bool = False):
         self.update_calls.append((query, update, upsert))
         row = next((candidate for candidate in self.rows if matches(candidate, query)), None)
@@ -96,6 +103,8 @@ def fake_db() -> SimpleNamespace:
         momentum_tv_confirmations=FakeCollection(),
         scan_runs=FakeCollection(),
         scan_rows=FakeCollection(),
+        market_data=FakeCollection(),
+        market_load_state=FakeCollection(),
         pipeline_run_locks=FakeCollection(),
         pipeline_run_status=FakeCollection(),
         paper_update_runs=FakeCollection(),
@@ -140,3 +149,53 @@ def test_run_scan_uses_real_quote_rows_and_persists_scan_rows(monkeypatch) -> No
         assert rows["rows"][0]["scan_run_id"] == result["scan_run_id"]
 
     asyncio.run(run())
+
+
+def test_sync_scan_rows_from_market_data() -> None:
+    async def run() -> None:
+        db = fake_db()
+        market_rows = [
+            {
+                "symbol": "RELIANCE",
+                "canonical_symbol": "RELIANCE",
+                "exchange": "NSE",
+                "current_price": 2500.0,
+                "change_percent": 1.5,
+                "day_high": 2520.0,
+                "day_low": 2480.0,
+                "traded_volume": 1000000,
+                "traded_value": 2500000000.0,
+                "source_used": "NSE_PRIMARY",
+                "is_complete": True,
+            },
+            {
+                "symbol": "TCS",
+                "canonical_symbol": "TCS",
+                "exchange": "NSE",
+                "current_price": 3800.0,
+                "change_percent": -0.5,
+                "day_high": 3850.0,
+                "day_low": 3780.0,
+                "traded_volume": 500000,
+                "traded_value": 1900000000.0,
+                "source_used": "NSE_PRIMARY",
+                "is_complete": True,
+            },
+        ]
+
+        scan_run_id = await scan.sync_scan_rows_from_market_data(
+            db,
+            rows=market_rows,
+            selected_index="BROAD_MARKET_750",
+            force_refresh=False,
+        )
+
+        assert scan_run_id.startswith("scan-")
+        assert len(db.scan_rows.rows) == 2
+        symbols = [r["symbol"] for r in db.scan_rows.rows]
+        assert "RELIANCE" in symbols
+        assert "TCS" in symbols
+        assert db.scan_rows.rows[0]["scan_run_id"] == scan_run_id
+
+    asyncio.run(run())
+

@@ -281,13 +281,13 @@ def test_dry_run_blocks_when_proposed_writes_exceed_limit(monkeypatch) -> None:
     monkeypatch.setattr(paper, "TradingViewClient", FakeTradingViewEntryClient)
     client = TestClient(app)
 
-    response = client.post("/api/paper/update-trades?dry_run=true&max_trades=6&max_writes=1")
+    response = client.post("/api/paper/update-trades?dry_run=true&max_trades=6&max_writes=0")
 
     assert response.status_code == 200
     payload = response.json()
     assert payload["dry_run"] is True
     assert payload["blocked"] is True
-    assert payload["block_reason"] == "MAX_WRITES_EXCEEDED"
+    assert payload["block_reason"] == "MAX_WRITES_ZERO"
     assert payload["mongo_writes_enabled"] is False
     assert payload["proposed_write_count"] == 2
     assert payload["updated_count"] == 0

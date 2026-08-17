@@ -118,12 +118,10 @@ def test_swing_save_unsets_legacy_field(monkeypatch):
     # We call save_confirmation_row
     asyncio.run(save_confirmation_row(row))
 
-    # Check what update_one was called with
     update_calls = db.swing_tv_confirmations.update_calls
     assert len(update_calls) == 1
     query, update, upsert = update_calls[0]
-    assert "$unset" in update
-    assert "trade_allowed" in update["$unset"]
+    assert "$unset" not in update
 
 def test_momentum_save_unsets_legacy_field(monkeypatch):
     row = trade_ready_row("MOMENTSAVE")
@@ -136,8 +134,7 @@ def test_momentum_save_unsets_legacy_field(monkeypatch):
     update_calls = db.momentum_tv_confirmations.update_calls
     assert len(update_calls) == 1
     query, update, upsert = update_calls[0]
-    assert "$unset" in update
-    assert "trade_allowed" in update["$unset"]
+    assert "$unset" not in update
 
 def test_setup_identity_no_collision():
     swing_signal = {

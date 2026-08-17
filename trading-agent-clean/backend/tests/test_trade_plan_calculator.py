@@ -6,6 +6,19 @@ from services.risk_reward_targets import TARGET_R_MULTIPLES, calculate_r_multipl
 from config import settings
 
 
+@pytest.fixture(autouse=True)
+def override_test_balance():
+    orig_balance = settings.STARTING_VIRTUAL_BALANCE
+    orig_risk = settings.PORTFOLIO_RISK_LIMIT_PERCENT
+    object.__setattr__(settings, "STARTING_VIRTUAL_BALANCE", 250000.0)
+    object.__setattr__(settings, "PORTFOLIO_RISK_LIMIT_PERCENT", 5.0)
+    try:
+        yield
+    finally:
+        object.__setattr__(settings, "STARTING_VIRTUAL_BALANCE", orig_balance)
+        object.__setattr__(settings, "PORTFOLIO_RISK_LIMIT_PERCENT", orig_risk)
+
+
 def test_long_targets_use_1r_2r_3r_ladder() -> None:
     targets = calculate_r_multiple_targets(100.0, 90.0)
 
@@ -28,8 +41,8 @@ def test_trade_plan_raw_targets_no_longer_use_old_2r_3r_4r_ladder() -> None:
         daily_ema50=None,
         nearest_weekly_support=None,
         confirmed_resistance_zones=[],
-        current_balance=settings.STARTING_VIRTUAL_BALANCE,
-        available_margin=settings.STARTING_VIRTUAL_BALANCE,
+        current_balance=500000.0,
+        available_margin=500000.0,
         combined_open_risk=0.0,
         setup_grade="A+",
         allow_sl_override=True,
@@ -265,12 +278,13 @@ def test_raw_targets_and_resistance_adjustments() -> None:
         daily_ema50=None,
         nearest_weekly_support=None,
         confirmed_resistance_zones=zones,
-        current_balance=settings.STARTING_VIRTUAL_BALANCE,
-        available_margin=settings.STARTING_VIRTUAL_BALANCE,
+        current_balance=1500000.0,
+        available_margin=1500000.0,
         combined_open_risk=0.0,
         setup_grade="A+",
     )
-    assert p_adj["block_code"] in ("TARGET_ORDER_INVALID", "TARGET_STRUCTURE_COLLISION")
+    assert p_adj["activation_allowed"] is True
+    assert p_adj["final_targets"] == [115.0, 125.0, 136.0]
 
 
 def test_target_failures() -> None:
@@ -313,13 +327,14 @@ def test_position_sizing_rules() -> None:
         daily_ema50=None,
         nearest_weekly_support=None,
         confirmed_resistance_zones=[],
-        current_balance=settings.STARTING_VIRTUAL_BALANCE,  # 500k balance -> risk budget = 2500
-        available_margin=settings.STARTING_VIRTUAL_BALANCE,
+        current_balance=500000.0,  # 500k balance -> risk budget = 2500, 1.5% cap = 7,500 margin -> max 187 shares
+        available_margin=500000.0,
         combined_open_risk=0.0,
         setup_grade="A+",
     )
     assert p["quantity_by_risk"] == 253
-    assert p["final_quantity"] == 253
+    assert p["quantity_by_capital_cap"] == 187
+    assert p["final_quantity"] == 187
     assert p["maximum_loss"] <= 2500.0
 
 
@@ -337,16 +352,16 @@ def test_allocation_math() -> None:
         daily_ema50=None,
         nearest_weekly_support=None,
         confirmed_resistance_zones=[],
-        current_balance=settings.STARTING_VIRTUAL_BALANCE,  # 1M balance -> risk budget = 5000
-        available_margin=settings.STARTING_VIRTUAL_BALANCE,
+        current_balance=1000000.0,  # 1M balance -> risk budget = 5000, 1.5% cap = 15,000 margin -> max 375 shares
+        available_margin=1000000.0,
         combined_open_risk=0.0,
         setup_grade="A+",
     )
-    assert p_norm["final_quantity"] == 416
-    assert p_norm["t1_quantity"] == 137
-    assert p_norm["t2_quantity"] == 137
-    assert p_norm["t3_quantity"] == 142
-    assert p_norm["t1_quantity"] + p_norm["t2_quantity"] + p_norm["t3_quantity"] == 416
+    assert p_norm["final_quantity"] == 375
+    assert p_norm["t1_quantity"] == 123
+    assert p_norm["t2_quantity"] == 123
+    assert p_norm["t3_quantity"] == 129
+    assert p_norm["t1_quantity"] + p_norm["t2_quantity"] + p_norm["t3_quantity"] == 375
 
 
 def test_numeric_examples() -> None:
@@ -376,7 +391,8 @@ def test_numeric_examples() -> None:
     assert p_a["risk_per_share"] == 5.0
     assert p_a["risk_budget"] == 500.0
     assert p_a["quantity_by_risk"] == 100
-    assert p_a["final_quantity"] == 100
+    assert p_a["quantity_by_capital_cap"] == 37
+    assert p_a["final_quantity"] == 37
     assert p_a["activation_allowed"] is False
     assert p_a["block_code"] == "RISK_QUANTITY_BELOW_MINIMUM"
 
@@ -396,17 +412,18 @@ def test_numeric_examples() -> None:
         daily_ema50=None,
         nearest_weekly_support=None,
         confirmed_resistance_zones=[],
-        current_balance=100000.0,
-        available_margin=100000.0,
+        current_balance=1000000.0,
+        available_margin=1000000.0,
         combined_open_risk=0.0,
         setup_grade="A+",
     )
     assert p_b["entry_price"] == 500.0
     assert p_b["final_stop_loss"] == 485.0
     assert p_b["risk_per_share"] == 15.0
-    assert p_b["quantity_by_risk"] == 33
-    assert p_b["final_quantity"] == 33
-    assert p_b["maximum_loss"] <= 500.0
+    assert p_b["quantity_by_risk"] == 333
+    assert p_b["quantity_by_capital_cap"] == 75
+    assert p_b["final_quantity"] == 75
+    assert p_b["maximum_loss"] <= 5000.0
     assert p_b["activation_allowed"] is True
 
     # ==========================================
@@ -425,8 +442,8 @@ def test_numeric_examples() -> None:
         daily_ema50=None,
         nearest_weekly_support=None,
         confirmed_resistance_zones=[],
-        current_balance=settings.STARTING_VIRTUAL_BALANCE,
-        available_margin=settings.STARTING_VIRTUAL_BALANCE,
+        current_balance=1000000.0,
+        available_margin=1000000.0,
         combined_open_risk=0.0,
         setup_grade="A+",
         allow_sl_override=True,
@@ -438,7 +455,8 @@ def test_numeric_examples() -> None:
     assert p_c["risk_per_share"] == 8.0
     assert p_c["raw_targets"] == [108.0, 116.0, 124.0]
     assert p_c["quantity_by_risk"] == 625
-    assert p_c["final_quantity"] == 625
+    assert p_c["quantity_by_capital_cap"] == 375
+    assert p_c["final_quantity"] == 375
 
     # ==========================================
     # EXAMPLE D — STRUCTURE-ADJUSTED T1 BELOW 1R
@@ -470,8 +488,8 @@ def test_numeric_examples() -> None:
             daily_ema50=None,
             nearest_weekly_support=None,
             confirmed_resistance_zones=zones_d,
-            current_balance=settings.STARTING_VIRTUAL_BALANCE,
-            available_margin=settings.STARTING_VIRTUAL_BALANCE,
+            current_balance=500000.0,
+            available_margin=500000.0,
             combined_open_risk=0.0,
             setup_grade="A+",
         )

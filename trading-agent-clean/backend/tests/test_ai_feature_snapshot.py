@@ -102,6 +102,9 @@ def fake_paper_trade(status: str = "NOT_TRIGGERED") -> dict:
         "paper_only": True,
         "status": status,
         "outcome_status": status,
+        "entry_triggered": True,
+        "bought_quantity": 10,
+        "executed_quantity": 10,
         "entry_price": 126.0,
         "stop_loss": 119.0,
         "target_1": 140.0,
@@ -258,13 +261,13 @@ def test_paper_outcome_attaches_only_after_trade_closes() -> None:
 @pytest.mark.parametrize(
     ("status", "paper_pnl", "expected"),
     [
-        ("TARGET_2_HIT", 0.0, "WIN"),
-        ("STOPPED", 0.0, "LOSS"),
+        ("TARGET_2_HIT", 100.0, "WIN"),
+        ("STOPPED", -50.0, "LOSS"),
         ("CLOSED", 0.0, "BREAKEVEN"),
-        ("AMBIGUOUS", 300.0, "UNKNOWN"),
+        ("AMBIGUOUS", None, "UNKNOWN"),
     ],
 )
-def test_closed_paper_outcome_result_labels(status: str, paper_pnl: float, expected: str) -> None:
+def test_closed_paper_outcome_result_labels(status: str, paper_pnl: float | None, expected: str) -> None:
     snapshot = build_ai_feature_snapshot(
         fake_scored_candidate(),
         fake_market_data(),
@@ -274,7 +277,9 @@ def test_closed_paper_outcome_result_labels(status: str, paper_pnl: float, expec
         snapshot_time="2026-01-01T09:15:00",
     )
     trade = fake_paper_trade(status)
+    trade["exit_reason"] = status
     trade["paper_pnl"] = paper_pnl
+    trade["realized_pnl"] = paper_pnl
     trade["updated_at"] = "2026-01-07T15:30:00"
 
     updated = attach_closed_paper_trade_outcome(snapshot, trade)

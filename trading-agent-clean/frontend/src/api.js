@@ -154,6 +154,22 @@ export const getAiFeatureDatasetSummary = ({ strategyType, timeframe } = {}, opt
 export const getAiDataCollectionStatus = (options = {}) => request("/api/ai/features/collection-status", options);
 export const getAiFeatureSnapshots = (limit = 50, options = {}) => request(`/api/ai/features/snapshots?limit=${encodeURIComponent(limit)}`, options);
 export const getAiOutcomePreview = (limit = 50, options = {}) => request(`/api/ai/features/outcome-preview?limit=${encodeURIComponent(limit)}`, options);
+export const getCandidateOutcomesCalendar = ({ year } = {}, options = {}) => {
+  const query = year ? `?year=${encodeURIComponent(year)}` : "";
+  return request(`/api/ai/candidate-outcomes/calendar${query}`, options);
+};
+export const getDailyDatasetSummary = (options = {}) => request("/api/ai/daily-dataset/summary", options);
+export const getDataCollectionStatus = (options = {}) => request("/api/ai/data-collection/status", options);
+export const getDailyDatasetRows = ({ tradeDate, limit = 500 } = {}, options = {}) => {
+  const params = new URLSearchParams();
+  if (tradeDate) {
+    params.set("trade_date_from", tradeDate);
+    params.set("trade_date_to", tradeDate);
+  }
+  if (limit) params.set("limit", String(limit));
+  const query = params.toString();
+  return request(`/api/ai/daily-dataset/rows${query ? `?${query}` : ""}`, options);
+};
 export const getScanRows = (scanRunId, options = {}) => request(`/api/scan/rows${scanRunId ? `?scan_run_id=${encodeURIComponent(scanRunId)}` : ""}`, options);
 export const runScoring = (indexName = "BROAD_MARKET_750", dryRun = false) => (
   request(
@@ -233,6 +249,7 @@ export const getPaperUpdateSchedulerStatus = (options = {}) => request("/api/pap
 export const getPaperSummary = (options = {}) => request("/api/paper/summary", options);
 export const getPaperOpenTrades = (options = {}) => request("/api/paper/open", options);
 export const getPaperHistory = (options = {}) => request("/api/paper/history", options);
+
 export const loadAllMarketData = (dryRun = true) => request(`/api/market/load-all?index_name=BROAD_MARKET_750&dry_run=${dryRun}`, withOperatorIntent({ method: "POST" }, dryRun === false));
 export const getMarketLoadProgress = () => request("/api/market/load-progress?index_name=BROAD_MARKET_750");
 export const getMarketPipelineStatus = (options = {}) => request("/api/market/pipeline-status", options);
@@ -270,3 +287,53 @@ export const swingTvConfirm = ({
 } = {}) => (
   request(`/api/swing/tv-confirm?index_name=${encodeURIComponent(indexName)}&limit=${encodeURIComponent(limit)}&offset=${encodeURIComponent(offset)}${batchNumber ? `&batch_number=${encodeURIComponent(batchNumber)}` : ""}${batchSize ? `&batch_size=${encodeURIComponent(batchSize)}` : ""}&timeframes=${encodeURIComponent(timeframes)}&save=${encodeURIComponent(save)}&single_symbol=${encodeURIComponent(singleSymbol)}${symbol ? `&symbol=${encodeURIComponent(symbol)}` : ""}${tradingviewSymbol ? `&tradingview_symbol=${encodeURIComponent(tradingviewSymbol)}` : ""}&exchange=${encodeURIComponent(exchange)}`, withOperatorIntent({ method: "POST" }, save === true))
 );
+
+export const getTradeOutcome = (tradeId, options = {}) => request(`/api/outcomes/trade/${encodeURIComponent(tradeId)}`, options);
+export const evaluateAllTradeOutcomes = (options = {}) => request("/api/outcomes/evaluate-all", { method: "POST", ...options });
+
+export function mapTimeframeToInterval(timeframe) {
+  if (!timeframe) return "D";
+  const clean = String(timeframe).trim().toUpperCase();
+  if (clean === "1W" || clean === "W" || clean === "1WEEK" || clean === "WEEK") return "W";
+  if (clean === "1D" || clean === "D" || clean === "1DAY" || clean === "DAY") return "D";
+  if (clean === "4H" || clean === "240" || clean === "4HOUR") return "240";
+  if (clean === "1H" || clean === "60" || clean === "1HOUR") return "60";
+  if (clean === "1M" || clean === "M" || clean === "1MONTH" || clean === "MONTH") return "M";
+  return clean || "D";
+}
+
+export function buildTradingViewSymbol(row) {
+  if (!row) return "";
+  let exchange = String(row.exchange || "").trim().toUpperCase();
+  let rawSymbol = String(row.tradingview_symbol || row.symbol || row.canonical_symbol || "").trim();
+  if (!rawSymbol || rawSymbol === "-" || rawSymbol === "null" || rawSymbol === "undefined") {
+    return "";
+  }
+  if (rawSymbol.includes(":")) {
+    const parts = rawSymbol.split(":");
+    if (parts[0].trim()) {
+      exchange = parts[0].trim().toUpperCase();
+    }
+    rawSymbol = parts.slice(1).join(":").trim();
+  }
+  if (!exchange) {
+    exchange = "NSE";
+  }
+  let cleanSymbol = rawSymbol.toUpperCase();
+  for (const suffix of [".NS", ".BO", "-EQ"]) {
+    if (cleanSymbol.endsWith(suffix)) {
+      cleanSymbol = cleanSymbol.slice(0, -suffix.length);
+    }
+  }
+  cleanSymbol = cleanSymbol.replace(/-/g, "_").replace(/\s+/g, "");
+  return `${exchange}:${cleanSymbol}`;
+}
+
+export function buildTradingViewUrl(row) {
+  const tradingviewSymbol = buildTradingViewSymbol(row);
+  if (!tradingviewSymbol) return "";
+  const timeframe = row?.timeframe || row?.interval || row?.setup_timeframe || row?.timeframe_entry || "1D";
+  const interval = mapTimeframeToInterval(timeframe);
+  return `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(tradingviewSymbol)}&interval=${encodeURIComponent(interval)}`;
+}
+

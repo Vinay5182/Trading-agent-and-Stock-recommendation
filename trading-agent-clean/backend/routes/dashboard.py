@@ -8,6 +8,7 @@ from services.trade_journal import (
     analytics_realized_pnl_record,
     build_trade_analytics,
     is_ambiguous_trade,
+    is_invalidated_trade,
     load_trade_journal,
     number_or_none,
 )
@@ -119,7 +120,7 @@ def _has_sl_status(record: dict) -> bool:
 
 
 def _is_completed_trade(trade: dict) -> bool:
-    if is_ambiguous_trade(trade) or _has_sl_status(trade):
+    if is_invalidated_trade(trade) or is_ambiguous_trade(trade) or _has_sl_status(trade):
         return False
     statuses = _statuses(trade)
     return bool(statuses & TARGET_STATUSES)
@@ -131,7 +132,7 @@ def _is_sl_record(record: dict) -> bool:
 
 
 def _is_completed_record(record: dict) -> bool:
-    if is_ambiguous_trade(record) or _is_sl_record(record):
+    if is_invalidated_trade(record) or is_ambiguous_trade(record) or _is_sl_record(record):
         return False
     statuses = _statuses(record)
     pnl = analytics_pnl_value(record)
@@ -177,10 +178,18 @@ def _open_trade_unrealized_pnl(trade: dict) -> float:
     pnl = _first_number(
         trade.get("remaining_unrealized_pnl"),
         trade.get("unrealized_pnl"),
-        trade.get("paper_pnl"),
-        trade.get("total_trade_pnl"),
     )
-    return pnl or 0.0
+    if pnl is not None:
+        return float(pnl)
+    entry = _first_number(trade.get("entry_price"), trade.get("entry"), trade.get("paper_entry_price"))
+    current = _first_number(trade.get("latest_close"), trade.get("current_price"))
+    q_rem = trade.get("quantity_remaining")
+    if q_rem is None:
+        q_rem = trade.get("quantity")
+    q_rem = float(q_rem or 0.0)
+    if entry is not None and current is not None and q_rem > 0:
+        return round((current - entry) * q_rem, 2)
+    return float(_first_number(trade.get("paper_pnl"), trade.get("total_trade_pnl")) or 0.0)
 
 
 def _paper_quantity(trade: dict) -> int:
@@ -311,7 +320,17 @@ async def get_paper_equity() -> dict:
     journal_records = await load_trade_journal(db, 5000)
     analytics = build_trade_analytics(journal_records)
     realized_records = [record for record in journal_records if analytics_realized_pnl_record(record)]
-    realized_pnl = sum(analytics_pnl_value(record) or 0.0 for record in realized_records)
+    journal_realized = sum(analytics_pnl_value(record) or 0.0 for record in realized_records)
+    journal_pt_ids = {str(rec.get("paper_trade_id") or rec.get("_id")) for rec in realized_records}
+    journal_symbols = {str(rec.get("symbol")) for rec in realized_records if rec.get("symbol")}
+    paper_realized = sum(
+        float(trade.get("realized_pnl") or 0.0)
+        for trade in trades
+        if str(trade.get("_id")) not in journal_pt_ids
+        and str(trade.get("symbol") or trade.get("canonical_symbol")) not in journal_symbols
+        and not is_invalidated_trade(trade)
+    )
+    realized_pnl = journal_realized + paper_realized
     settled_balance = settings.STARTING_VIRTUAL_BALANCE + realized_pnl
 
     open_trades = [trade for trade in trades if is_genuine_open_trade(trade)]
@@ -406,6 +425,7 @@ async def get_paper_equity() -> dict:
         "broker_funded": _round(broker_funded), # backward compatibility
         "active_partial_trade_count": f"{active_count} / {partial_count}",
         "active_partial_count": f"{active_count} / {partial_count}", # backward compatibility
+        "total_open_trades": len(open_trades),
         "total_margin_released": _round(total_margin_released),
         "capital_returned_from_latest_exits": _round(capital_returned_from_latest_exits),
 

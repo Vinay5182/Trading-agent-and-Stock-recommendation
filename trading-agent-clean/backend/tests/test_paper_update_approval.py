@@ -334,7 +334,7 @@ def test_approval_rejects_invalid_confirmation_text(monkeypatch) -> None:
         ({"status": "RUNNING"}, "DRY_RUN_NOT_COMPLETED"),
         ({"errors_count": 1}, "DRY_RUN_HAS_ERRORS"),
         ({"blocked": True}, "DRY_RUN_BLOCKED"),
-        ({"proposed_write_count": 2, "blocked": True}, "TOO_MANY_PROPOSED_WRITES"),
+        ({"approved_max_writes": 0, "max_writes": 0}, "TOO_MANY_PROPOSED_WRITES"),
         ({"max_writes": 2}, "REQUEST_LIMITS_MISMATCH"),
         ({"paper_only": False}, "SAFETY_FLAGS_INVALID"),
         ({"live_trading": True}, "SAFETY_FLAGS_INVALID"),
@@ -350,7 +350,8 @@ def test_approval_rejects_unsafe_dry_run(monkeypatch, overrides, reason) -> None
     patch_db(monkeypatch, db)
     client = trusted_client()
 
-    response = client.post("/api/paper/update-trades/approve", json=approval_body())
+    body = approval_body(max_writes=overrides.get("max_writes", 1))
+    response = client.post("/api/paper/update-trades/approve", json=body)
 
     assert_rejected(response, reason, db)
 

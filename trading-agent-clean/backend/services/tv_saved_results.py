@@ -10,25 +10,23 @@ DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 DATE_FIELDS = (
     "trade_date",
     "source_trade_date",
-    "source_candle_at",
     "calculation_timestamp",
     "swing_confirmed_at",
     "momentum_confirmed_at",
     "confirmed_at",
     "updated_at",
+    "source_candle_at",
     "created_at",
 )
 
 
+from utils.symbol_utils import normalize_symbol
+
 def normalized_symbol(value: Any) -> str | None:
     if value is None:
         return None
-    text = str(value).strip().upper()
-    if not text:
-        return None
-    if ":" in text:
-        text = text.split(":", 1)[1].strip()
-    return text or None
+    res = normalize_symbol("NSE", str(value))
+    return res or None
 
 
 def normalized_tv_symbol(value: Any) -> str | None:
@@ -78,6 +76,47 @@ def row_scope_date(row: dict) -> str | None:
 def latest_scope_date(rows: Iterable[dict]) -> str | None:
     dates = [value for row in rows if (value := row_scope_date(row))]
     return max(dates) if dates else None
+
+
+SWING_CONFIRMED_STATUSES = {"CONFIRMED_SIGNAL", "WAIT_FOR_RETEST"}
+MOMENTUM_CONFIRMED_STATUSES = {"MOMENTUM_CONFIRMED", "WAIT_FOR_PULLBACK"}
+
+
+def is_swing_confirmed_or_watch(status: str | None) -> bool:
+    return str(status or "").upper() in SWING_CONFIRMED_STATUSES
+
+
+def is_momentum_confirmed_or_watch(status: str | None) -> bool:
+    return str(status or "").upper() in MOMENTUM_CONFIRMED_STATUSES
+
+
+def is_strategy_confirmed_or_watch(strategy_type: str, status: str | None) -> bool:
+    clean_strat = str(strategy_type).lower()
+    if clean_strat == "swing":
+        return is_swing_confirmed_or_watch(status)
+    return is_momentum_confirmed_or_watch(status)
+
+
+def categorize_tv_rows(strategy_type: str, rows: Iterable[dict]) -> tuple[int, int, int]:
+    """
+    Single source of truth for categorizing TradingView rows into (selected_count, confirmed_count, rejected_count).
+    Swing Confirmed / Watch: CONFIRMED_SIGNAL, WAIT_FOR_RETEST
+    Momentum Confirmed / Watch: MOMENTUM_CONFIRMED, WAIT_FOR_PULLBACK
+    """
+    row_list = list(rows)
+    selected_count = len(row_list)
+    confirmed_count = sum(
+        1 for r in row_list
+        if is_strategy_confirmed_or_watch(strategy_type, r.get("tv_status") or r.get("status"))
+    )
+    rejected_count = sum(
+        1 for r in row_list
+        if str(r.get("tv_status") or r.get("status") or "").upper() == "REJECTED"
+    )
+    if confirmed_count + rejected_count != selected_count:
+        rejected_count = max(0, selected_count - confirmed_count)
+
+    return selected_count, confirmed_count, rejected_count
 
 
 def status_value(row: dict) -> str:
@@ -151,7 +190,8 @@ async def cursor_to_rows(cursor) -> list[dict]:
     rows = []
     async for row in cursor:
         document = dict(row)
-        document.pop("_id", None)
+        if "_id" in document and document["_id"] is not None:
+            document["_id"] = str(document["_id"])
         rows.append(document)
     return rows
 
@@ -262,3 +302,147 @@ async def load_current_scoped_saved_tv_results(
             f"Only {saved_result_count}/{candidate_count} current {label} candidates have saved TV results."
         )
     return response
+
+
+async def refresh_daily_tv_counts_from_db(
+    db: Any,
+    strategy_type: str | None = None,
+    selected_count: int = 0,
+    confirmed_count: int = 0,
+    rejected_count: int = 0,
+    trade_date: str | None = None,
+    index_name: str = "BROAD_MARKET_750",
+) -> dict:
+    """
+    Recalculates and persists today's summary in daily_tradingview_counts
+    by querying authoritative MongoDB confirmation collections for both swing and momentum.
+    Guarantees that multiple runs always overwrite today's summary with the latest aggregated DB state.
+    Fallback parameters preserve unit test mock compatibility when DB candidate collections are absent.
+    """
+    from services.timestamps import utc_now_iso
+    now = utc_now_iso()
+
+    def _serialize(row: dict) -> dict:
+        doc = dict(row)
+        if "_id" in doc and doc["_id"] is not None:
+            doc["_id"] = str(doc["_id"])
+        return doc
+
+    swing_selected, swing_confirmed, swing_rejected = 0, 0, 0
+    mom_selected, mom_confirmed, mom_rejected = 0, 0, 0
+    scope_date = trade_date or now[:10]
+    has_swing_db_data = False
+    has_mom_db_data = False
+
+    try:
+        swing_res = await load_current_scoped_saved_tv_results(
+            db=db,
+            strategy_type="swing",
+            index_name=index_name,
+            candidate_query={"index_name": index_name, "swing_candidate": True},
+            candidate_projection={"_id": 0},
+            confirmation_collection_name="swing_tv_confirmations",
+            serialize_row=_serialize,
+        )
+        if swing_res.get("candidate_count", 0) > 0 or swing_res.get("saved_result_count", 0) > 0:
+            swing_selected, swing_confirmed, swing_rejected = categorize_tv_rows("swing", swing_res.get("rows", []))
+            has_swing_db_data = True
+            if swing_res.get("trade_date"):
+                scope_date = swing_res["trade_date"]
+    except Exception as exc:
+        import logging
+        logging.getLogger("uvicorn.error").warning("refresh_daily_tv_counts_from_db swing load failed: %s", exc)
+
+    try:
+        mom_res = await load_current_scoped_saved_tv_results(
+            db=db,
+            strategy_type="momentum",
+            index_name=index_name,
+            candidate_query={"index_name": index_name, "momentum_candidate": True},
+            candidate_projection={"_id": 0},
+            confirmation_collection_name="momentum_tv_confirmations",
+            serialize_row=_serialize,
+        )
+        if mom_res.get("candidate_count", 0) > 0 or mom_res.get("saved_result_count", 0) > 0:
+            mom_selected, mom_confirmed, mom_rejected = categorize_tv_rows("momentum", mom_res.get("rows", []))
+            has_mom_db_data = True
+            if mom_res.get("trade_date"):
+                scope_date = mom_res["trade_date"]
+    except Exception as exc:
+        import logging
+        logging.getLogger("uvicorn.error").warning("refresh_daily_tv_counts_from_db momentum load failed: %s", exc)
+
+    clean_strat = str(strategy_type or "").lower()
+    if not has_swing_db_data and clean_strat == "swing":
+        swing_selected = selected_count
+        swing_confirmed = confirmed_count
+        swing_rejected = rejected_count
+
+    if not has_mom_db_data and clean_strat == "momentum":
+        mom_selected = selected_count
+        mom_confirmed = confirmed_count
+        mom_rejected = rejected_count
+
+    clean_date = str(scope_date)[:10]
+
+    set_fields = {
+        "updated_at": now,
+    }
+    if has_swing_db_data or clean_strat == "swing":
+        set_fields["swing_selected"] = swing_selected
+        set_fields["swing_confirmed"] = swing_confirmed
+        set_fields["swing_rejected"] = swing_rejected
+    if has_mom_db_data or clean_strat == "momentum":
+        set_fields["momentum_selected"] = mom_selected
+        set_fields["momentum_confirmed"] = mom_confirmed
+        set_fields["momentum_rejected"] = mom_rejected
+
+    collection = getattr(db, "daily_tradingview_counts", None)
+    if collection is None and hasattr(db, "__getitem__"):
+        try:
+            collection = db["daily_tradingview_counts"]
+        except Exception:
+            collection = None
+
+    if collection is not None and hasattr(collection, "update_one"):
+        try:
+            set_on_insert = {"trade_date": clean_date}
+            for k in ("swing_selected", "swing_confirmed", "swing_rejected", "momentum_selected", "momentum_confirmed", "momentum_rejected"):
+                if k not in set_fields:
+                    set_on_insert[k] = 0
+            await collection.update_one(
+                {"trade_date": clean_date},
+                {
+                    "$set": set_fields,
+                    "$setOnInsert": set_on_insert,
+                },
+                upsert=True,
+            )
+        except Exception as err:
+            import logging
+            logging.getLogger("uvicorn.error").warning("refresh_daily_tv_counts_from_db update_one failed: %s", err)
+
+
+    return {"trade_date": clean_date, **set_fields}
+
+
+async def persist_daily_tv_counts(
+    db: Any,
+    strategy_type: str,
+    selected_count: int = 0,
+    confirmed_count: int = 0,
+    rejected_count: int = 0,
+    trade_date: str | None = None,
+) -> dict:
+    return await refresh_daily_tv_counts_from_db(
+        db,
+        strategy_type=strategy_type,
+        selected_count=selected_count,
+        confirmed_count=confirmed_count,
+        rejected_count=rejected_count,
+        trade_date=trade_date,
+    )
+
+
+
+

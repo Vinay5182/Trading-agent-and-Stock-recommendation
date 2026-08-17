@@ -27,6 +27,7 @@ TERMINAL_STATUSES = {
     "WON_T1",
     "WON_T2",
     "WON_T3",
+    "ENTRY_MISSED_GAP_UP",
 }
 REALIZED_PNL_STATUSES = {
     "COMPLETED",
@@ -115,15 +116,33 @@ def analytics_statuses(record: dict) -> set[str]:
     }
 
 
+INVALIDATED_STATUSES = {"INVALIDATED_STALE", "INVALIDATED"}
+
+
+def is_invalidated_trade(record: dict) -> bool:
+    if not isinstance(record, dict):
+        return False
+    if record.get("invalidated_reason") or normalize_status(record.get("status")) in INVALIDATED_STATUSES:
+        return True
+    statuses = analytics_statuses(record)
+    return bool(statuses & INVALIDATED_STATUSES)
+
+
 def is_completed_trade(trade: dict) -> bool:
+    if is_invalidated_trade(trade):
+        return False
     return bool(trade_statuses(trade) & TERMINAL_STATUSES)
 
 
 def is_ambiguous_trade(record: dict) -> bool:
+    if is_invalidated_trade(record):
+        return False
     return bool(record.get("ambiguous")) or "AMBIGUOUS" in analytics_statuses(record)
 
 
 def analytics_realized_pnl_record(record: dict) -> bool:
+    if is_invalidated_trade(record):
+        return False
     if analytics_pnl_value(record) is None:
         return False
     statuses = analytics_statuses(record)
@@ -135,6 +154,8 @@ def analytics_realized_pnl_record(record: dict) -> bool:
 
 
 def analytics_eligible_record(record: dict) -> bool:
+    if is_invalidated_trade(record):
+        return False
     statuses = analytics_statuses(record)
     if is_ambiguous_trade(record):
         return False
@@ -290,6 +311,7 @@ def journal_record_from_trade(trade: dict, *, journaled_at: str | None = None) -
         paper_trade_id = f"{trade.get('symbol')}:{entry_date}:{exit_date}"
     return {
         "paper_trade_id": paper_trade_id,
+        "setup_id": trade.get("setup_id"),
         "symbol": trade.get("symbol"),
         "strategy_type": strategy_type_for_trade(trade),
         "entry": number_or_none(trade.get("entry_price")),
@@ -319,7 +341,9 @@ def journal_record_from_trade(trade: dict, *, journaled_at: str | None = None) -
         "profit_percent": profit_percent_for_trade(trade),
         "paper_pnl": number_or_none(trade.get("total_trade_pnl") or trade.get("paper_pnl")) or 0.0,
         "ambiguous": "AMBIGUOUS" in statuses,
-        "days_held": days_between(entry_date, exit_date),
+        "holding_days": number_or_none(trade.get("holding_days")) or days_between(entry_date, exit_date) or 1.0,
+        "bars_held": number_or_none(trade.get("bars_held")) or days_between(entry_date, exit_date) or 1,
+        "days_held": days_between(entry_date, exit_date) or 1,
         "status": trade.get("status"),
         "outcome_status": trade.get("outcome_status"),
         "journaled_at": now,

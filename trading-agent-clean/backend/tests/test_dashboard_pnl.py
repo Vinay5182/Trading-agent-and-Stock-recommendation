@@ -6,7 +6,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import pytest
 from routes import dashboard
+
+
+@pytest.fixture(autouse=True)
+def override_test_balance():
+    orig_balance = settings.STARTING_VIRTUAL_BALANCE
+    object.__setattr__(settings, "STARTING_VIRTUAL_BALANCE", 250000.0)
+    try:
+        yield
+    finally:
+        object.__setattr__(settings, "STARTING_VIRTUAL_BALANCE", orig_balance)
 
 
 class FakeCursor:
@@ -300,11 +311,7 @@ def test_dashboard_includes_old_ambiguous_realized_pnl_without_win_rate(monkeypa
 
 def test_dashboard_has_no_stale_virtual_balance_defaults() -> None:
     source = Path(dashboard.__file__).read_text()
-    stale_balances = (
-        dashboard.MINIMUM_TRADE_CAPITAL * 20,
-        dashboard.MINIMUM_TRADE_CAPITAL * 10,
-    )
-
-    assert "STARTING_VIRTUAL_BALANCE = settings.STARTING_VIRTUAL_BALANCE" in source
-    for stale_balance in stale_balances:
-        assert f"STARTING_VIRTUAL_BALANCE = {stale_balance:.1f}" not in source
+    assert "settings.STARTING_VIRTUAL_BALANCE" in source
+    assert "STARTING_VIRTUAL_BALANCE = 250000" not in source
+    assert "STARTING_VIRTUAL_BALANCE = 1500000" not in source
+    assert "STARTING_VIRTUAL_BALANCE = 2500000" not in source

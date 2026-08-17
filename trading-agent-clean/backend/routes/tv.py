@@ -108,11 +108,11 @@ def _list_attachable_tabs_sync() -> dict:
     client.connect_to_debug_port()
     list_targets = getattr(client, "list_attachable_chart_targets", None) or client.list_attachable_targets
     targets = list_targets()
+    preflight = tradingview_manager.get_preflight_status()
     attached = tradingview_manager.attached_target_snapshot()
     attached_target_id = attached.get("target_id") if attached else None
     target_ids = {str(target.get("target_id")) for target in targets if target.get("target_id")}
     attached_target_visible = bool(attached_target_id and str(attached_target_id) in target_ids)
-    preflight = tradingview_manager.get_preflight_status()
     return {
         "targets": targets,
         "count": len(targets),

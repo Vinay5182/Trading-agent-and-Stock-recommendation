@@ -21,6 +21,9 @@ def trade_open_margin_used(trade: dict) -> float:
     """
     Returns the open margin reserved by the trade, prioritizing stored fields.
     """
+    if trade.get("historical_dataset_mode"):
+        return 0.0
+
     # Prefer stored margin_remaining
     margin = trade.get("margin_remaining")
     if margin is not None:
@@ -38,6 +41,8 @@ def trade_open_sl_risk(trade: dict) -> float:
     """
     Returns the open stop-loss risk of the trade, prioritizing stored fields.
     """
+    if trade.get("historical_dataset_mode"):
+        return 0.0
     # Prefer stored open_sl_risk
     risk = trade.get("open_sl_risk")
     if risk is not None:
@@ -51,13 +56,34 @@ def trade_open_sl_risk(trade: dict) -> float:
         return abs(float(entry) - float(sl)) * float(q)
     return 0.0
 
+from services.trade_journal import (
+    analytics_pnl_value,
+    analytics_realized_pnl_record,
+    is_invalidated_trade,
+    load_trade_journal,
+)
+
+
 async def get_current_virtual_balance_and_pnl(db) -> tuple[float, float]:
     """
-    Returns (current_virtual_balance, realized_pnl) from trade journal.
+    Returns (current_virtual_balance, realized_pnl) from trade journal and paper_trades.
     """
     journal_records = await load_trade_journal(db, 5000)
     realized_records = [record for record in journal_records if analytics_realized_pnl_record(record)]
-    realized_pnl = sum(analytics_pnl_value(record) or 0.0 for record in realized_records)
+    journal_realized = sum(analytics_pnl_value(record) or 0.0 for record in realized_records)
+    
+    cursor = db.paper_trades.find({"paper_only": True})
+    trades = [t async for t in cursor]
+    journal_pt_ids = {str(rec.get("paper_trade_id") or rec.get("_id")) for rec in realized_records}
+    journal_symbols = {str(rec.get("symbol")) for rec in realized_records if rec.get("symbol")}
+    
+    paper_realized = sum(
+        float(t.get("realized_pnl") or 0.0)
+        for t in trades
+        if str(t.get("_id")) not in journal_pt_ids and str(t.get("symbol") or t.get("canonical_symbol")) not in journal_symbols and not is_invalidated_trade(t)
+    )
+    
+    realized_pnl = journal_realized + paper_realized
     current_balance = settings.STARTING_VIRTUAL_BALANCE + realized_pnl
     return current_balance, realized_pnl
 
@@ -95,13 +121,45 @@ async def try_activate_trade_with_capital(db, trade_id, current_state_version, n
             return {"ok": False, "reason": "LOCK_ALREADY_HELD", "lock": lock_result.get("lock")}
 
     try:
-        # 2. Re-read Trade
-        q_id = ObjectId(trade_id) if ObjectId.is_valid(trade_id) else trade_id
-        trade = await db.paper_trades.find_one({"_id": q_id, "paper_only": True})
+        # 2. Re-read Trade (support string and ObjectId _id format)
+        trade = await db.paper_trades.find_one({"_id": trade_id, "paper_only": True})
+        if not trade and ObjectId.is_valid(trade_id):
+            trade = await db.paper_trades.find_one({"_id": ObjectId(trade_id), "paper_only": True})
         if not trade:
             return {"ok": False, "reason": "TRADE_NOT_FOUND"}
 
-        # 3. Verify Status & Version
+        # 3. Verify Status & Version & Historical Dataset Mode
+        if trade.get("historical_dataset_mode"):
+            final_q = trade.get("quantity") or trade.get("proposed_quantity") or 1
+            update_doc = {
+                "status": "ACTIVE",
+                "outcome_status": "ACTIVE",
+                "state": "ACTIVE",
+                "status_updated_at": now,
+                "entry_triggered": True,
+                "entry_triggered_at": trade.get("entry_triggered_at") or now,
+                "original_quantity": final_q,
+                "quantity_remaining": final_q,
+                "initial_margin_reserved": 0.0,
+                "margin_remaining": 0.0,
+                "initial_sl_risk": 0.0,
+                "open_sl_risk": 0.0,
+                "exposure": 0.0,
+                "capital_model_version": trade.get("capital_model_version") or "v2",
+                "margin_released_total": 0.0,
+                "activation_blocked_reason": None,
+                "capital_rejection_reason": None,
+            }
+            res = await db.paper_trades.update_one(
+                {"_id": trade["_id"], "status": {"$in": ["WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL"]}, "state_version": current_state_version},
+                {"$set": update_doc, "$inc": {"state_version": 1}},
+                upsert=False
+            )
+            if res.modified_count > 0:
+                return {"ok": True, "activated": True, "quantity": final_q}
+            else:
+                return {"ok": False, "reason": "STATE_VERSION_CONFLICT"}
+
         status = trade.get("status")
         if status not in ("WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "WAITING_FOR_CAPITAL"):
             return {"ok": False, "reason": "INVALID_PRECONDITION_STATUS", "status": status}

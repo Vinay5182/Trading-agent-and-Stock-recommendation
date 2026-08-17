@@ -1,9 +1,8 @@
 from __future__ import annotations
-from config import settings
-
+import os
 import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from config import settings
 
 import pytest
 from services.position_sizing import calculate_proposed_sizing
@@ -12,24 +11,21 @@ def test_emmvee_like_case():
     # EMMVEE: entry 356.95, sl 330.25, Grade A (0.35% of 250,000 balance = 875 risk)
     # Stop distance = 26.7
     # Risk-allowed quantity = floor(875 / 26.7) = 32 shares
-    # (Note: on 100,000 balance, risk budget = 350, risk qty = floor(350 / 26.7) = 13 shares)
-    # Min margin (5000 * 2.5 / 356.95) requires 36 shares.
-    # With paper_mode=True, it should allow the risk-allowed quantity (32 shares) even though it is < 36.
+    # 1.5% margin cap = 3750 margin (9375 gross) / 356.95 = 26 shares. Capital cap wins!
     res = calculate_proposed_sizing(
         entry_price=356.95,
         stop_loss=330.25,
         grade="A",
-        current_balance=settings.STARTING_VIRTUAL_BALANCE,
-        available_margin=settings.STARTING_VIRTUAL_BALANCE,
+        current_balance=250000.0,
+        available_margin=250000.0,
         open_margin=0.0,
         combined_open_risk=0.0,
         paper_mode=True
     )
     assert res["ok"] is True
-    assert res["final_quantity"] == 32
-    assert res["required_margin"] < 5000.0  # (32 * 356.95) / 2.5 = 4568.96 < 5000
+    assert res["final_quantity"] == 26
 
-    # Test with 100,000 balance (risk quantity 13, min margin requires 36)
+    # Test with 100,000 balance
     res_small = calculate_proposed_sizing(
         entry_price=356.95,
         stop_loss=330.25,
@@ -41,13 +37,12 @@ def test_emmvee_like_case():
         paper_mode=True
     )
     assert res_small["ok"] is True
-    assert res_small["final_quantity"] == 13
+    assert res_small["final_quantity"] == 10
 
 def test_texrail_like_case():
     # TEXRAIL: entry 115.65, sl 107.35, Grade A
-    # Stop distance = 8.3. On 100,000 balance, risk budget = 350. Qty by risk = floor(350 / 8.3) = 42.
-    # Min margin (5000 * 2.5 / 115.65) requires 109.
-    # With paper_mode=True, should allow 42.
+    # Stop distance = 8.3. On 100,000 balance, risk budget = 350 -> risk qty = 42 shares.
+    # 1.5% margin cap = 1500 margin (3750 gross) / 115.65 = 32 shares. Capital cap wins!
     res = calculate_proposed_sizing(
         entry_price=115.65,
         stop_loss=107.35,
@@ -59,13 +54,12 @@ def test_texrail_like_case():
         paper_mode=True
     )
     assert res["ok"] is True
-    assert res["final_quantity"] == 42
+    assert res["final_quantity"] == 32
 
 def test_hext_like_case():
     # HEXT: entry 557.25, sl 511.35, Grade A
-    # Stop distance = 45.9. On 100,000 balance, risk budget = 350. Qty by risk = floor(350 / 45.9) = 7.
-    # Min margin (5000 * 2.5 / 557.25) requires 23.
-    # With paper_mode=True, should allow 7.
+    # Stop distance = 45.9. On 100,000 balance, risk budget = 350. Qty by risk = floor(350 / 45.9) = 7 shares.
+    # 1.5% margin cap = 1500 margin (3750 gross) / 557.25 = 6 shares. Capital cap wins!
     res = calculate_proposed_sizing(
         entry_price=557.25,
         stop_loss=511.35,
@@ -77,7 +71,7 @@ def test_hext_like_case():
         paper_mode=True
     )
     assert res["ok"] is True
-    assert res["final_quantity"] == 7
+    assert res["final_quantity"] == 6
 
 def test_rejections_and_invalid_cases():
     # quantity 0 -> rejected (risk allowed quantity < 1)

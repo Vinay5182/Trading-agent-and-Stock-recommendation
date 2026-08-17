@@ -225,11 +225,17 @@ def test_reconciliation_categories() -> None:
             "margin_remaining": 4000.0,
             "open_sl_risk": 1000.0,
             "trade_quality_grade": "A+",
-            "updated_at": now,
-            "state_version": 1,
         }, "MANUAL_REVIEW_REQUIRED")
 
-    asyncio.run(run_async())
+    orig_balance = settings.STARTING_VIRTUAL_BALANCE
+    orig_risk_limit = settings.PORTFOLIO_RISK_LIMIT_PERCENT
+    object.__setattr__(settings, "STARTING_VIRTUAL_BALANCE", 250000.0)
+    object.__setattr__(settings, "PORTFOLIO_RISK_LIMIT_PERCENT", 5.0)
+    try:
+        asyncio.run(run_async())
+    finally:
+        object.__setattr__(settings, "STARTING_VIRTUAL_BALANCE", orig_balance)
+        object.__setattr__(settings, "PORTFOLIO_RISK_LIMIT_PERCENT", orig_risk_limit)
 
 
 def test_reconciliation_dry_run_and_cas() -> None:

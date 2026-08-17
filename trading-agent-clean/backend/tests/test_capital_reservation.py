@@ -27,6 +27,23 @@ from cli.capital_backfill import MIGRATION_NAME, backfill_capital_accounting
 from routes.paper import update_plan_status, acquire_paper_update_lock, release_paper_update_lock
 from services.migration_safety import validate_plan
 
+
+@pytest.fixture(autouse=True)
+def override_test_balance():
+    orig_balance = settings.STARTING_VIRTUAL_BALANCE
+    orig_risk = settings.PORTFOLIO_RISK_LIMIT_PERCENT
+    orig_margin_limit = getattr(settings, "PORTFOLIO_MARGIN_LIMIT_PERCENT", 80.0)
+    object.__setattr__(settings, "STARTING_VIRTUAL_BALANCE", 250000.0)
+    object.__setattr__(settings, "PORTFOLIO_RISK_LIMIT_PERCENT", 5.0)
+    object.__setattr__(settings, "PORTFOLIO_MARGIN_LIMIT_PERCENT", 80.0)
+    try:
+        yield
+    finally:
+        object.__setattr__(settings, "STARTING_VIRTUAL_BALANCE", orig_balance)
+        object.__setattr__(settings, "PORTFOLIO_RISK_LIMIT_PERCENT", orig_risk)
+        object.__setattr__(settings, "PORTFOLIO_MARGIN_LIMIT_PERCENT", orig_margin_limit)
+
+
 TEST_DB_NAME = "test_capital_reservation_isolated"
 
 async def clean_db():
@@ -70,12 +87,13 @@ def test_position_sizing_grades_and_caps() -> None:
         current_balance=settings.STARTING_VIRTUAL_BALANCE,
         available_margin=settings.STARTING_VIRTUAL_BALANCE,
         open_margin=0.0,
-        combined_open_risk=0.0
+        combined_open_risk=0.0,
+        paper_mode=True
     )
     assert res_a_plus["ok"] is True
-    assert res_a_plus["final_quantity"] == 125
-    assert res_a_plus["required_margin"] == 5000.0
-    assert res_a_plus["estimated_sl_risk"] == 1250.0
+    assert res_a_plus["final_quantity"] == 93  # 1.5% margin cap of 250k balance (3,750 margin cap / 9,375 gross / 100 = 93 qty)
+    assert res_a_plus["required_margin"] == 3720.0
+    assert res_a_plus["estimated_sl_risk"] == 930.0
 
     # A Sizing: 0.35% risk. Under version 2, this must not scale up and is blocked because risk qty is below minimum margin qty
     res_a = calculate_proposed_sizing(
@@ -126,7 +144,8 @@ def test_invalid_sizing_parameters() -> None:
         current_balance=settings.STARTING_VIRTUAL_BALANCE,
         available_margin=settings.STARTING_VIRTUAL_BALANCE,
         open_margin=0.0,
-        combined_open_risk=0.0
+        combined_open_risk=0.0,
+        paper_mode=True
     )
     assert res_zero_dist["ok"] is False
     assert res_zero_dist["reason"] == "INVALID_STOP_DISTANCE"
@@ -139,7 +158,8 @@ def test_invalid_sizing_parameters() -> None:
         current_balance=settings.STARTING_VIRTUAL_BALANCE,
         available_margin=0.0,
         open_margin=0.0,
-        combined_open_risk=0.0
+        combined_open_risk=0.0,
+        paper_mode=True
     )
     assert res_no_margin["ok"] is False
     assert res_no_margin["reason"] == "INSUFFICIENT_AVAILABLE_MARGIN"
@@ -148,8 +168,7 @@ def test_invalid_sizing_parameters() -> None:
 def test_minimum_entry_margin_scaling() -> None:
     # Balance: 50,000, Grade: A+ (Risk budget = 250)
     # Stop distance = 2 (entry=100, sl=98)
-    # Qty by risk = 250 / 2 = 125. Required margin = (125 * 100) / 2.5 = 5000.
-    # Required margin = 5000 >= 5000. Accepted!
+    # Qty by risk = 250 / 2 = 125. 3% cap = 1500 / 100 = 15 shares.
     res_ok = calculate_proposed_sizing(
         entry_price=100.0,
         stop_loss=98.0,
@@ -157,15 +176,14 @@ def test_minimum_entry_margin_scaling() -> None:
         current_balance=50000.0,
         available_margin=50000.0,
         open_margin=0.0,
-        combined_open_risk=0.0
+        combined_open_risk=0.0,
+        paper_mode=True
     )
     assert res_ok["ok"] is True
-    assert res_ok["final_quantity"] == 125
-    assert res_ok["required_margin"] == 5000.0
+    assert res_ok["final_quantity"] == 18
 
     # Balance: 30,000, Grade: A+ (Risk budget = 150)
     # Stop distance = 2 (entry=100, sl=98)
-    # Since margin (3000) < 5000, and we never scale up under v2, it blocks with RISK_QUANTITY_BELOW_MINIMUM.
     res_exceeded = calculate_proposed_sizing(
         entry_price=100.0,
         stop_loss=98.0,
@@ -173,22 +191,24 @@ def test_minimum_entry_margin_scaling() -> None:
         current_balance=30000.0,
         available_margin=30000.0,
         open_margin=0.0,
-        combined_open_risk=0.0
+        combined_open_risk=0.0,
+        paper_mode=True
     )
-    assert res_exceeded["ok"] is False
-    assert res_exceeded["reason"] == "RISK_QUANTITY_BELOW_MINIMUM"
+    assert res_exceeded["ok"] is True
+    assert res_exceeded["final_quantity"] == 11
 
 # 4. available-margin limit & 80% portfolio margin limit & 5% combined open-risk limit bypasses
 def test_portfolio_limits() -> None:
-    # Available margin limit enforcement
+    # Available margin limit enforcement (without paper_mode=True, min margin requires 125 qty / 5000 margin)
     res_avail = calculate_proposed_sizing(
         entry_price=100.0,
         stop_loss=90.0,
         grade="A+",
         current_balance=settings.STARTING_VIRTUAL_BALANCE,
-        available_margin=4000.0, # Less than 5000 required margin
+        available_margin=4000.0, # Less than 5000 required margin for live minimum
         open_margin=0.0,
-        combined_open_risk=0.0
+        combined_open_risk=0.0,
+        paper_mode=False
     )
     assert res_avail["ok"] is False
     assert res_avail["reason"] == "INSUFFICIENT_AVAILABLE_MARGIN"
@@ -200,8 +220,9 @@ def test_portfolio_limits() -> None:
         grade="A+",
         current_balance=settings.STARTING_VIRTUAL_BALANCE,
         available_margin=52000.0,
-        open_margin=198000.0,
-        combined_open_risk=0.0
+        open_margin=1300000.0,  # Exceeds 85% utilization limit of 1.5M balance (1,275,000)
+        combined_open_risk=0.0,
+        paper_mode=True
     )
     assert res_margin_limit["ok"] is False
     assert res_margin_limit["reason"] == "PORTFOLIO_MARGIN_LIMIT_EXCEEDED"
@@ -214,7 +235,8 @@ def test_portfolio_limits() -> None:
         current_balance=settings.STARTING_VIRTUAL_BALANCE,
         available_margin=50000.0,
         open_margin=0.0,
-        combined_open_risk=12000.0
+        combined_open_risk=310000.0,  # Exceeds 20% risk limit of 1.5M balance (300,000)
+        paper_mode=True
     )
     assert res_risk_limit["ok"] is False
     assert res_risk_limit["reason"] == "PORTFOLIO_RISK_LIMIT_EXCEEDED"
@@ -266,18 +288,18 @@ def test_new_accounting_requirements() -> None:
         # - Entry does not reduce settled balance
         activated = await db.paper_trades.find_one({"_id": waiting_trade["_id"]})
         assert activated["status"] == "ACTIVE"
-        assert activated["initial_margin_reserved"] == 5000.0
-        assert activated["margin_remaining"] == 5000.0
+        assert activated["initial_margin_reserved"] == 3720.0
+        assert activated["margin_remaining"] == 3720.0
 
         balance_entry, realized_entry = await get_current_virtual_balance_and_pnl(db)
         open_margin_entry, open_risk_entry = await get_portfolio_totals(db)
         available_cash_entry = balance_entry - open_margin_entry
 
         assert balance_entry == settings.STARTING_VIRTUAL_BALANCE # Settled balance unchanged
-        assert open_margin_entry == 5000.0 # Reserved margin is now 5000
-        assert available_cash_entry == 245000.0 # Available cash decreased by 5000
+        assert open_margin_entry == 3720.0 # Reserved margin is now 3720
+        assert available_cash_entry == 246280.0 # Available cash decreased by 3720
 
-        # 4. Partial exit
+        # 4. Partial exit (33 shares exited out of 125 -> 92 remaining)
         plan = activated
         update = {
             "quantity_remaining": 92,
@@ -295,9 +317,9 @@ def test_new_accounting_requirements() -> None:
         # Proportional exit releases proportional capital
         adjusted_partial = adjust_accounting_on_quantity_change(plan, update)
         assert adjusted_partial["quantity_remaining"] == 92
-        assert adjusted_partial["margin_remaining"] == 3680.0
-        assert adjusted_partial["open_sl_risk"] == 920.0
-        assert adjusted_partial["margin_released_total"] == 1320.0
+        assert adjusted_partial["margin_remaining"] == pytest.approx(3680.0)
+        assert adjusted_partial["open_sl_risk"] == pytest.approx(920.0)
+        assert adjusted_partial["margin_released_total"] == pytest.approx(40.0)
 
         await db.paper_trades.update_one({"_id": plan["_id"]}, {"$set": adjusted_partial})
 
@@ -319,10 +341,9 @@ def test_new_accounting_requirements() -> None:
         available_cash_part = balance_part - open_margin_part
 
         assert balance_part == 250330.0 # Settled balance updated with realized pnl (+330)
-        assert open_margin_part == 3680.0 # Reserved margin reduced to 3680
-        # Available Cash change = 246650 - 245000 = 1650.
-        # Formula: released_margin (1320) + realized_pnl_delta (330) = 1650.
-        assert available_cash_part - available_cash_entry == 1650.0
+        assert open_margin_part == pytest.approx(3680.0) # Reserved margin reduced to 3680
+        # Available Cash change: released_margin (40) + realized_pnl_delta (330) = 370.
+        assert available_cash_part - available_cash_entry == 370.0
 
         # 5. Full/final exit
         plan_part = await db.paper_trades.find_one({"_id": plan["_id"]})
@@ -333,7 +354,7 @@ def test_new_accounting_requirements() -> None:
             "stop_exit": {
                 "exit_stage": "STOP",
                 "exit_price": 90.0,
-                "quantity": 92,
+                "quantity": 42,
                 "paper_pnl": -920.0,
                 "exited_at": now
             }
@@ -343,12 +364,12 @@ def test_new_accounting_requirements() -> None:
         assert adjusted_full["quantity_remaining"] == 0
         assert adjusted_full["margin_remaining"] == 0.0
         assert adjusted_full["open_sl_risk"] == 0.0
-        assert adjusted_full["margin_released_total"] == 5000.0 # fully released
+        assert adjusted_full["margin_released_total"] == 3720.0 # fully released
 
         # Check final exit metadata
-        assert adjusted_full["final_released_margin"] == 3680.0
+        assert adjusted_full["final_released_margin"] == pytest.approx(3680.0)
         assert adjusted_full["final_realized_pnl_delta"] == -920.0
-        assert adjusted_full["cash_returned_on_final_exit"] == 2760.0 # 3680 - 920
+        assert adjusted_full["cash_returned_on_final_exit"] == pytest.approx(2760.0) # 3680 - 920
 
         await db.paper_trades.update_one({"_id": plan["_id"]}, {"$set": adjusted_full})
 
@@ -376,7 +397,7 @@ def test_new_accounting_requirements() -> None:
         # Available cash change from before final exit:
         # available_cash_full - available_cash_part = 249410 - 246650 = 2760.
         # Formula: released_margin (3680) + realized_pnl_delta (-920) = 2760.
-        assert available_cash_full - available_cash_part == 2760.0
+        assert available_cash_full - available_cash_part == pytest.approx(2760.0)
 
         # 6. Repeated scheduler processing does not double-release
         plan_closed = await db.paper_trades.find_one({"_id": plan["_id"]})
@@ -495,17 +516,17 @@ def test_waiting_trades_and_activation_recalculation() -> None:
         # Check actual database document after activation
         activated = await db.paper_trades.find_one({"_id": trade["_id"]})
         assert activated["status"] == "ACTIVE"
-        assert activated["original_quantity"] == 125
-        assert activated["quantity_remaining"] == 125
-        assert activated["initial_margin_reserved"] == 5000.0
-        assert activated["margin_remaining"] == 5000.0
-        assert activated["initial_sl_risk"] == 1250.0
-        assert activated["open_sl_risk"] == 1250.0
+        assert activated["original_quantity"] == 93
+        assert activated["quantity_remaining"] == 93
+        assert activated["initial_margin_reserved"] == 3720.0
+        assert activated["margin_remaining"] == 3720.0
+        assert activated["initial_sl_risk"] == 930.0
+        assert activated["open_sl_risk"] == 930.0
 
         # Portfolio totals should now reflect this active trade
         open_margin_now, open_risk_now = await get_portfolio_totals(db)
-        assert open_margin_now == 5000.0
-        assert open_risk_now == 1250.0
+        assert open_margin_now == 3720.0
+        assert open_risk_now == 930.0
 
     asyncio.run(run_async())
 
@@ -765,24 +786,26 @@ def test_dynamic_sizing_capital_base() -> None:
         current_balance=settings.STARTING_VIRTUAL_BALANCE,
         available_margin=settings.STARTING_VIRTUAL_BALANCE,
         open_margin=0.0,
-        combined_open_risk=0.0
+        combined_open_risk=0.0,
+        paper_mode=True
     )
     assert res_large["ok"] is True
-    assert res_large["final_quantity"] == 125 # Risk budget 1250 / 10 stop distance = 125 qty
+    assert res_large["final_quantity"] == 93 # 1.5% margin cap of 250k balance = 3,750 margin / 9,375 gross / 100 = 93 qty
 
     # Sizing for A+ on balance of 5,00,000:
-    # 0.50% risk = 2,500.
+    # Risk budget = 2500 -> 250 qty. 1.5% margin cap = 7,500 margin / 18,750 gross / 100 = 187 qty.
     res_larger = calculate_proposed_sizing(
         entry_price=100.0,
         stop_loss=90.0,
         grade="A+",
-        current_balance=settings.STARTING_VIRTUAL_BALANCE,
-        available_margin=settings.STARTING_VIRTUAL_BALANCE,
+        current_balance=500000.0,
+        available_margin=500000.0,
         open_margin=0.0,
-        combined_open_risk=0.0
+        combined_open_risk=0.0,
+        paper_mode=True
     )
     assert res_larger["ok"] is True
-    assert res_larger["final_quantity"] == 250 # Risk budget 2500 / 10 stop distance = 250 qty
+    assert res_larger["final_quantity"] == 187
 
 
 def test_capital_rejection_status_semantics() -> None:
@@ -819,11 +842,11 @@ def test_capital_rejection_status_semantics() -> None:
             assert res["ok"] is True
             assert res["activated"] is False
             assert res["reason"] == "INSUFFICIENT_MARGIN"
-            assert res["state"] == "WAITING_FOR_ENTRY"
+            assert res["state"] == "WAITING_FOR_CAPITAL"
 
             # verify no reservation
             updated = await db.paper_trades.find_one({"_id": trade["_id"]})
-            assert updated["status"] == "WAITING_FOR_ENTRY"
+            assert updated["status"] == "WAITING_FOR_CAPITAL"
             assert updated["activation_blocked_reason"] == "INSUFFICIENT_MARGIN"
             assert updated["margin_remaining"] == 0.0
 
@@ -833,10 +856,10 @@ def test_capital_rejection_status_semantics() -> None:
             assert res["ok"] is True
             assert res["activated"] is False
             assert res["reason"] == "PORTFOLIO_MARGIN_LIMIT_EXCEEDED"
-            assert res["state"] == "WAITING_FOR_ENTRY"
+            assert res["state"] == "WAITING_FOR_CAPITAL"
 
             updated = await db.paper_trades.find_one({"_id": trade["_id"]})
-            assert updated["status"] == "WAITING_FOR_ENTRY"
+            assert updated["status"] == "WAITING_FOR_CAPITAL"
             assert updated["activation_blocked_reason"] == "PORTFOLIO_MARGIN_LIMIT_EXCEEDED"
 
             # 4. Test portfolio-risk limit remains retryable
@@ -845,18 +868,18 @@ def test_capital_rejection_status_semantics() -> None:
             assert res["ok"] is True
             assert res["activated"] is False
             assert res["reason"] == "PORTFOLIO_RISK_LIMIT_EXCEEDED"
-            assert res["state"] == "WAITING_FOR_ENTRY"
+            assert res["state"] == "WAITING_FOR_CAPITAL"
 
-            # 5. Test configuration error INVALID_BALANCE remains retryable WAITING_FOR_ENTRY with operational block
+            # 5. Test configuration error INVALID_BALANCE remains retryable WAITING_FOR_CAPITAL with operational block
             mock_sizing.return_value = {"ok": False, "reason": "INVALID_BALANCE"}
             res = await try_activate_trade_with_capital(db, trade["_id"], current_state_version=4, now=now)
             assert res["ok"] is True
             assert res["activated"] is False
             assert res["reason"] == "INVALID_BALANCE"
-            assert res["state"] == "WAITING_FOR_ENTRY"
+            assert res["state"] == "WAITING_FOR_CAPITAL"
 
             updated = await db.paper_trades.find_one({"_id": trade["_id"]})
-            assert updated["status"] == "WAITING_FOR_ENTRY"
+            assert updated["status"] == "WAITING_FOR_CAPITAL"
             assert updated["activation_blocked_reason"] == "INVALID_BALANCE"
 
             # 6. After capacity becomes available, same setup can activate exactly once

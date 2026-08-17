@@ -1,0 +1,49 @@
+{
+  "dataset_version": "v1.0.0",
+  "export_timestamp": "2026-07-26T02:28:00+00:00",
+  "source_collection": "candidate_trade_outcomes",
+  "total_records": 25,
+  "cutoff_date": "2026-07-19",
+  "date_ranges": {
+    "train": [
+      "2026-07-20",
+      "2026-07-24"
+    ],
+    "val": [
+      "2026-07-20",
+      "2026-07-24"
+    ],
+    "test": [
+      "2026-07-20",
+      "2026-07-24"
+    ]
+  },
+  "feature_count": 25,
+  "feature_manifest": [
+    "candidate_id",
+    "canonical_symbol",
+    "symbol",
+    "scan_date",
+    "timeframe",
+    "strategy_type",
+    "current_price",
+    "entry_price",
+    "stop_loss",
+    "target_1",
+    "target_2",
+    "target_3",
+    "risk_reward_ratio",
+    "position_size",
+    "score",
+    "nse_score",
+    "momentum_score",
+    "swing_candidate",
+    "momentum_candidate",
+    "trade_outcome",
+    "binary_label",
+    "volatility_index",
+    "market_trend",
+    "sector_trend",
+    "market_regime"
+  ]
+}

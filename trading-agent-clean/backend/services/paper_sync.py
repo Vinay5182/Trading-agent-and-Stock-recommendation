@@ -55,6 +55,7 @@ TERMINAL_STATUSES = {
     "WON_T1",
     "WON_T2",
     "WON_T3",
+    "ENTRY_MISSED_GAP_UP",
 }
 SYNC_STATUS = "WAITING_FOR_ENTRY"
 logger = logging.getLogger("uvicorn.error")
@@ -80,25 +81,6 @@ SAVED_ROW_CONFIRMED_AT_FIELDS = (
 )
 
 
-async def _best_effort_update_daily_dataset_from_trade(db, trade: dict, *, audit_time: str, link_source: str) -> dict:
-    try:
-        return await update_daily_dataset_from_paper_trade(
-            db,
-            trade,
-            audit_time=audit_time,
-            link_source=link_source,
-        )
-    except Exception as exc:  # pragma: no cover - defensive production guard
-        logger.warning("daily_trade_dataset paper sync side effect failed: %s", exc, exc_info=True)
-        return {
-            "processed_count": 1,
-            "updated_count": 0,
-            "unmatched_count": 0,
-            "skipped_count": 0,
-            "error_count": 1,
-            "status_counts": {},
-            "validation_errors": [{"paper_trade_id": trade.get("_id"), "errors": [f"{type(exc).__name__}: {exc}"]}],
-        }
 
 
 def _clean_grade(value: object) -> str:
@@ -217,6 +199,31 @@ def _saved_row_confirmed_at(row: dict) -> object | None:
     return _first_saved_row_value(row, SAVED_ROW_CONFIRMED_AT_FIELDS)
 
 
+ALLOWED_PAPER_SIGNAL_STATUSES = {
+    "WAITING_FOR_ENTRY",
+    "ACTIVE",
+    "COMPLETED",
+    "SL_HIT",
+    "EXPIRED",
+    "CANCELLED",
+    "WAITING_FOR_CAPITAL",
+    "NOT_TRIGGERED",
+    "AMBIGUOUS",
+}
+
+
+def validate_paper_signal_dict(signal: dict) -> dict:
+    """Validates status and ensures mandatory fields have safe fallback values."""
+    status = str(signal.get("status") or "WAITING_FOR_ENTRY").strip().upper()
+    if status not in ALLOWED_PAPER_SIGNAL_STATUSES:
+        logger.warning("Unrecognized paper_signal status '%s'; defaulting to WAITING_FOR_ENTRY", status)
+        status = "WAITING_FOR_ENTRY"
+    signal["status"] = status
+    signal["paper_only"] = True
+    signal["state_version"] = int(signal.get("state_version") or 1)
+    return signal
+
+
 def _same_setup_date(left: dict, right: dict) -> bool:
     left_date = setup_date_for_document(left)
     right_date = setup_date_for_document(right)
@@ -285,6 +292,7 @@ def _paper_docs_from_saved_row(row: dict, source_signal_type: str, source_collec
     source_fields = source_fields_from_saved_row(row, source_collection)
     common = {
         "symbol": symbol,
+        "canonical_symbol": row.get("canonical_symbol") or row.get("symbol") or symbol,
         "tradingview_symbol": row.get("tradingview_symbol") or row.get("requested_tradingview_symbol"),
         "timeframe": row.get("timeframe") or "1D",
         "paper_only": True,
@@ -354,6 +362,7 @@ def _paper_docs_from_saved_row(row: dict, source_signal_type: str, source_collec
         "proposed_margin": proposed_margin,
         "proposed_sl_risk": proposed_risk,
         "proposed_capital_model_version": "v2",
+        "required_margin": proposed_margin,
 
         # Zeroed actual accounting fields
         "margin_remaining": 0.0,
@@ -373,7 +382,7 @@ def _paper_docs_from_saved_row(row: dict, source_signal_type: str, source_collec
         **{field: row.get(field) for field in PAPER_PLAN_FIELDS},
         **target_plan_fields,
     }
-    return apply_setup_identity(signal), apply_setup_identity(trade)
+    return apply_setup_identity(validate_paper_signal_dict(signal)), apply_setup_identity(trade)
 
 
 def _sync_identity(doc: dict) -> dict:
@@ -436,7 +445,7 @@ async def sync_trade_ready(index_name: str = "BROAD_MARKET_750", db_override=Non
         }
 
     async with _SYNC_LOCK:
-        db = db_override or get_database()
+        db = db_override if db_override is not None else get_database()
         index_warnings = await _ensure_sync_indexes(db) if not dry_run else []
         trade_ready_rows = await _load_trade_ready_saved_rows(db, clean_index)
         logger.info("sync_trade_ready() rows found=%d", len(trade_ready_rows))
@@ -497,23 +506,16 @@ async def sync_trade_ready(index_name: str = "BROAD_MARKET_750", db_override=Non
                     continue
 
                 if not dry_run:
-                    result = await db.paper_trades.update_one(
-                        trade_identity,
-                        {"$setOnInsert": trade},
-                        upsert=True,
+                    from services.paper_orchestrator import atomic_insert_paper_trade_plan
+                    trade["updated_at"] = now
+                    _identity_plan, inserted, dataset_update = await atomic_insert_paper_trade_plan(
+                        db,
+                        trade,
+                        link_source="paper_sync",
                     )
-                    inserted = getattr(result, "upserted_id", None) is not None
                     trades_upserted += 1 if inserted else 0
-                    if inserted:
-                        persisted_trade = await db.paper_trades.find_one(trade_identity) or trade
-                        daily_dataset_updates.append(
-                            await _best_effort_update_daily_dataset_from_trade(
-                                db,
-                                persisted_trade,
-                                audit_time=now,
-                                link_source="paper_sync",
-                            )
-                        )
+                    if inserted and dataset_update:
+                        daily_dataset_updates.append(dataset_update)
                 else:
                     trades_upserted += 1
             except DuplicateKeyError:

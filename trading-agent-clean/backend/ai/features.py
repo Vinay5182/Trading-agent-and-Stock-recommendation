@@ -351,7 +351,8 @@ def build_ai_feature_snapshot(
     rule_score_val = scores.get("rule_score")
     trend_score = scores.get("trend_score")
 
-    if rule_score_val is None or trend_score is None:
+    has_candidate = any(scored_candidate.get(k) is not None for k in ("_id", "scan_run_id"))
+    if (strict_linking or has_candidate) and (rule_score_val is None or trend_score is None):
         import logging
         logger = logging.getLogger("ai.features")
         symbol = _first_value(
@@ -491,18 +492,18 @@ def build_ai_feature_snapshot(
 
 
 def _outcome_label(statuses: set[str], pnl: float | int | None) -> str | None:
-    if statuses & WIN_STATUSES:
-        return "WIN"
-    if statuses & LOSS_STATUSES:
-        return "LOSS"
-    if "AMBIGUOUS" in statuses:
-        return "UNKNOWN"
     if pnl is not None:
         if pnl > 0:
             return "WIN"
         if pnl < 0:
             return "LOSS"
         return "BREAKEVEN"
+    if statuses & WIN_STATUSES:
+        return "WIN"
+    if statuses & LOSS_STATUSES:
+        return "LOSS"
+    if "AMBIGUOUS" in statuses:
+        return "UNKNOWN"
     return "UNKNOWN"
 
 
@@ -513,7 +514,15 @@ def build_closed_paper_trade_outcome(
 ) -> dict[str, Any]:
     if not is_closed_paper_trade(paper_trade):
         raise ValueError("Paper outcome can only be attached after the paper trade closes.")
+
+    bought_qty = _number(paper_trade.get("bought_quantity") or paper_trade.get("executed_quantity") or 0.0) or 0.0
+    entry_trig = bool(paper_trade.get("entry_triggered") or paper_trade.get("entry_triggered_at"))
+    exit_reason = str(paper_trade.get("exit_reason") or "").upper()
+    if exit_reason == "STOP_LOSS_HIT_BEFORE_ENTRY" or (not entry_trig and bought_qty == 0):
+        raise ValueError("Pre-entry stopped trades do not have an execution outcome.")
+
     statuses = _status_values(paper_trade)
+
 
     exit_time = _first_value(
         paper_trade.get("exit_time"),

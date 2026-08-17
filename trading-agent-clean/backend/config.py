@@ -94,6 +94,7 @@ class Settings:
     PAPER_MARKET_SNAPSHOT_RETENTION_DAYS: int = field(default_factory=lambda: env_int("PAPER_MARKET_SNAPSHOT_RETENTION_DAYS", 14, minimum=1, maximum=3650))
     PAPER_AI_HARD_GATE_ENABLED: bool = field(default_factory=lambda: env_bool("PAPER_AI_HARD_GATE_ENABLED", False))
     SMOKE_READ_ONLY_MODE: bool = field(default_factory=lambda: env_bool("SMOKE_READ_ONLY_MODE", False))
+    MARKET_DATA_BACKEND: str = field(default_factory=lambda: env_str("MARKET_DATA_BACKEND", "historical"))
     MARKET_DATA_STALENESS_THRESHOLD_SECONDS: int = field(default_factory=lambda: env_int("MARKET_DATA_STALENESS_THRESHOLD_SECONDS", 86400, minimum=1))
     HISTORICAL_CANDLE_CLOSE_SAFETY_SECONDS: int = field(default_factory=lambda: env_int("HISTORICAL_CANDLE_CLOSE_SAFETY_SECONDS", 60, minimum=0, maximum=3600))
     HISTORICAL_OHLCV_MAX_ROWS: int = field(default_factory=lambda: env_int("HISTORICAL_OHLCV_MAX_ROWS", 5000, minimum=1, maximum=50000))
@@ -105,12 +106,20 @@ class Settings:
     DAILY_OHLCV_SCHEDULER_PROVIDER: str = field(default_factory=lambda: env_str("DAILY_OHLCV_SCHEDULER_PROVIDER", "yfinance"))
     DAILY_OHLCV_SCHEDULER_MAX_SYMBOLS: int = field(default_factory=lambda: env_int("DAILY_OHLCV_SCHEDULER_MAX_SYMBOLS", 0, minimum=0, maximum=5000))
 
+    ML_SETUP_EXPIRY_DAYS: int = field(default_factory=lambda: env_int("ML_SETUP_EXPIRY_DAYS", 5, minimum=1, maximum=30))
+    ML_SETUP_EXPIRY_BARS: int = field(default_factory=lambda: env_int("ML_SETUP_EXPIRY_BARS", 5, minimum=1, maximum=30))
 
-    STARTING_VIRTUAL_BALANCE: float = 1500000.0
+    SWING_MAX_HOLDING_DAYS: int = field(default_factory=lambda: env_int("SWING_MAX_HOLDING_DAYS", 30, minimum=1, maximum=365))
+    MOMENTUM_MAX_HOLDING_DAYS: int = field(default_factory=lambda: env_int("MOMENTUM_MAX_HOLDING_DAYS", 15, minimum=1, maximum=365))
+
+    STARTING_VIRTUAL_BALANCE: float = 2500000.0
     LEVERAGE: float = 2.5
     MINIMUM_ENTRY_MARGIN: float = 5000.0
     PAPER_ALLOW_SMALL_RISK_SIZED_POSITIONS: bool = field(default_factory=lambda: env_bool("PAPER_ALLOW_SMALL_RISK_SIZED_POSITIONS", True))
-    PORTFOLIO_MARGIN_LIMIT_PERCENT: float = 95.0
+    PORTFOLIO_MARGIN_LIMIT_PERCENT: float = 90.0
+    PORTFOLIO_MARGIN_UTILIZATION_CAP_PERCENT: float = 90.0
+    PER_TRADE_CAPITAL_ALLOCATION_PERCENT: float = 1.5
+    MAX_PER_TRADE_CAPITAL: float = 30000.0
     PORTFOLIO_RISK_LIMIT_PERCENT: float = 20.0
 
     GRADE_RISK_PERCENT_A_PLUS: float = 0.50
@@ -149,6 +158,12 @@ def validate_settings(value: Settings) -> dict:
             "CONFIG_INVALID_SCHEDULER_MODE",
             "PAPER_UPDATE_SCHEDULER_MODE must be disabled, dry_run_only, or real.",
             {"field": "PAPER_UPDATE_SCHEDULER_MODE"},
+        )
+    if value.MARKET_DATA_BACKEND not in {"legacy", "historical"}:
+        raise ConfigValidationError(
+            "CONFIG_INVALID_MARKET_DATA_BACKEND",
+            "MARKET_DATA_BACKEND must be either 'legacy' or 'historical'.",
+            {"field": "MARKET_DATA_BACKEND"},
         )
     if value.SMOKE_READ_ONLY_MODE:
         return {"ok": True, "automation_disabled": True, "smoke_read_only_mode": True}

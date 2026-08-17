@@ -1,3 +1,9 @@
+import os
+import sys
+
+# Ensure backend directory is in sys.path for imports when starting via uvicorn backend.main:app
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
@@ -7,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from config import ConfigValidationError, settings
 from database import lifespan
 from models import SettingsResponse
-from routes import ai as ai_routes, dashboard, market, momentum, paper, scan, score, signals, swing, system, tv
+from routes import ai as ai_routes, dashboard, market, momentum, outcomes, paper, scan, score, signals, swing, system, tv
 from security.operator_intent import OperatorIntentRequired, operator_intent_exception_handler
 from services.error_contract import (
     config_exception_handler,
@@ -57,6 +63,7 @@ app.include_router(tv.router, prefix="/api/tv", tags=["tradingview"])
 app.include_router(market.router, prefix="/api/market", tags=["market"])
 app.include_router(ai_routes.router, prefix="/api/ai", tags=["ai"])
 app.include_router(system.router, prefix="/api/system", tags=["system"])
+app.include_router(outcomes.router, prefix="/api/outcomes", tags=["outcomes"])
 
 
 @app.get("/health")

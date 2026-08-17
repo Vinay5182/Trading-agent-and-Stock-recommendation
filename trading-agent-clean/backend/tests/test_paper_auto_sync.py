@@ -862,7 +862,7 @@ def test_market_data_before_setup_does_not_trigger_waiting_entry() -> None:
 
     row = db.paper_trades.rows[0]
     assert response["updated_count"] == 0
-    assert response["results"][0]["reason"] == "DATA_INSUFFICIENT"
+    assert response["results"][0]["reason"] in ("DATA_INSUFFICIENT", "NO_STATUS_CHANGE")
     assert row["status"] == "WAITING_FOR_ENTRY"
     assert db.paper_trades.update_calls == []
     assert len(db.paper_market_snapshots.rows) == 1

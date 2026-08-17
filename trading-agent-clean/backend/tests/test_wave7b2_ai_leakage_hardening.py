@@ -45,6 +45,8 @@ def test_same_time_or_earlier_outcome_cannot_become_label():
         "status": "CLOSED",
         "created_at": "2026-01-01T12:00:00",
         "exit_time": "2026-01-02T12:00:00",  # same as feature_as_of
+        "entry_triggered": True,
+        "bought_quantity": 10,
     }
     with pytest.raises(ValueError) as exc:
         attach_closed_paper_trade_outcome(snapshot, trade_same_time)
@@ -54,6 +56,8 @@ def test_same_time_or_earlier_outcome_cannot_become_label():
         "status": "CLOSED",
         "created_at": "2026-01-01T12:00:00",
         "exit_time": "2026-01-03T11:00:00",  # within 1 day prediction horizon
+        "entry_triggered": True,
+        "bought_quantity": 10,
     }
     with pytest.raises(ValueError) as exc:
         attach_closed_paper_trade_outcome(snapshot, trade_within_horizon)
@@ -69,6 +73,8 @@ def test_valid_later_outcome_attaches_successfully():
         "created_at": "2026-01-01T12:00:00",
         "exit_time": "2026-01-04T12:00:00",  # 2 days later, satisfies horizon
         "paper_pnl": 500.0,
+        "entry_triggered": True,
+        "bought_quantity": 10,
     }
     result = attach_closed_paper_trade_outcome(snapshot, trade_later)
     assert result["result_label"] == "WIN"

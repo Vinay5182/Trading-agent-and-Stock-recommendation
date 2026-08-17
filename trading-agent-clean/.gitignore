@@ -41,3 +41,19 @@ backend/full_backend_failures*.txt
 
 # Patch files
 *.patch
+
+# Exports and Local Database Backups
+exports/
+mongo_backups/
+historical_scored_candidates_backup_*.json
+
+# Datasets and Scratch
+datasets/*.csv
+scratch/
+
+# Trained Model Binaries and Metadata
+models/*.joblib
+models/feature_importance_*.json
+
+# Logs
+*.log

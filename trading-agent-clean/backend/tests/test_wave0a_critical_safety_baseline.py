@@ -121,8 +121,13 @@ class ExplodingDB:
         raise OperationStarted(f"database access reached before trusted operator intent: {item}")
 
 
+class ReadOnlyDB(SimpleNamespace):
+    def __getitem__(self, item):
+        return getattr(self, item, ReadOnlyCollection([]))
+
+
 def isolated_read_db():
-    db = SimpleNamespace(
+    db = ReadOnlyDB(
         name="wave0a_isolated_fake_db",
         paper_trades=ReadOnlyCollection(
             [

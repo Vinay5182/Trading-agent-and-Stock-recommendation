@@ -37,13 +37,10 @@ def _clean_text(value: Any) -> str:
     return str(value or "").strip().upper()
 
 
+from utils.symbol_utils import normalize_symbol
+
 def clean_symbol(value: Any) -> str:
-    text = _clean_text(value)
-    if ":" in text:
-        text = text.split(":")[-1]
-    if "." in text:
-        text = text.split(".")[0]
-    return text
+    return normalize_symbol("NSE", str(value or ""))
 
 
 def clean_source_type(document: dict) -> str:

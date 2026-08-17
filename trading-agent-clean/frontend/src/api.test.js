@@ -12,6 +12,8 @@ import {
   getAiFeatureDatasetSummary,
   getAiFeatureSnapshots,
   getAiOutcomePreview,
+  getDailyDatasetSummary,
+  getDataCollectionStatus,
   getDashboardPaperEquity,
   getHealth,
   getMarketPipelineStatus,
@@ -33,6 +35,9 @@ import {
   tradingViewBadge,
   isBatchReady,
   canStartTradingViewOperation,
+  mapTimeframeToInterval,
+  buildTradingViewSymbol,
+  buildTradingViewUrl,
 } from "./api.js";
 import { aiDataCollectionChecklist, aiOutcomeSkippedRows, aiSnapshotDisplayRows } from "./aiDataset.js";
 import {
@@ -371,7 +376,7 @@ test("Paper Trades P&L calendar includes ambiguous realized trades without date 
   assert.equal(dailyMapSource.includes("Date.now()"), false);
   assert.equal(dailyMapSource.toLowerCase().includes("today"), false);
   assert.ok(paperTradesSource.includes("const ambiguousTrades = withPaperGroup(arr(history, [\"ambiguous\"]), \"ambiguous\");"));
-  assert.ok(paperTradesSource.includes("const calendarTrades = dedupePaperTrades([...completedTrades, ...stoppedTrades, ...ambiguousTrades]);"));
+  assert.ok(paperTradesSource.includes("const calendarTrades = dedupePaperTrades([...activeTrades, ...completedTrades, ...stoppedTrades, ...ambiguousTrades]);"));
 });
 
 test("stock detail requests cancel stale responses and abort on unmount", () => {
@@ -1384,4 +1389,392 @@ test("Saved TV cards display explicit confirmation labels without created_at fal
   assert.equal(appSource.includes("Confirmed: {val(row?.created_at"), false);
   assert.equal(appSource.includes("row?.created_at || row?.confirmed_at"), false);
   assert.equal(appSource.includes("row?.source_candle_at || row?.confirmed_at"), false);
+});
+
+test("TradingView symbol and timeframe interval URL construction rules", () => {
+  assert.equal(buildTradingViewSymbol({ symbol: "BAJAJ_AUTO", exchange: "NSE" }), "NSE:BAJAJ_AUTO");
+  assert.equal(buildTradingViewSymbol({ symbol: "NAM_INDIA", exchange: "NSE" }), "NSE:NAM_INDIA");
+  assert.equal(buildTradingViewSymbol({ symbol: "BAJAJ-AUTO" }), "NSE:BAJAJ_AUTO");
+  assert.equal(buildTradingViewSymbol({ symbol: "BSE:500325" }), "BSE:500325");
+  assert.equal(buildTradingViewSymbol({ tradingview_symbol: "NSE:SBIN" }), "NSE:SBIN");
+  assert.equal(buildTradingViewSymbol({ symbol: "M_M.NS" }), "NSE:M_M");
+
+  assert.equal(mapTimeframeToInterval("1D"), "D");
+  assert.equal(mapTimeframeToInterval("1W"), "W");
+  assert.equal(mapTimeframeToInterval("4H"), "240");
+  assert.equal(mapTimeframeToInterval("1H"), "60");
+  assert.equal(mapTimeframeToInterval(""), "D");
+  assert.equal(mapTimeframeToInterval(null), "D");
+
+  assert.equal(
+    buildTradingViewUrl({ symbol: "BAJAJ_AUTO", timeframe: "1D" }),
+    "https://www.tradingview.com/chart/?symbol=NSE%3ABAJAJ_AUTO&interval=D"
+  );
+  assert.equal(
+    buildTradingViewUrl({ symbol: "NAM_INDIA", timeframe: "1W" }),
+    "https://www.tradingview.com/chart/?symbol=NSE%3ANAM_INDIA&interval=W"
+  );
+  assert.equal(
+    buildTradingViewUrl({ tradingview_symbol: "NSE:TATAMOTORS", timeframe: "4H" }),
+    "https://www.tradingview.com/chart/?symbol=NSE%3ATATAMOTORS&interval=240"
+  );
+});
+
+test("Verify button opens TradingView chart in new browser tab without modal or DB write", (t) => {
+  const originalWindowOpen = globalThis.window?.open;
+  const originalFetch = globalThis.fetch;
+  const openCalls = [];
+  const fetchCalls = [];
+
+  t.after(() => {
+    if (globalThis.window) {
+      globalThis.window.open = originalWindowOpen;
+    }
+    globalThis.fetch = originalFetch;
+  });
+
+  if (!globalThis.window) {
+    globalThis.window = {};
+  }
+  globalThis.window.open = (url, target, features) => {
+    openCalls.push({ url, target, features });
+  };
+  globalThis.fetch = async (url, options = {}) => {
+    fetchCalls.push({ url, options });
+    return { ok: true, status: 200, text: async () => JSON.stringify({}) };
+  };
+
+  const tradeRow = { symbol: "BAJAJ_AUTO", timeframe: "1D", exchange: "NSE" };
+  const targetUrl = buildTradingViewUrl(tradeRow);
+
+  globalThis.window.open(targetUrl, "_blank", "noopener,noreferrer");
+
+  assert.equal(openCalls.length, 1);
+  assert.equal(openCalls[0].url, "https://www.tradingview.com/chart/?symbol=NSE%3ABAJAJ_AUTO&interval=D");
+  assert.equal(openCalls[0].target, "_blank");
+  assert.equal(openCalls[0].features, "noopener,noreferrer");
+
+  assert.equal(fetchCalls.length, 0, "Verify action must not make any API / DB write calls");
+});
+
+test("Paper Trades Verify workflow structure safety check", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  assert.equal(appSource.includes("Trade Verification Audit"), false, "Fake verification audit modal must be removed");
+  assert.equal(appSource.includes("selectedVerifyTrade"), false, "selectedVerifyTrade state must be removed");
+
+  assert.ok(appSource.includes("const handleVerifyTrade = (trade) => {"), "handleVerifyTrade handler present");
+  assert.ok(appSource.includes("window.open(url, \"_blank\", \"noopener,noreferrer\")"), "Opens TradingView chart in new tab");
+  assert.ok(appSource.includes("onVerifyTrade={handleVerifyTrade}"), "Passes handleVerifyTrade to PaperTradeTable");
+
+  assert.ok(appSource.includes("selectedProgressTrade"), "Trade Progress modal state preserved");
+  assert.ok(appSource.includes("Trade Progress —"), "Trade Progress modal UI preserved");
+});
+
+test("Paper Trades detailed Progress modal structure safety check", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  // Verify all 7 detailed progress sections exist
+  assert.ok(appSource.includes("1. Trade Metadata &amp; Strategy"), "Section 1 present");
+  assert.ok(appSource.includes("2. Price Levels"), "Section 2 present");
+  assert.ok(appSource.includes("3. Position Sizing &amp; Margin"), "Section 3 present");
+  assert.ok(appSource.includes("4. Price Progress"), "Section 4 present");
+  assert.ok(appSource.includes("5. Live Trade Progress"), "Section 5 present");
+  assert.ok(appSource.includes("6. Execution Logic &amp; Diagnostics"), "Section 6 present");
+  assert.ok(appSource.includes("7. Live Trade Progress &amp; Outcome"), "Section 7 rich title present");
+  assert.ok(appSource.includes("sec7LiveCard"), "sec7LiveCard present");
+  assert.ok(appSource.includes("Trade Status"), "Trade status header label present");
+  assert.ok(appSource.includes("Current Market Price"), "Current Market Price header label present");
+  assert.ok(appSource.includes("sec7TrackBarWrapper"), "sec7TrackBarWrapper present");
+  assert.ok(appSource.includes("sec7TrackMarker"), "sec7TrackMarker present");
+  assert.ok(appSource.includes("sec7CardGrid"), "sec7CardGrid present");
+  assert.ok(appSource.includes("sec7RiskPanel"), "sec7RiskPanel present");
+  assert.ok(appSource.includes("sec7OutcomeBox"), "sec7OutcomeBox present");
+
+  // Verify restored fields exist in modal JSX
+  assert.ok(appSource.includes("Target 2 (T2)"), "T2 present");
+  assert.ok(appSource.includes("Target 3 (T3)"), "T3 present");
+  assert.ok(appSource.includes("Planned Quantity"), "Planned Qty present");
+  assert.ok(appSource.includes("Bought Quantity"), "Bought Qty present");
+  assert.ok(appSource.includes("Open Quantity"), "Open Qty present");
+  assert.ok(appSource.includes("Distance to SL (₹)"), "Distance to SL present");
+  assert.ok(appSource.includes("Max High"), "Max High present");
+  assert.ok(appSource.includes("Min Low"), "Min Low present");
+  assert.ok(appSource.includes("Current R"), "Current R present");
+  assert.ok(appSource.includes("Realized RR"), "Realized RR present");
+  assert.ok(appSource.includes("EMA Alignment"), "EMA Alignment present");
+  assert.ok(appSource.includes("ATR"), "ATR present");
+  assert.ok(appSource.includes("Volume Confirmation"), "Volume Confirmation present");
+  assert.ok(appSource.includes("MTF Confirmation"), "MTF Confirmation present");
+  assert.ok(appSource.includes("Trap Detection"), "Trap Detection present");
+
+  // Verify modal is styled with responsive CSS class
+  assert.ok(appSource.includes("progressModalCard"), "progressModalCard class applied");
+});
+
+test("Paper Trades hero grid outcome StatCards structure safety check", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  assert.ok(appSource.includes('label="Target Completed"'), "Target Completed StatCard present");
+  assert.ok(appSource.includes('label="Target → SL"'), "Target → SL StatCard present");
+  assert.ok(appSource.includes('label="Pure SL Hit"'), "Pure SL Hit StatCard present");
+});
+
+test("Pure SL Hit count logic prioritizes canonical pure_sl_hit_count over legacy sl_hit_count when pure_sl_hit_count is 0", () => {
+  const summary = {
+    pure_sl_hit_count: 0,
+    target_partial_then_sl_count: 3,
+    target_completed_count: 1,
+    sl_hit_count: 4,
+    waiting_for_entry: 57,
+    open_trades: 45,
+  };
+  const stoppedTrades = [{ partial_exit_1: true }, { partial_exit_1: true }, { partial_exit_1: true }, { exit_reason: "STOP_LOSS_HIT_BEFORE_ENTRY" }];
+
+  const pureSlCount = summary?.pure_sl_hit_count ?? summary?.sl_hit_count ?? stoppedTrades.filter((t) => !t.partial_exit_1 && !t.t1_hit && t.exit_reason !== "STOP_LOSS_HIT_BEFORE_ENTRY").length;
+  const targetPartialThenSlCount = summary?.target_partial_then_sl_count ?? stoppedTrades.filter((t) => t.partial_exit_1 || t.t1_hit).length;
+  const targetCompletedCount = summary?.target_completed_count ?? 1;
+
+  assert.strictEqual(pureSlCount, 0, "Pure SL Hit count must be 0 when pure_sl_hit_count is 0 despite sl_hit_count being 4");
+  assert.strictEqual(targetPartialThenSlCount, 3, "Target → SL count must be 3");
+  assert.strictEqual(targetCompletedCount, 1, "Target Completed count must be 1");
+});
+
+test("P&L Calendar dual-metric aggregation logic handles target exit events and closed trades separately", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  assert.ok(appSource.includes("buildDailyTargetExitMap"), "buildDailyTargetExitMap helper present");
+  assert.ok(appSource.includes("Realized Target Exit Events"), "Realized Target Exit Events summary header label present");
+  assert.ok(appSource.includes("Closed Parent Trades"), "Closed Parent Trades summary header label present");
+  assert.ok(appSource.includes('INVALIDATED_STALE'), "INVALIDATED_STALE exclusion present");
+  assert.ok(appSource.includes('pe.exited_at || pe.timestamp'), "Date attribution uses partial_exit exited_at timestamp");
+  assert.ok(appSource.includes('openTrades?.waiting_for_entry') && appSource.includes('openTrades?.active_partial'), "openTrades robustly combines waiting_for_entry and active_partial when present");
+  assert.ok(appSource.includes('const calendarTrades = dedupePaperTrades([...activeTrades, ...completedTrades, ...stoppedTrades, ...ambiguousTrades]);'), "calendarTrades includes activeTrades so target exit events on active trades are passed to calendar");
+});
+
+test("getDailyDatasetSummary calls GET /api/ai/daily-dataset/summary", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const payload = {
+    total_rows: 70,
+    strategy_type: { SWING: 13, MOMENTUM: 57 },
+    current_stage: { SCORE_SNAPSHOT: 13, TV_CONFIRMATION: 57 },
+    label_state: { PENDING: 70 },
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = async (url, options = {}) => {
+    assert.equal(url, "http://127.0.0.1:8011/api/ai/daily-dataset/summary");
+    assert.equal(options.method, undefined);
+    return { ok: true, status: 200, text: async () => JSON.stringify(payload) };
+  };
+
+  assert.deepEqual(await getDailyDatasetSummary(), payload);
+});
+
+test("getDataCollectionStatus calls GET /api/ai/data-collection/status", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const payload = {
+    historical_ohlcv_count: 0,
+    historical_scored_candidates_count: 0,
+    daily_trade_dataset_count: 70,
+    live_scored_candidates_count: 748,
+    label_pending_count: 70,
+    export_ready_count: 0,
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = async (url, options = {}) => {
+    assert.equal(url, "http://127.0.0.1:8011/api/ai/data-collection/status");
+    assert.equal(options.method, undefined);
+    return { ok: true, status: 200, text: async () => JSON.stringify(payload) };
+  };
+
+  assert.deepEqual(await getDataCollectionStatus(), payload);
+});
+
+const dataCollectionPageSource = () => {
+  const source = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+  const dataCollectionStart = source.indexOf("const DATA_COLLECTION_STAGES");
+  const dataCollectionEnd = source.indexOf("function AiDatasetPage", dataCollectionStart);
+  return source.slice(dataCollectionStart, dataCollectionEnd);
+};
+
+test("DataCollectionPage source renders paper collection counts and legacy snapshot coverage accurately", () => {
+  const dcSource = dataCollectionPageSource();
+
+  assert.ok(dcSource.includes("Paper Trade Collection"), "Section 1 title present");
+  assert.ok(dcSource.includes("Total Paper Trades"), "Total Paper Trades StatCard present");
+  assert.ok(dcSource.includes("Terminal Paper Trades"), "Terminal Paper Trades StatCard present");
+  assert.ok(dcSource.includes("Waiting Paper Trades"), "Waiting Paper Trades StatCard present");
+  assert.ok(dcSource.includes("Open Paper Trades"), "Open Paper Trades StatCard present");
+  assert.ok(dcSource.includes("Legacy AI snapshot coverage"), "Legacy AI snapshot coverage label present");
+  assert.ok(dcSource.includes("Terminal trades missing legacy AI snapshots"), "Legacy missing snapshot label present");
+});
+
+test("DataCollectionPage source renders active daily dataset counts and pipeline stage progression flow", () => {
+  const dcSource = dataCollectionPageSource();
+
+  assert.ok(dcSource.includes("Active Dataset (daily_trade_dataset)"), "Active dataset section present");
+  assert.ok(dcSource.includes("Total Dataset Rows"), "Total Dataset Rows present");
+  assert.ok(dcSource.includes("Swing Dataset Rows"), "Swing Dataset Rows present");
+  assert.ok(dcSource.includes("Momentum Dataset Rows"), "Momentum Dataset Rows present");
+  assert.ok(dcSource.includes("Pending Labels"), "Pending Labels present");
+  assert.ok(dcSource.includes("Ready Labels"), "Ready Labels present");
+  assert.ok(dcSource.includes("Excluded Labels"), "Excluded Labels present");
+
+  assert.ok(dcSource.includes("Pipeline Stage Progress"), "Pipeline Stage Progress section present");
+  assert.ok(dcSource.includes("SCORE_SNAPSHOT"), "SCORE_SNAPSHOT stage present");
+  assert.ok(dcSource.includes("TV_CONFIRMATION"), "TV_CONFIRMATION stage present");
+  assert.ok(dcSource.includes("PAPER_SYNC"), "PAPER_SYNC stage present");
+  assert.ok(dcSource.includes("ENTRY_EVALUATION"), "ENTRY_EVALUATION stage present");
+  assert.ok(dcSource.includes("OUTCOME_LABEL"), "OUTCOME_LABEL stage present");
+});
+
+test("DataCollectionPage source renders market rows with universe context and historical data coverage", () => {
+  const dcSource = dataCollectionPageSource();
+
+  assert.ok(dcSource.includes("Market & Historical Data Coverage"), "Market and historical data coverage section present");
+  assert.ok(dcSource.includes("Market Rows"), "Market Rows StatCard present");
+  assert.ok(dcSource.includes("Scored Candidates"), "Scored Candidates StatCard present");
+  assert.ok(dcSource.includes("Historical OHLCV Store"), "Historical OHLCV Store StatCard present");
+  assert.ok(dcSource.includes("Historical Scored Candidates"), "Historical Scored Candidates StatCard present");
+  assert.ok(dcSource.includes("universe"), "Universe context present");
+  assert.ok(dcSource.includes("persisted candle records"), "Persisted records context present");
+});
+
+test("DataCollectionPage source distinguishes 0 from unavailable (--) and handles empty state", () => {
+  const dcSource = dataCollectionPageSource();
+
+  assert.ok(dcSource.includes('if (value === null || value === undefined) return "--"'), "Distinguishes null/undefined as --");
+  assert.ok(dcSource.includes("No active dataset rows collected yet."), "Empty state message for active dataset present");
+});
+
+test("DataCollectionPage remains strictly read-only without mutating controls or hardcoded counts", () => {
+  const dcSource = dataCollectionPageSource();
+
+  // Prohibit mutating action buttons inside Data Collection
+  assert.equal(/<ActionButton[^>]*>\s*(Train|Predict|Prediction|Recommend)/i.test(dcSource), false);
+  assert.equal(/<ActionButton[^>]*>\s*(Attach|Write|Save|Collect|Run|Build|Migrate|Execute|Approve)/i.test(dcSource), false);
+
+  // Verify only safe Refresh Status button exists
+  assert.ok(dcSource.includes("Refresh Status"), "Safe Refresh Status button present");
+  assert.ok(dcSource.includes("Last refreshed:"), "Last refreshed timestamp indicator present");
+  assert.ok(dcSource.includes("READ-ONLY DATA PIPELINE"), "Read-only safety banner present");
+  assert.ok(dcSource.includes("daily_trade_dataset"), "Surfaces daily_trade_dataset as primary");
+  assert.ok(dcSource.includes("Legacy AI feature snapshots are shown separately"), "Clarifies legacy snapshots");
+
+  // Prohibit hardcoded sample numbers in JSX string values
+  assert.equal(dcSource.includes('value="70"'), false, "Must not hardcode 70");
+  assert.equal(dcSource.includes('value="748"'), false, "Must not hardcode 748");
+  assert.equal(dcSource.includes('value="750"'), false, "Must not hardcode 750");
+  assert.equal(dcSource.includes('value="54,528"'), false, "Must not hardcode 54,528");
+  assert.equal(dcSource.includes('value="187"'), false, "Must not hardcode 187");
+  assert.equal(dcSource.includes('value="Available"'), false, "Must not hardcode vague Available");
+  assert.equal(dcSource.includes('value="Tracking active"'), false, "Must not hardcode vague Tracking active");
+});
+
+test("readyLabels precedence fallback: READY=0 preserved, READY>0 used, missing falls to export_ready_count, all-absent stays undefined", () => {
+  // Reproduce the exact expression from DataCollectionPage
+  const deriveReadyLabels = (activeDataset, pipelineStatus) =>
+    activeDataset ? (activeDataset.label_state?.READY ?? activeDataset.label_state?.LABEL_READY ?? 0) : pipelineStatus?.export_ready_count;
+
+  // READY = 0 must remain 0 (not fall through)
+  assert.strictEqual(
+    deriveReadyLabels({ label_state: { READY: 0 } }, { export_ready_count: 99 }),
+    0,
+    "READY=0 must be preserved as 0"
+  );
+
+  // READY > 0 must be used directly
+  assert.strictEqual(
+    deriveReadyLabels({ label_state: { READY: 5 } }, { export_ready_count: 99 }),
+    5,
+    "READY=5 must be used"
+  );
+
+  // Active dataset missing, fall to export_ready_count
+  assert.strictEqual(
+    deriveReadyLabels(null, { export_ready_count: 12 }),
+    12,
+    "Missing active dataset falls to export_ready_count"
+  );
+
+  // All sources unavailable → undefined (UI renders '--')
+  assert.strictEqual(
+    deriveReadyLabels(null, null),
+    undefined,
+    "All sources unavailable must yield undefined"
+  );
+
+  // LABEL_READY compat fallback used when READY absent
+  assert.strictEqual(
+    deriveReadyLabels({ label_state: { LABEL_READY: 3 } }, { export_ready_count: 99 }),
+    3,
+    "LABEL_READY compat fallback used when READY is absent"
+  );
+
+  // READY key absent in successful response defaults to 0
+  assert.strictEqual(
+    deriveReadyLabels({ label_state: { PENDING: 70 } }, { export_ready_count: 99 }),
+    0,
+    "Successful response with absent READY key defaults to 0"
+  );
+});
+
+test("label-state and strategy-type zero-vs-unavailable: absent key in successful response is 0, failed API is --", () => {
+  // Reproduce the exact expressions from DataCollectionPage
+  const derive = (activeDataset, pipelineStatus) => ({
+    swingRows: activeDataset ? (activeDataset.strategy_type?.SWING ?? 0) : undefined,
+    momentumRows: activeDataset ? (activeDataset.strategy_type?.MOMENTUM ?? 0) : undefined,
+    pendingLabels: activeDataset ? (activeDataset.label_state?.PENDING ?? 0) : pipelineStatus?.label_pending_count,
+    readyLabels: activeDataset ? (activeDataset.label_state?.READY ?? activeDataset.label_state?.LABEL_READY ?? 0) : pipelineStatus?.export_ready_count,
+    excludedLabels: activeDataset ? (activeDataset.label_state?.EXCLUDED ?? 0) : undefined,
+  });
+
+  // formatCount reproduces the component helper
+  const formatCount = (value) => {
+    if (value === null || value === undefined) return "--";
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed.toLocaleString("en-IN") : String(value);
+  };
+
+  // CASE 1: Successful response, EXCLUDED absent → display 0
+  const case1 = derive({ label_state: { PENDING: 70 }, strategy_type: { SWING: 13, MOMENTUM: 57 } }, null);
+  assert.strictEqual(case1.excludedLabels, 0, "EXCLUDED absent in successful response → 0");
+  assert.strictEqual(formatCount(case1.excludedLabels), "0");
+
+  // CASE 2: Successful response, EXCLUDED = 0 → display 0
+  const case2 = derive({ label_state: { PENDING: 70, EXCLUDED: 0 }, strategy_type: {} }, null);
+  assert.strictEqual(case2.excludedLabels, 0);
+  assert.strictEqual(formatCount(case2.excludedLabels), "0");
+
+  // CASE 3: Successful response, EXCLUDED = 5 → display 5
+  const case3 = derive({ label_state: { EXCLUDED: 5 }, strategy_type: {} }, null);
+  assert.strictEqual(case3.excludedLabels, 5);
+  assert.strictEqual(formatCount(case3.excludedLabels), "5");
+
+  // CASE 4: API failed / activeDataset unavailable → display --
+  const case4 = derive(null, null);
+  assert.strictEqual(case4.excludedLabels, undefined);
+  assert.strictEqual(formatCount(case4.excludedLabels), "--");
+  assert.strictEqual(case4.swingRows, undefined);
+  assert.strictEqual(formatCount(case4.swingRows), "--");
+  assert.strictEqual(case4.momentumRows, undefined);
+  assert.strictEqual(formatCount(case4.momentumRows), "--");
+
+  // CASE 5: Successful response with only PENDING → other categories are 0
+  const case5 = derive({ label_state: { PENDING: 70 }, strategy_type: { SWING: 13 } }, null);
+  assert.strictEqual(case5.pendingLabels, 70);
+  assert.strictEqual(case5.readyLabels, 0);
+  assert.strictEqual(case5.excludedLabels, 0);
+  assert.strictEqual(case5.swingRows, 13);
+  assert.strictEqual(case5.momentumRows, 0, "Absent MOMENTUM in successful response → 0");
+
+  // Verify App.jsx uses activeDataset-gated pattern
+  const dcSource = dataCollectionPageSource();
+  assert.ok(dcSource.includes("activeDataset ? (activeDataset.label_state?.EXCLUDED ?? 0) : undefined"), "excludedLabels uses activeDataset gate");
+  assert.ok(dcSource.includes("activeDataset ? (activeDataset.strategy_type?.SWING ?? 0) : undefined"), "swingRows uses activeDataset gate");
+  assert.ok(dcSource.includes("activeDataset ? (activeDataset.strategy_type?.MOMENTUM ?? 0) : undefined"), "momentumRows uses activeDataset gate");
 });

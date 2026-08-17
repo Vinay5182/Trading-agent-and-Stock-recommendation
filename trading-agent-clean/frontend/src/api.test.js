@@ -12,6 +12,8 @@ import {
   getAiFeatureDatasetSummary,
   getAiFeatureSnapshots,
   getAiOutcomePreview,
+  getDailyDatasetSummary,
+  getDataCollectionStatus,
   getDashboardPaperEquity,
   getHealth,
   getMarketPipelineStatus,
@@ -1550,3 +1552,229 @@ test("P&L Calendar dual-metric aggregation logic handles target exit events and 
   assert.ok(appSource.includes('const calendarTrades = dedupePaperTrades([...activeTrades, ...completedTrades, ...stoppedTrades, ...ambiguousTrades]);'), "calendarTrades includes activeTrades so target exit events on active trades are passed to calendar");
 });
 
+test("getDailyDatasetSummary calls GET /api/ai/daily-dataset/summary", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const payload = {
+    total_rows: 70,
+    strategy_type: { SWING: 13, MOMENTUM: 57 },
+    current_stage: { SCORE_SNAPSHOT: 13, TV_CONFIRMATION: 57 },
+    label_state: { PENDING: 70 },
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = async (url, options = {}) => {
+    assert.equal(url, "http://127.0.0.1:8011/api/ai/daily-dataset/summary");
+    assert.equal(options.method, undefined);
+    return { ok: true, status: 200, text: async () => JSON.stringify(payload) };
+  };
+
+  assert.deepEqual(await getDailyDatasetSummary(), payload);
+});
+
+test("getDataCollectionStatus calls GET /api/ai/data-collection/status", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const payload = {
+    historical_ohlcv_count: 0,
+    historical_scored_candidates_count: 0,
+    daily_trade_dataset_count: 70,
+    live_scored_candidates_count: 748,
+    label_pending_count: 70,
+    export_ready_count: 0,
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = async (url, options = {}) => {
+    assert.equal(url, "http://127.0.0.1:8011/api/ai/data-collection/status");
+    assert.equal(options.method, undefined);
+    return { ok: true, status: 200, text: async () => JSON.stringify(payload) };
+  };
+
+  assert.deepEqual(await getDataCollectionStatus(), payload);
+});
+
+const dataCollectionPageSource = () => {
+  const source = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+  const dataCollectionStart = source.indexOf("const DATA_COLLECTION_STAGES");
+  const dataCollectionEnd = source.indexOf("function AiDatasetPage", dataCollectionStart);
+  return source.slice(dataCollectionStart, dataCollectionEnd);
+};
+
+test("DataCollectionPage source renders paper collection counts and legacy snapshot coverage accurately", () => {
+  const dcSource = dataCollectionPageSource();
+
+  assert.ok(dcSource.includes("Paper Trade Collection"), "Section 1 title present");
+  assert.ok(dcSource.includes("Total Paper Trades"), "Total Paper Trades StatCard present");
+  assert.ok(dcSource.includes("Terminal Paper Trades"), "Terminal Paper Trades StatCard present");
+  assert.ok(dcSource.includes("Waiting Paper Trades"), "Waiting Paper Trades StatCard present");
+  assert.ok(dcSource.includes("Open Paper Trades"), "Open Paper Trades StatCard present");
+  assert.ok(dcSource.includes("Legacy AI snapshot coverage"), "Legacy AI snapshot coverage label present");
+  assert.ok(dcSource.includes("Terminal trades missing legacy AI snapshots"), "Legacy missing snapshot label present");
+});
+
+test("DataCollectionPage source renders active daily dataset counts and pipeline stage progression flow", () => {
+  const dcSource = dataCollectionPageSource();
+
+  assert.ok(dcSource.includes("Active Dataset (daily_trade_dataset)"), "Active dataset section present");
+  assert.ok(dcSource.includes("Total Dataset Rows"), "Total Dataset Rows present");
+  assert.ok(dcSource.includes("Swing Dataset Rows"), "Swing Dataset Rows present");
+  assert.ok(dcSource.includes("Momentum Dataset Rows"), "Momentum Dataset Rows present");
+  assert.ok(dcSource.includes("Pending Labels"), "Pending Labels present");
+  assert.ok(dcSource.includes("Ready Labels"), "Ready Labels present");
+  assert.ok(dcSource.includes("Excluded Labels"), "Excluded Labels present");
+
+  assert.ok(dcSource.includes("Pipeline Stage Progress"), "Pipeline Stage Progress section present");
+  assert.ok(dcSource.includes("SCORE_SNAPSHOT"), "SCORE_SNAPSHOT stage present");
+  assert.ok(dcSource.includes("TV_CONFIRMATION"), "TV_CONFIRMATION stage present");
+  assert.ok(dcSource.includes("PAPER_SYNC"), "PAPER_SYNC stage present");
+  assert.ok(dcSource.includes("ENTRY_EVALUATION"), "ENTRY_EVALUATION stage present");
+  assert.ok(dcSource.includes("OUTCOME_LABEL"), "OUTCOME_LABEL stage present");
+});
+
+test("DataCollectionPage source renders market rows with universe context and historical data coverage", () => {
+  const dcSource = dataCollectionPageSource();
+
+  assert.ok(dcSource.includes("Market & Historical Data Coverage"), "Market and historical data coverage section present");
+  assert.ok(dcSource.includes("Market Rows"), "Market Rows StatCard present");
+  assert.ok(dcSource.includes("Scored Candidates"), "Scored Candidates StatCard present");
+  assert.ok(dcSource.includes("Historical OHLCV Store"), "Historical OHLCV Store StatCard present");
+  assert.ok(dcSource.includes("Historical Scored Candidates"), "Historical Scored Candidates StatCard present");
+  assert.ok(dcSource.includes("universe"), "Universe context present");
+  assert.ok(dcSource.includes("persisted candle records"), "Persisted records context present");
+});
+
+test("DataCollectionPage source distinguishes 0 from unavailable (--) and handles empty state", () => {
+  const dcSource = dataCollectionPageSource();
+
+  assert.ok(dcSource.includes('if (value === null || value === undefined) return "--"'), "Distinguishes null/undefined as --");
+  assert.ok(dcSource.includes("No active dataset rows collected yet."), "Empty state message for active dataset present");
+});
+
+test("DataCollectionPage remains strictly read-only without mutating controls or hardcoded counts", () => {
+  const dcSource = dataCollectionPageSource();
+
+  // Prohibit mutating action buttons inside Data Collection
+  assert.equal(/<ActionButton[^>]*>\s*(Train|Predict|Prediction|Recommend)/i.test(dcSource), false);
+  assert.equal(/<ActionButton[^>]*>\s*(Attach|Write|Save|Collect|Run|Build|Migrate|Execute|Approve)/i.test(dcSource), false);
+
+  // Verify only safe Refresh Status button exists
+  assert.ok(dcSource.includes("Refresh Status"), "Safe Refresh Status button present");
+  assert.ok(dcSource.includes("Last refreshed:"), "Last refreshed timestamp indicator present");
+  assert.ok(dcSource.includes("READ-ONLY DATA PIPELINE"), "Read-only safety banner present");
+  assert.ok(dcSource.includes("daily_trade_dataset"), "Surfaces daily_trade_dataset as primary");
+  assert.ok(dcSource.includes("Legacy AI feature snapshots are shown separately"), "Clarifies legacy snapshots");
+
+  // Prohibit hardcoded sample numbers in JSX string values
+  assert.equal(dcSource.includes('value="70"'), false, "Must not hardcode 70");
+  assert.equal(dcSource.includes('value="748"'), false, "Must not hardcode 748");
+  assert.equal(dcSource.includes('value="750"'), false, "Must not hardcode 750");
+  assert.equal(dcSource.includes('value="54,528"'), false, "Must not hardcode 54,528");
+  assert.equal(dcSource.includes('value="187"'), false, "Must not hardcode 187");
+  assert.equal(dcSource.includes('value="Available"'), false, "Must not hardcode vague Available");
+  assert.equal(dcSource.includes('value="Tracking active"'), false, "Must not hardcode vague Tracking active");
+});
+
+test("readyLabels precedence fallback: READY=0 preserved, READY>0 used, missing falls to export_ready_count, all-absent stays undefined", () => {
+  // Reproduce the exact expression from DataCollectionPage
+  const deriveReadyLabels = (activeDataset, pipelineStatus) =>
+    activeDataset ? (activeDataset.label_state?.READY ?? activeDataset.label_state?.LABEL_READY ?? 0) : pipelineStatus?.export_ready_count;
+
+  // READY = 0 must remain 0 (not fall through)
+  assert.strictEqual(
+    deriveReadyLabels({ label_state: { READY: 0 } }, { export_ready_count: 99 }),
+    0,
+    "READY=0 must be preserved as 0"
+  );
+
+  // READY > 0 must be used directly
+  assert.strictEqual(
+    deriveReadyLabels({ label_state: { READY: 5 } }, { export_ready_count: 99 }),
+    5,
+    "READY=5 must be used"
+  );
+
+  // Active dataset missing, fall to export_ready_count
+  assert.strictEqual(
+    deriveReadyLabels(null, { export_ready_count: 12 }),
+    12,
+    "Missing active dataset falls to export_ready_count"
+  );
+
+  // All sources unavailable → undefined (UI renders '--')
+  assert.strictEqual(
+    deriveReadyLabels(null, null),
+    undefined,
+    "All sources unavailable must yield undefined"
+  );
+
+  // LABEL_READY compat fallback used when READY absent
+  assert.strictEqual(
+    deriveReadyLabels({ label_state: { LABEL_READY: 3 } }, { export_ready_count: 99 }),
+    3,
+    "LABEL_READY compat fallback used when READY is absent"
+  );
+
+  // READY key absent in successful response defaults to 0
+  assert.strictEqual(
+    deriveReadyLabels({ label_state: { PENDING: 70 } }, { export_ready_count: 99 }),
+    0,
+    "Successful response with absent READY key defaults to 0"
+  );
+});
+
+test("label-state and strategy-type zero-vs-unavailable: absent key in successful response is 0, failed API is --", () => {
+  // Reproduce the exact expressions from DataCollectionPage
+  const derive = (activeDataset, pipelineStatus) => ({
+    swingRows: activeDataset ? (activeDataset.strategy_type?.SWING ?? 0) : undefined,
+    momentumRows: activeDataset ? (activeDataset.strategy_type?.MOMENTUM ?? 0) : undefined,
+    pendingLabels: activeDataset ? (activeDataset.label_state?.PENDING ?? 0) : pipelineStatus?.label_pending_count,
+    readyLabels: activeDataset ? (activeDataset.label_state?.READY ?? activeDataset.label_state?.LABEL_READY ?? 0) : pipelineStatus?.export_ready_count,
+    excludedLabels: activeDataset ? (activeDataset.label_state?.EXCLUDED ?? 0) : undefined,
+  });
+
+  // formatCount reproduces the component helper
+  const formatCount = (value) => {
+    if (value === null || value === undefined) return "--";
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed.toLocaleString("en-IN") : String(value);
+  };
+
+  // CASE 1: Successful response, EXCLUDED absent → display 0
+  const case1 = derive({ label_state: { PENDING: 70 }, strategy_type: { SWING: 13, MOMENTUM: 57 } }, null);
+  assert.strictEqual(case1.excludedLabels, 0, "EXCLUDED absent in successful response → 0");
+  assert.strictEqual(formatCount(case1.excludedLabels), "0");
+
+  // CASE 2: Successful response, EXCLUDED = 0 → display 0
+  const case2 = derive({ label_state: { PENDING: 70, EXCLUDED: 0 }, strategy_type: {} }, null);
+  assert.strictEqual(case2.excludedLabels, 0);
+  assert.strictEqual(formatCount(case2.excludedLabels), "0");
+
+  // CASE 3: Successful response, EXCLUDED = 5 → display 5
+  const case3 = derive({ label_state: { EXCLUDED: 5 }, strategy_type: {} }, null);
+  assert.strictEqual(case3.excludedLabels, 5);
+  assert.strictEqual(formatCount(case3.excludedLabels), "5");
+
+  // CASE 4: API failed / activeDataset unavailable → display --
+  const case4 = derive(null, null);
+  assert.strictEqual(case4.excludedLabels, undefined);
+  assert.strictEqual(formatCount(case4.excludedLabels), "--");
+  assert.strictEqual(case4.swingRows, undefined);
+  assert.strictEqual(formatCount(case4.swingRows), "--");
+  assert.strictEqual(case4.momentumRows, undefined);
+  assert.strictEqual(formatCount(case4.momentumRows), "--");
+
+  // CASE 5: Successful response with only PENDING → other categories are 0
+  const case5 = derive({ label_state: { PENDING: 70 }, strategy_type: { SWING: 13 } }, null);
+  assert.strictEqual(case5.pendingLabels, 70);
+  assert.strictEqual(case5.readyLabels, 0);
+  assert.strictEqual(case5.excludedLabels, 0);
+  assert.strictEqual(case5.swingRows, 13);
+  assert.strictEqual(case5.momentumRows, 0, "Absent MOMENTUM in successful response → 0");
+
+  // Verify App.jsx uses activeDataset-gated pattern
+  const dcSource = dataCollectionPageSource();
+  assert.ok(dcSource.includes("activeDataset ? (activeDataset.label_state?.EXCLUDED ?? 0) : undefined"), "excludedLabels uses activeDataset gate");
+  assert.ok(dcSource.includes("activeDataset ? (activeDataset.strategy_type?.SWING ?? 0) : undefined"), "swingRows uses activeDataset gate");
+  assert.ok(dcSource.includes("activeDataset ? (activeDataset.strategy_type?.MOMENTUM ?? 0) : undefined"), "momentumRows uses activeDataset gate");
+});

@@ -158,6 +158,8 @@ export const getCandidateOutcomesCalendar = ({ year } = {}, options = {}) => {
   const query = year ? `?year=${encodeURIComponent(year)}` : "";
   return request(`/api/ai/candidate-outcomes/calendar${query}`, options);
 };
+export const getDailyDatasetSummary = (options = {}) => request("/api/ai/daily-dataset/summary", options);
+export const getDataCollectionStatus = (options = {}) => request("/api/ai/data-collection/status", options);
 export const getDailyDatasetRows = ({ tradeDate, limit = 500 } = {}, options = {}) => {
   const params = new URLSearchParams();
   if (tradeDate) {

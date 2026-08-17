@@ -2604,3 +2604,125 @@ th {
     gap: 8px;
   }
 }
+
+/* Data Collection Pipeline Flow & Enhanced Page Styles */
+.pipelineFlowContainer {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  margin-top: 12px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+
+.pipelineStageCard {
+  flex: 1 1 160px;
+  min-width: 140px;
+  background: rgba(2, 8, 5, 0.75);
+  border: 1px solid rgba(57, 229, 139, 0.2);
+  border-radius: 8px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.pipelineStageCard.activeStage {
+  border-color: rgba(57, 229, 139, 0.5);
+  background: rgba(57, 229, 139, 0.06);
+}
+
+.pipelineStageHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.pipelineStageStepNum {
+  font-size: 11px;
+  font-weight: 800;
+  color: #597c6a;
+}
+
+.pipelineStageLabel {
+  font-size: 13px;
+  font-weight: 700;
+  color: #eafff1;
+  margin-top: 2px;
+}
+
+.pipelineStageDesc {
+  font-size: 11px;
+  color: #8eb69f;
+  line-height: 1.3;
+}
+
+.pipelineStageCount {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.pipelineStageCount strong {
+  font-size: 20px;
+  font-weight: 900;
+  color: #39e58b;
+}
+
+.pipelineStageCount span {
+  font-size: 11px;
+  color: #8eb69f;
+}
+
+.pipelineArrow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #476c59;
+  font-size: 16px;
+  font-weight: 900;
+  user-select: none;
+}
+
+.dataCollectionNotice {
+  background: rgba(2, 8, 5, 0.6);
+  border: 1px solid rgba(245, 189, 59, 0.25);
+  border-radius: 8px;
+  padding: 12px 16px;
+  color: #f8d778;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.dataCollectionNoteSub {
+  color: #9cc8ad;
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+.statCardContext {
+  font-size: 11px;
+  color: #8eb69f;
+  margin-top: 2px;
+  display: block;
+}
+
+.dataCollectionHeaderActions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 768px) {
+  .pipelineFlowContainer {
+    flex-direction: column;
+  }
+  .pipelineArrow {
+    transform: rotate(90deg);
+    margin: -4px 0;
+  }
+}
+

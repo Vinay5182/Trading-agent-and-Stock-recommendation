@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   API_BASE, attachTradingViewTab, detachTradingViewTab,
-  getAiDataCollectionStatus, getAiFeatureDatasetSummary, getAiFeatureSnapshots, getAiOutcomePreview, getDashboardPaperEquity, getHealth, getMarketDataSymbol, getMarketLoadProgress, getMomentumCandidates, getMomentumPrecheck,
+  getAiDataCollectionStatus, getAiFeatureDatasetSummary, getAiFeatureSnapshots, getAiOutcomePreview, getDailyDatasetSummary, getDataCollectionStatus, getDashboardPaperEquity, getHealth, getMarketDataSymbol, getMarketLoadProgress, getMomentumCandidates, getMomentumPrecheck,
   getMomentumSummary, getMomentumTvConfirmed, getPaperHistory, getPaperOpenTrades, getPaperSummary, getPaperUpdateLock, getPaperUpdateProgress, getPaperUpdateRuns, getPaperUpdateSchedulerStatus, getScanRows, getScoreSummary, getSettings, getSwingCandidates, getSystemRuntimeInfo,
   getSwingPrecheck, getSwingSummary, getSwingTvConfirmed, getTradingViewAttachableTabs, getTradingViewRuntimeStatus, isRequestCancellation, momentumTvConfirm, loadAllMarketData, runPaperPipeline, runScoring,
   swingTvConfirm, testTvSymbol, tradingViewBadge, deriveTradingViewBusy, isBatchReady, canStartTradingViewOperation, buildTradingViewUrl,
@@ -3116,30 +3116,179 @@ function Settings({ settings, health, runtimeInfo, tvRuntimeStatus, tvAttachable
   </div>;
 }
 
-function DataCollectionPage({ collectionStatus, summary }) {
-  return <div className="pageStack">
-    <div className="topHeader"><div><h2>Data Collection</h2><p>Read-only data collection status</p></div></div>
-    <div className="pageContent pageStack">
-      <Card title="Data Collection Pipeline" eyebrow="read-only tracking">
-        <div className="datasetTrackingReminder">This page tracks data collection only. It does not generate predictions.</div>
-        <div className="statsGrid compact aiDatasetBreakdowns">
-          <StatCard label="Total Paper Trades" value={collectionStatus?.total_paper_trades ?? "--"} />
-          <StatCard label="Terminal Paper Trades" value={collectionStatus?.terminal_paper_trades ?? "--"} />
-          <StatCard label="Waiting Paper Trades" value={collectionStatus?.waiting_paper_trades ?? "--"} />
-          <StatCard label="Open Paper Trades" value={collectionStatus?.open_paper_trades ?? "--"} />
+const DATA_COLLECTION_STAGES = [
+  { key: "SCORE_SNAPSHOT", label: "Score Snapshot", desc: "Rule scored candidate" },
+  { key: "TV_CONFIRMATION", label: "TV Confirmation", desc: "Technical chart check" },
+  { key: "PAPER_SYNC", label: "Paper Sync", desc: "Paper trade alignment" },
+  { key: "ENTRY_EVALUATION", label: "Entry Evaluation", desc: "Trigger & price check" },
+  { key: "OUTCOME_LABEL", label: "Terminal Outcome", desc: "Outcome label attached" },
+];
+
+function DataCollectionPage({
+  collectionStatus,
+  dailyDatasetSummary,
+  pipelineStatus,
+  marketProgress,
+  scoreSummary,
+  summary,
+  loading,
+  errors = [],
+  lastRefreshed,
+  onRefresh,
+}) {
+  const activeDataset = dailyDatasetSummary || summary;
+  const formatCount = (value) => {
+    if (value === null || value === undefined) return "--";
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed.toLocaleString("en-IN") : String(value);
+  };
+
+  const totalDatasetRows = activeDataset?.total_rows ?? pipelineStatus?.daily_trade_dataset_count;
+  const swingRows = activeDataset ? (activeDataset.strategy_type?.SWING ?? 0) : undefined;
+  const momentumRows = activeDataset ? (activeDataset.strategy_type?.MOMENTUM ?? 0) : undefined;
+  const pendingLabels = activeDataset ? (activeDataset.label_state?.PENDING ?? 0) : pipelineStatus?.label_pending_count;
+  const readyLabels = activeDataset ? (activeDataset.label_state?.READY ?? activeDataset.label_state?.LABEL_READY ?? 0) : pipelineStatus?.export_ready_count;
+  const excludedLabels = activeDataset ? (activeDataset.label_state?.EXCLUDED ?? 0) : undefined;
+
+  const marketRowsCount = marketProgress?.market_data_count;
+  const universeCount = marketProgress?.universe_count ?? 750;
+  const scoredCount = scoreSummary?.total_scored ?? pipelineStatus?.live_scored_candidates_count;
+  const histOhlcvCount = pipelineStatus?.historical_ohlcv_count;
+  const histScoredCount = pipelineStatus?.historical_scored_candidates_count;
+
+  const missingLegacySnapshots = collectionStatus?.terminal_trades_without_ai_snapshot_symbols;
+  const missingLegacyCount = collectionStatus?.terminal_trades_without_ai_snapshot_count ?? (missingLegacySnapshots?.length ?? 0);
+
+  return (
+    <div className="pageStack">
+      <div className="topHeader">
+        <div>
+          <h2>Data Collection</h2>
+          <p>Read-only data collection status</p>
         </div>
-        <div className="datasetTrackingReminder" style={{ marginTop: '15px' }}>
-          Terminal trades missing AI snapshots: {collectionStatus?.terminal_trades_without_ai_snapshot_symbols?.join(", ") || "none"}
+        <div className="statusBadges dataCollectionHeaderActions">
+          <span className="badge gray">Last refreshed: {lastRefreshed || "--"}</span>
+          <ActionButton onClick={onRefresh} disabled={loading}>
+            {loading ? "Refreshing..." : "Refresh Status"}
+          </ActionButton>
         </div>
-      </Card>
-      <Card title="Historical Market Data" eyebrow="read-only coverage">
-        <div className="statsGrid compact">
-          <StatCard label="OHLCV Checkpoint" value="Tracking active" tone="green" />
-          <StatCard label="Candidates Scored" value="Available" tone="green" />
+      </div>
+
+      <div className="pageContent pageStack">
+        {/* Read-Only Safety Banner */}
+        <div className="dataCollectionNotice">
+          <strong>READ-ONLY DATA PIPELINE</strong>
+          <div className="dataCollectionNoteSub">
+            This page is read-only. It tracks active data collection across pipeline stages without running scans, scoring, TradingView confirmation, paper trade creation, dataset export, or model training.
+          </div>
+          <div className="dataCollectionNoteSub" style={{ marginTop: "6px", color: "#bbeacb" }}>
+            Active candidate tracking uses <code>daily_trade_dataset</code>. Legacy AI feature snapshots are shown separately on AI Dataset / Labels.
+          </div>
         </div>
-      </Card>
+
+        {/* Partial Endpoint Error Warning */}
+        {errors && errors.length > 0 ? (
+          <div className="datasetTrackingReminder warningText" style={{ color: "#f8d778" }}>
+            Some data collection endpoints could not refresh: {errors.map((item) => item.endpoint).join(", ")}.
+          </div>
+        ) : null}
+
+        {/* SECTION 1 — PAPER TRADE COLLECTION */}
+        <Card title="Paper Trade Collection" eyebrow="read-only tracking">
+          <div className="statsGrid compact aiDatasetBreakdowns">
+            <StatCard label="Total Paper Trades" value={formatCount(collectionStatus?.total_paper_trades)} />
+            <StatCard label="Terminal Paper Trades" value={formatCount(collectionStatus?.terminal_paper_trades)} />
+            <StatCard label="Waiting Paper Trades" value={formatCount(collectionStatus?.waiting_paper_trades)} />
+            <StatCard label="Open Paper Trades" value={formatCount(collectionStatus?.open_paper_trades)} />
+          </div>
+          <div className="datasetTrackingReminder" style={{ marginTop: "12px" }}>
+            {missingLegacyCount > 0
+              ? `Terminal trades missing legacy AI snapshots: ${missingLegacySnapshots?.join(", ") || missingLegacyCount}`
+              : "Legacy AI snapshot coverage: No terminal trades currently require legacy AI snapshots"}
+          </div>
+        </Card>
+
+        {/* SECTION 2 — ACTIVE DATASET (daily_trade_dataset) */}
+        <Card title="Active Dataset (daily_trade_dataset)" eyebrow="primary multi-stage collection">
+          {totalDatasetRows === 0 ? (
+            <div className="datasetTrackingReminder">No active dataset rows collected yet.</div>
+          ) : null}
+          <div className="statsGrid compact aiDatasetBreakdowns">
+            <StatCard label="Total Dataset Rows" value={formatCount(totalDatasetRows)} />
+            <StatCard label="Swing Dataset Rows" value={formatCount(swingRows)} />
+            <StatCard label="Momentum Dataset Rows" value={formatCount(momentumRows)} />
+            <StatCard label="Pending Labels" value={formatCount(pendingLabels)} tone={Number(pendingLabels) > 0 ? "yellow" : "green"} />
+            <StatCard label="Ready Labels" value={formatCount(readyLabels)} />
+            <StatCard label="Excluded Labels" value={formatCount(excludedLabels)} tone="gray" />
+          </div>
+        </Card>
+
+        {/* SECTION 3 — PIPELINE STAGE PROGRESS */}
+        <Card title="Pipeline Stage Progress" eyebrow="canonical stage distribution">
+          <div className="datasetTrackingReminder" style={{ marginTop: 0, marginBottom: "8px" }}>
+            Progression of trade candidates from initial market scoring to terminal outcome labeling.
+          </div>
+          <div className="pipelineFlowContainer">
+            {DATA_COLLECTION_STAGES.map((stage, idx) => {
+              const stageCount = activeDataset?.current_stage ? (activeDataset.current_stage[stage.key] ?? 0) : (activeDataset ? 0 : null);
+              return (
+                <React.Fragment key={stage.key}>
+                  <div className={`pipelineStageCard ${Number(stageCount) > 0 ? "activeStage" : ""}`}>
+                    <div className="pipelineStageHeader">
+                      <span className="pipelineStageStepNum">STAGE 0{idx + 1}</span>
+                      <span className={`badge ${Number(stageCount) > 0 ? "green" : "gray"}`}>
+                        {stage.key}
+                      </span>
+                    </div>
+                    <div>
+                      <div className="pipelineStageLabel">{stage.label}</div>
+                      <div className="pipelineStageDesc">{stage.desc}</div>
+                    </div>
+                    <div className="pipelineStageCount">
+                      <strong>{formatCount(stageCount)}</strong>
+                      <span>candidates</span>
+                    </div>
+                  </div>
+                  {idx < DATA_COLLECTION_STAGES.length - 1 ? (
+                    <div className="pipelineArrow">→</div>
+                  ) : null}
+                </React.Fragment>
+              );
+            })}
+          </div>
+        </Card>
+
+        {/* SECTION 4 — MARKET & HISTORICAL DATA COVERAGE */}
+        <Card title="Market & Historical Data Coverage" eyebrow="read-only coverage">
+          <div className="statsGrid compact">
+            <div className="statCard accent-green">
+              <span>Market Rows</span>
+              <strong>{marketRowsCount !== undefined && marketRowsCount !== null ? `${formatCount(marketRowsCount)} rows` : "--"}</strong>
+              <small className="statCardContext">{`of ${formatCount(universeCount)} universe`}</small>
+            </div>
+            <div className="statCard accent-green">
+              <span>Scored Candidates</span>
+              <strong>{scoredCount !== undefined && scoredCount !== null ? formatCount(scoredCount) : "--"}</strong>
+              <small className="statCardContext">{marketRowsCount !== undefined && marketRowsCount !== null ? `of ${formatCount(marketRowsCount)} market rows` : "universe scored"}</small>
+            </div>
+            <div className="statCard accent-green">
+              <span>Historical OHLCV Store</span>
+              <strong>{histOhlcvCount !== undefined && histOhlcvCount !== null ? `${formatCount(histOhlcvCount)} records` : "--"}</strong>
+              <small className="statCardContext">persisted candle records</small>
+            </div>
+            <div className="statCard accent-green">
+              <span>Historical Scored Candidates</span>
+              <strong>{histScoredCount !== undefined && histScoredCount !== null ? `${formatCount(histScoredCount)} records` : "--"}</strong>
+              <small className="statCardContext">persisted scored history</small>
+            </div>
+          </div>
+          <div className="datasetTrackingReminder" style={{ marginTop: "12px" }}>
+            Market rows and scored candidates reflect the current active universe. Historical OHLCV store tracks persisted historical records.
+          </div>
+        </Card>
+      </div>
     </div>
-  </div>;
+  );
 }
 
 function AiDatasetPage({ summary, snapshots, outcomePreview, filters, onFiltersChange, onRefresh, loading, errors }) {
@@ -3185,6 +3334,11 @@ export default function App() {
   const [aiFeatureSnapshots, setAiFeatureSnapshots] = useState([]);
   const [aiOutcomePreview, setAiOutcomePreview] = useState(null);
   const [aiDataCollectionStatus, setAiDataCollectionStatus] = useState(null);
+  const [dataCollectionStatus, setDataCollectionStatus] = useState(null);
+  const [dailyDatasetSummary, setDailyDatasetSummary] = useState(null);
+  const [dataCollectionLoading, setDataCollectionLoading] = useState(false);
+  const [dataCollectionErrors, setDataCollectionErrors] = useState([]);
+  const [dataCollectionLastRefreshed, setDataCollectionLastRefreshed] = useState("");
   const [aiDatasetFilters, setAiDatasetFilters] = useState({ strategyType: "", timeframe: "" });
   const [aiDatasetErrors, setAiDatasetErrors] = useState([]);
   const [dashboardErrors, setDashboardErrors] = useState([]);
@@ -3730,6 +3884,63 @@ export default function App() {
     };
   }, [activePage, aiDatasetFilters]);
 
+  const refreshDataCollectionStatus = useCallback((requestOptions = {}) => {
+    setDataCollectionLoading(true);
+    return Promise.allSettled([
+      getAiDataCollectionStatus(requestOptions),
+      getDailyDatasetSummary(requestOptions),
+      getDataCollectionStatus(requestOptions),
+      getMarketLoadProgress(requestOptions),
+      getScoreSummary("BROAD_MARKET_750", requestOptions),
+    ]).then((results) => {
+      const [collectionResult, dailyDatasetResult, pipelineResult, marketResult, scoreResult] = results;
+      const collectionData = settledValue(collectionResult, aiDataCollectionStatus);
+      const dailyDatasetData = settledValue(dailyDatasetResult, dailyDatasetSummary);
+      const pipelineData = settledValue(pipelineResult, dataCollectionStatus);
+      const marketData = settledValue(marketResult, marketProgress);
+      const scoreData = settledValue(scoreResult, scoreSummary);
+
+      setAiDataCollectionStatus(collectionData);
+      setDailyDatasetSummary(dailyDatasetData);
+      setDataCollectionStatus(pipelineData);
+      setMarketProgress(marketData);
+      setScoreSummary(scoreData);
+
+      const errors = settledErrors([
+        { endpoint: "/api/ai/features/collection-status", result: collectionResult },
+        { endpoint: "/api/ai/daily-dataset/summary", result: dailyDatasetResult },
+        { endpoint: "/api/ai/data-collection/status", result: pipelineResult },
+        { endpoint: "/api/market/load-progress", result: marketResult },
+        { endpoint: "/api/score/summary", result: scoreResult },
+      ]);
+      setDataCollectionErrors(errors);
+      setDataCollectionLastRefreshed(new Date().toLocaleTimeString("en-IN", { hour12: true }));
+      setDataCollectionLoading(false);
+      return {
+        collection_status: collectionData,
+        daily_dataset: dailyDatasetData,
+        data_collection: pipelineData,
+        market_progress: marketData,
+        score_summary: scoreData,
+        partial_errors: errors,
+      };
+    }).catch(() => {
+      setDataCollectionLoading(false);
+    });
+  }, [aiDataCollectionStatus, dailyDatasetSummary, dataCollectionStatus, marketProgress, scoreSummary]);
+
+  useEffect(() => {
+    if (activePage !== "Data Collection") return undefined;
+    let cancelled = false;
+    const controller = new AbortController();
+    const requestOptions = { signal: controller.signal };
+    refreshDataCollectionStatus(requestOptions);
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [activePage, refreshDataCollectionStatus]);
+
   useEffect(() => {
     if (activePage !== "Paper Trades") return undefined;
     let cancelled = false;
@@ -3841,6 +4052,7 @@ export default function App() {
       setAiDatasetErrors(errors);
       return { summary: summaryData, snapshots: snapshotsData, outcome_preview: outcomePreviewData, collection_status: collectionStatusData, partial_errors: errors };
     }),
+    refreshDataCollection: () => refreshDataCollectionStatus(),
     dryRun: () => act("pipeline dry run", () => runPaperPipeline({ limit: 1, timeframe: "1D", dryRun: true, strategy: "swing" })),
     saveRun: () => act("pipeline save", () => runPaperPipeline({ limit: 1, timeframe: "1D", dryRun: false, strategy: "swing" })),
     tvRefreshStatus: () => act("refresh tv status", async () => {
@@ -4329,12 +4541,12 @@ export default function App() {
     if (activePage === "Stock Detail") return <StockDetailPage search={search} stockMarketData={stockMarketData} stockSwingPrecheck={stockSwingPrecheck} stockMomentumPrecheck={stockMomentumPrecheck} stockSwingTvResult={stockSwingTvResult} stockMomentumTvResult={stockMomentumTvResult} stockSavedSwingResult={stockSavedSwingResult} stockSavedMomentumResult={stockSavedMomentumResult} latestSwingTvRows={latestSwingTvRows} latestMomentumTvRows={latestMomentumTvRows} stockSwingTimeframes={stockSwingTimeframes} setStockSwingTimeframes={setStockSwingTimeframes} stockMomentumTimeframes={stockMomentumTimeframes} setStockMomentumTimeframes={setStockMomentumTimeframes} onLoadStockMarket={handlers.stockMarketData} onSwingPrecheck={handlers.stockSwingPrecheck} onMomentumPrecheck={handlers.stockMomentumPrecheck} onStockSwingTvConfirm={handlers.stockSwingTvConfirm} onStockMomentumTvConfirm={handlers.stockMomentumTvConfirm} loading={!!loading} />;
     if (activePage === "Paper Trades") return <PaperTrades openTrades={paperOpenTrades} history={paperHistory} summary={summary} liveStatus={paperLiveStatus} />;
     if (activePage === "Settings") return <Settings settings={settings} health={health} runtimeInfo={systemRuntimeInfo} tvRuntimeStatus={tvRuntimeStatus} tvAttachableTabs={tvAttachableTabs} onRefreshTvTabs={handlers.tvRefreshTabs} onAttachTvTab={handlers.tvAttachTab} onDetachTvTab={handlers.tvDetachTab} loading={!!loading} />;
-    if (activePage === "Data Collection") return <DataCollectionPage collectionStatus={aiDataCollectionStatus} summary={aiDatasetSummary} />;
+    if (activePage === "Data Collection") return <DataCollectionPage collectionStatus={aiDataCollectionStatus} dailyDatasetSummary={dailyDatasetSummary} pipelineStatus={dataCollectionStatus} marketProgress={marketProgress} scoreSummary={scoreSummary} loading={dataCollectionLoading} errors={dataCollectionErrors} lastRefreshed={dataCollectionLastRefreshed} onRefresh={handlers.refreshDataCollection} />;
     if (activePage === "AI Dataset / Labels") return <AiDatasetPage summary={aiDatasetSummary} snapshots={filteredAiFeatureSnapshots} outcomePreview={filteredAiOutcomePreview} filters={aiDatasetFilters} onFiltersChange={setAiDatasetFilters} onRefresh={handlers.aiDatasetSummary} loading={loading === "AI dataset summary"} errors={aiDatasetErrors} />;
     if (activePage === "System Health") return <SystemHealthPage health={health} tvRuntimeStatus={tvRuntimeStatus} schedulerStatus={paperUpdateScheduler} runs={paperUpdateRuns} />;
 
     return <Dashboard summary={summary} scoreSummary={scoreSummary} swingSummary={swingSummary} momentumSummary={momentumSummary} dashboardEquity={dashboardEquity} health={health} tvRuntimeStatus={tvRuntimeStatus} aiDatasetSummary={aiDatasetSummary} aiFeatureSnapshots={filteredAiFeatureSnapshots} aiOutcomePreview={filteredAiOutcomePreview} aiDataCollectionStatus={aiDataCollectionStatus} aiDatasetFilters={aiDatasetFilters} aiDatasetErrors={aiDatasetErrors} dashboardErrors={dashboardErrors} paperUpdateProgress={paperUpdateProgress} paperUpdateRuns={paperUpdateRuns} paperUpdateLock={paperUpdateLock} paperUpdateScheduler={paperUpdateScheduler} onSummary={handlers.loadSummary} onDryRun={handlers.dryRun} onSaveRun={handlers.saveRun} onAiDatasetRefresh={handlers.aiDatasetSummary} onAiDatasetFiltersChange={setAiDatasetFilters} aiDatasetLoading={loading === "AI dataset summary"} loading={!!loading} />;
-  }, [activePage, settings, health, systemRuntimeInfo, summary, scoreSummary, swingSummary, momentumSummary, dashboardEquity, tvRuntimeStatus, tvRuntimeLastUpdatedAt, tvAttachableTabs, aiDatasetSummary, filteredAiFeatureSnapshots, filteredAiOutcomePreview, aiDataCollectionStatus, aiDatasetFilters, aiDatasetErrors, dashboardErrors, paperUpdateProgress, paperUpdateRuns, paperUpdateLock, paperUpdateScheduler, swingRows, latestSwingTvRows, swingTvRowsLoaded, swingBatchResults, swingBatchProgress, swingBatchError, swingBatchStopRequested, swingBatchStopMessage, swingCandidatesStale, momentumRows, momentumCandidatesStale, latestMomentumTvRows, momentumTvRowsLoaded, momentumBatchResults, momentumBatchProgress, momentumBatchError, momentumBatchStopRequested, momentumBatchStopMessage, stockMarketData, stockSwingPrecheck, stockMomentumPrecheck, stockSwingTvResult, stockMomentumTvResult, stockSavedSwingResult, stockSavedMomentumResult, stockSwingTimeframes, stockMomentumTimeframes, search, tv, tvResult, marketLoadResult, marketProgress, scoreRunResult, marketDataNeedsScore, paperOpenTrades, paperHistory, paperLiveStatus, loading, lastResponse]);
+  }, [activePage, settings, health, systemRuntimeInfo, summary, scoreSummary, swingSummary, momentumSummary, dashboardEquity, tvRuntimeStatus, tvRuntimeLastUpdatedAt, tvAttachableTabs, aiDatasetSummary, filteredAiFeatureSnapshots, filteredAiOutcomePreview, aiDataCollectionStatus, dataCollectionStatus, dailyDatasetSummary, dataCollectionLoading, dataCollectionErrors, dataCollectionLastRefreshed, aiDatasetFilters, aiDatasetErrors, dashboardErrors, paperUpdateProgress, paperUpdateRuns, paperUpdateLock, paperUpdateScheduler, swingRows, latestSwingTvRows, swingTvRowsLoaded, swingBatchResults, swingBatchProgress, swingBatchError, swingBatchStopRequested, swingBatchStopMessage, swingCandidatesStale, momentumRows, momentumCandidatesStale, latestMomentumTvRows, momentumTvRowsLoaded, momentumBatchResults, momentumBatchProgress, momentumBatchError, momentumBatchStopRequested, momentumBatchStopMessage, stockMarketData, stockSwingPrecheck, stockMomentumPrecheck, stockSwingTvResult, stockMomentumTvResult, stockSavedSwingResult, stockSavedMomentumResult, stockSwingTimeframes, stockMomentumTimeframes, search, tv, tvResult, marketLoadResult, marketProgress, scoreRunResult, marketDataNeedsScore, paperOpenTrades, paperHistory, paperLiveStatus, loading, lastResponse]);
 
   const tvBadge = tradingViewBadge(tvRuntimeStatus);
 

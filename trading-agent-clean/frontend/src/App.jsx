@@ -55,7 +55,7 @@ const val = (value) => {
   return String(value);
 };
 const fmt = (value) => Number.isFinite(Number(value)) ? Number(value).toLocaleString("en-IN", { maximumFractionDigits: 2 }) : val(value);
-const money = (value) => Number.isFinite(Number(value)) ? `₹${Number(value).toLocaleString("en-IN", { maximumFractionDigits: 2 })}` : val(value);
+const money = (value) => Number.isFinite(Number(value)) ? `₹${Number(value).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : val(value);
 const pct = (value) => Number.isFinite(Number(value)) ? `${Number(value).toLocaleString("en-IN", { maximumFractionDigits: 2 })}%` : val(value);
 const num = (value) => Number.isFinite(Number(value)) ? Number(value) : null;
 const countValue = (value) => Math.max(0, Number(value) || 0);
@@ -2731,6 +2731,19 @@ function PaperTrades({ openTrades, history, summary, liveStatus }) {
   const targetPartialThenSlCount = summary?.target_partial_then_sl_count ?? stoppedTrades.filter((t) => t.partial_exit_1 || t.t1_hit).length;
   const pureSlCount = summary?.pure_sl_hit_count ?? summary?.sl_hit_count ?? stoppedTrades.filter((t) => !t.partial_exit_1 && !t.t1_hit && t.exit_reason !== "STOP_LOSS_HIT_BEFORE_ENTRY").length;
 
+  const totalActiveReservedMargin = activeTrades.reduce((acc, trade) => {
+    const raw = trade?.reserved_margin;
+    const numeric = Number(raw);
+    return acc + (Number.isFinite(numeric) && numeric > 0 ? numeric : 0);
+  }, 0);
+  const isFiltering = Boolean(paperSearch.trim() || strategyFilter !== "ALL");
+  const filteredActiveTrades = filteredRows.filter((trade) => trade.paper_group === "active");
+  const filteredActiveReservedMargin = filteredActiveTrades.reduce((acc, trade) => {
+    const raw = trade?.reserved_margin;
+    const numeric = Number(raw);
+    return acc + (Number.isFinite(numeric) && numeric > 0 ? numeric : 0);
+  }, 0);
+
   return <div className="pageStack">
     <div className="topHeader">
       <div><h2>Paper Trades</h2><p>Live tracking and history of automated paper executions.</p></div>
@@ -2779,8 +2792,23 @@ function PaperTrades({ openTrades, history, summary, liveStatus }) {
           </div>
         </div>
         <div className="paperTableMeta">
-          <span>{filteredRows.length} of {tabRows.length} shown &middot; Sorted by {(PAPER_SORT_LABELS[`${sortField}|${sortDirection}`] || "custom").toLowerCase()}</span>
-          <Badge tone={selectedFilter.key === "completed" ? "yellow" : selectedFilter.key === "active" ? "green" : "gray"}>{selectedFilter.label}</Badge>
+          <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+            <span>{filteredRows.length} of {tabRows.length} shown &middot; Sorted by {(PAPER_SORT_LABELS[`${sortField}|${sortDirection}`] || "custom").toLowerCase()}</span>
+            <Badge tone={selectedFilter.key === "completed" ? "yellow" : selectedFilter.key === "active" ? "green" : "gray"}>{selectedFilter.label}</Badge>
+          </div>
+          {activeTradeFilter === "active" && (
+            <div className="activeTradesSummary" style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", fontSize: "13px" }}>
+              <span>Active Trades: <strong>{activeTrades.length}</strong></span>
+              <span>&middot;</span>
+              <span>Total Reserved Margin: <strong style={{ color: "var(--accent, #6366f1)" }}>{money(totalActiveReservedMargin)}</strong></span>
+              {isFiltering && (
+                <>
+                  <span>&middot;</span>
+                  <span style={{ opacity: 0.85 }}>(Filtered: <strong>{filteredActiveTrades.length}</strong> trades / <strong>{money(filteredActiveReservedMargin)}</strong>)</span>
+                </>
+              )}
+            </div>
+          )}
         </div>
         <div className="paperTableShell">
           <PaperTradeTable rows={filteredRows} activeTab={activeTradeFilter} loading={initialLoading} emptyMessage={emptyMessage} onShowProgress={(trade) => setSelectedProgressTrade(trade)} onVerifyTrade={handleVerifyTrade} />

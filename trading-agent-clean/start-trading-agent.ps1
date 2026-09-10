@@ -48,8 +48,8 @@ if ($ForceKillUnrelatedPortOwner) {
 
 # 3. Verify ports 8011 and 5173 are free
 if (-not (Wait-PortFree $BackendPort 5) -or -not (Wait-PortFree $FrontendPort 5)) {
-    $bOwners = Get-PortOwners $BackendPort
-    $fOwners = Get-PortOwners $FrontendPort
+    $bOwners = @(Get-PortOwners $BackendPort)
+    $fOwners = @(Get-PortOwners $FrontendPort)
     Write-Host "Startup safety check failed: required ports are occupied by another process!" -ForegroundColor Red
     foreach ($owner in ($bOwners + $fOwners)) {
         Write-Host "  Occupied by: PID=$($owner.Pid), Name=$($owner.Name), Executable=$($owner.ExecutablePath), Command=$($owner.CommandLine)"

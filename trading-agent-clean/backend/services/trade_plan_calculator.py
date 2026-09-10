@@ -260,9 +260,9 @@ def calculate_trade_plan(
     risk_budget = current_balance * (grade_risk_percent / 100.0)
     quantity_by_risk = math.floor(risk_budget / risk_per_share)
 
-    # Centralized Capital Caps (1.5% of balance, absolute ₹30,000 hard cap, 90.0% portfolio limit)
+    # Centralized Capital Caps (1.5% of balance, absolute ₹15,000 hard cap, 90.0% portfolio limit)
     per_trade_cap_pct = getattr(settings, "PER_TRADE_CAPITAL_ALLOCATION_PERCENT", 1.5)
-    max_per_trade_cap = getattr(settings, "MAX_PER_TRADE_CAPITAL", 30000.0)
+    max_per_trade_cap = getattr(settings, "MAX_PER_TRADE_CAPITAL", 15000.0)
     pct_capital_limit = current_balance * (per_trade_cap_pct / 100.0)
     max_trade_capital = min(pct_capital_limit, max_per_trade_cap)
     quantity_by_capital_cap = math.floor((max_trade_capital * settings.LEVERAGE) / entry_price)

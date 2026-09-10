@@ -9,8 +9,8 @@ from services.position_sizing import calculate_proposed_sizing
 
 def test_1_normal_trade():
     """
-    Given: portfolio balance = ₹2,500,000, 1.5% cap = ₹30,000, entry = ₹500, risk quantity = 100
-    Expected: capital cap quantity = floor(30000 * 2.5 / 500) = 150, final quantity = 100 (risk wins)
+    Given: portfolio balance = ₹2,500,000, 1.5% cap = ₹15,000, entry = ₹500, risk quantity = 500
+    Expected: capital cap quantity = floor(15000 * 2.5 / 500) = 75, final quantity = 75
     """
     res = calculate_proposed_sizing(
         entry_price=500.0,
@@ -23,13 +23,13 @@ def test_1_normal_trade():
         paper_mode=True,
     )
     assert res["ok"] is True
-    # 1.5% cap = ₹30,000 margin -> 150 shares
-    assert res["final_quantity"] == 150
-    assert res["required_margin"] <= 30000.0
+    # 1.5% cap = ₹15,000 margin -> 75 shares
+    assert res["final_quantity"] == 75
+    assert res["required_margin"] <= 15000.0
 
 def test_2_risk_limit_still_wins():
     """
-    Given: portfolio balance = ₹2,500,000, 1.5% cap = ₹30,000, entry = ₹500, risk quantity = 50
+    Given: portfolio balance = ₹2,500,000, 1.5% cap = ₹15,000, entry = ₹500, risk quantity = 50
     Expected: final quantity = 50. The capital cap must NOT increase quantity.
     """
     res = calculate_proposed_sizing(
@@ -44,12 +44,12 @@ def test_2_risk_limit_still_wins():
     )
     assert res["ok"] is True
     assert res["final_quantity"] == 50
-    assert res["required_margin"] <= 30000.0
+    assert res["required_margin"] <= 15000.0
 
 def test_3_tight_stop_sunpharma():
     """
-    Given: portfolio balance = ₹2,500,000, entry = ₹1,977, 1.5% capital cap = ₹30,000 margin
-    Expected: capital cap quantity = floor(30000 * 2.5 / 1977) = 37. Expected final quantity = 37.
+    Given: portfolio balance = ₹2,500,000, entry = ₹1,977, 1.5% capital cap = ₹15,000 margin
+    Expected: capital cap quantity = floor(15000 * 2.5 / 1977) = 18. Expected final quantity = 18.
     """
     res = calculate_proposed_sizing(
         entry_price=1977.0,
@@ -62,8 +62,8 @@ def test_3_tight_stop_sunpharma():
         paper_mode=True,
     )
     assert res["ok"] is True
-    assert res["final_quantity"] == 37
-    assert res["required_margin"] <= 30000.0
+    assert res["final_quantity"] == 18
+    assert res["required_margin"] <= 15000.0
 
 def test_4_portfolio_utilization():
     """

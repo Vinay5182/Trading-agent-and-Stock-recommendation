@@ -56,4 +56,10 @@ models/*.joblib
 models/feature_importance_*.json
 
 # Logs
-*.log
+*.log
+
+# Dedicated Chrome profile data
+chrome-profile/
+C:/TradingAgent/chrome-profile/
+.runtime/chrome-profile/
+

@@ -43,6 +43,20 @@ def env_int(name: str, default: int, *, minimum: int | None = None, maximum: int
     return parsed
 
 
+def env_float(name: str, default: float, *, minimum: float | None = None, maximum: float | None = None) -> float:
+    raw = os.getenv(name)
+    value = str(default) if raw is None else raw.strip()
+    try:
+        parsed = float(value)
+    except Exception as exc:
+        raise ConfigValidationError("CONFIG_INVALID_FLOAT", f"{name} must be a number.", {"field": name}) from exc
+    if minimum is not None and parsed < minimum:
+        raise ConfigValidationError("CONFIG_FLOAT_TOO_SMALL", f"{name} must be >= {minimum}.", {"field": name})
+    if maximum is not None and parsed > maximum:
+        raise ConfigValidationError("CONFIG_FLOAT_TOO_LARGE", f"{name} must be <= {maximum}.", {"field": name})
+    return parsed
+
+
 def env_str(name: str, default: str, *, required: bool = False) -> str:
     value = os.getenv(name, default).strip()
     if required and not value:
@@ -119,7 +133,7 @@ class Settings:
     PORTFOLIO_MARGIN_LIMIT_PERCENT: float = 90.0
     PORTFOLIO_MARGIN_UTILIZATION_CAP_PERCENT: float = 90.0
     PER_TRADE_CAPITAL_ALLOCATION_PERCENT: float = 1.5
-    MAX_PER_TRADE_CAPITAL: float = 30000.0
+    MAX_PER_TRADE_CAPITAL: float = field(default_factory=lambda: env_float("MAX_PER_TRADE_CAPITAL", 15000.0, minimum=1.0))
     PORTFOLIO_RISK_LIMIT_PERCENT: float = 20.0
 
     GRADE_RISK_PERCENT_A_PLUS: float = 0.50

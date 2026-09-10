@@ -1550,3 +1550,103 @@ test("P&L Calendar dual-metric aggregation logic handles target exit events and 
   assert.ok(appSource.includes('const calendarTrades = dedupePaperTrades([...activeTrades, ...completedTrades, ...stoppedTrades, ...ambiguousTrades]);'), "calendarTrades includes activeTrades so target exit events on active trades are passed to calendar");
 });
 
+test("Paper Trades Total Reserved Margin calculation, status exclusions, filtering, and Indian currency formatting", async () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  // Verify App source contains Total Reserved Margin banner and calculation logic
+  assert.ok(appSource.includes("totalActiveReservedMargin"), "App source calculates totalActiveReservedMargin");
+  assert.ok(appSource.includes("filteredActiveReservedMargin"), "App source calculates filteredActiveReservedMargin");
+  assert.ok(appSource.includes("Total Reserved Margin"), "App source displays Total Reserved Margin label");
+  assert.ok(appSource.includes("activeTradesSummary"), "App source includes activeTradesSummary container");
+
+  // Helper to calculate reserved margin matching App.jsx logic
+  const calculateTotalReservedMargin = (activeTrades) => {
+    return activeTrades.reduce((acc, trade) => {
+      const raw = trade?.reserved_margin;
+      const numeric = Number(raw);
+      return acc + (Number.isFinite(numeric) && numeric > 0 ? numeric : 0);
+    }, 0);
+  };
+
+  const formatMoney = (value) => {
+    return Number.isFinite(Number(value))
+      ? `₹${Number(value).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+      : "-";
+  };
+
+  // 1. Multiple ACTIVE trades summation
+  const sampleActiveTrades = [
+    { symbol: "TECHM", status: "ACTIVE", reserved_margin: 38155.88 },
+    { symbol: "PRUDENT", status: "T1_PARTIAL", reserved_margin: 18738.30 },
+    { symbol: "SAPPHIRE", status: "T2_PARTIAL", reserved_margin: 10278.72 },
+  ];
+  const total1 = calculateTotalReservedMargin(sampleActiveTrades);
+  assert.equal(Number(total1.toFixed(2)), 67172.90);
+  assert.equal(formatMoney(total1), "₹67,172.90");
+
+  // 2. No ACTIVE trades -> total is 0 and formatted as ₹0.00
+  const noTrades = [];
+  const total2 = calculateTotalReservedMargin(noTrades);
+  assert.equal(total2, 0);
+  assert.equal(formatMoney(total2), "₹0.00");
+
+  // 3. Completed trades excluded
+  const completedTrade = { symbol: "INFY", status: "COMPLETED", outcome_status: "COMPLETED", reserved_margin: 25000.0 };
+  const allMixedTrades = [...sampleActiveTrades, completedTrade];
+  const activeOnly = allMixedTrades.filter((t) => ["ACTIVE", "T1_PARTIAL", "T2_PARTIAL"].includes(t.status));
+  assert.equal(activeOnly.length, 3);
+  assert.equal(Number(calculateTotalReservedMargin(activeOnly).toFixed(2)), 67172.90);
+
+  // 4. Waiting-for-entry trades excluded
+  const waitingTrade = { symbol: "TCS", status: "WAITING_FOR_ENTRY", reserved_margin: 0.0 };
+  const withWaiting = [...sampleActiveTrades, waitingTrade];
+  const activeOnlyAfterWaiting = withWaiting.filter((t) => ["ACTIVE", "T1_PARTIAL", "T2_PARTIAL"].includes(t.status));
+  assert.equal(activeOnlyAfterWaiting.length, 3);
+  assert.equal(Number(calculateTotalReservedMargin(activeOnlyAfterWaiting).toFixed(2)), 67172.90);
+
+  // 5. Stopped trades excluded
+  const stoppedTrade = { symbol: "WIPRO", status: "SL_HIT", outcome_status: "SL_HIT", reserved_margin: 0.0 };
+  const withStopped = [...sampleActiveTrades, stoppedTrade];
+  const activeOnlyAfterStopped = withStopped.filter((t) => ["ACTIVE", "T1_PARTIAL", "T2_PARTIAL"].includes(t.status));
+  assert.equal(activeOnlyAfterStopped.length, 3);
+  assert.equal(Number(calculateTotalReservedMargin(activeOnlyAfterStopped).toFixed(2)), 67172.90);
+
+  // 6. Missing, non-numeric, null, undefined, and negative reserved margin handled safely
+  const corruptedTrades = [
+    { symbol: "A", status: "ACTIVE", reserved_margin: 10000.0 },
+    { symbol: "B", status: "ACTIVE", reserved_margin: null },
+    { symbol: "C", status: "ACTIVE", reserved_margin: undefined },
+    { symbol: "D", status: "ACTIVE", reserved_margin: "invalid" },
+    { symbol: "E", status: "ACTIVE", reserved_margin: -5000.0 },
+    { symbol: "F", status: "ACTIVE", reserved_margin: NaN },
+    { symbol: "G", status: "ACTIVE", reserved_margin: 15000.0 },
+  ];
+  const totalCorrupted = calculateTotalReservedMargin(corruptedTrades);
+  assert.equal(totalCorrupted, 25000.0);
+  assert.equal(formatMoney(totalCorrupted), "₹25,000.00");
+
+  // 7. Search/filter does not mutate global active total
+  const globalActiveTrades = [
+    { symbol: "TITAN", strategy: "Swing", paper_group: "active", reserved_margin: 38658.54 },
+    { symbol: "TECHM", strategy: "Momentum", paper_group: "active", reserved_margin: 38155.88 },
+    { symbol: "BLUEJET", strategy: "Swing", paper_group: "active", reserved_margin: 29785.68 },
+  ];
+  const globalTotal = calculateTotalReservedMargin(globalActiveTrades);
+  assert.equal(Number(globalTotal.toFixed(2)), 106600.10);
+
+  // Filtered by strategy "Momentum"
+  const filtered = globalActiveTrades.filter((t) => t.strategy === "Momentum");
+  const filteredTotal = calculateTotalReservedMargin(filtered);
+  assert.equal(Number(filteredTotal.toFixed(2)), 38155.88);
+  // Global total remains unchanged
+  assert.equal(Number(globalTotal.toFixed(2)), 106600.10);
+
+  // 8. Indian currency formatting check
+  assert.equal(formatMoney(10278.72), "₹10,278.72");
+  assert.equal(formatMoney(125450.80), "₹1,25,450.80");
+  assert.equal(formatMoney(1235670.25), "₹12,35,670.25");
+  assert.equal(formatMoney(2084803.54), "₹20,84,803.54");
+  assert.equal(formatMoney(0), "₹0.00");
+});
+
+

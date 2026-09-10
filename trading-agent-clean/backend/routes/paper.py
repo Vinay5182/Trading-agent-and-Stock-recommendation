@@ -21,7 +21,7 @@ from services.mongo_indexes import get_collection_index_specs
 from services.paper_identity import apply_setup_identity, paper_trade_setup_filter
 from services.paper_sync import sync_trade_ready
 from services.system_errors import record_system_error
-from services.trading_calendar import add_trading_days
+from services.trading_calendar import add_trading_days, add_trading_days_to_market_close
 from services.capital_accounting import try_activate_trade_with_capital, get_current_virtual_balance_and_pnl, get_portfolio_totals, trade_open_margin_used
 
 from services.paper_update_scheduler import (
@@ -926,6 +926,14 @@ def make_trigger_doc(latest: dict, trigger_price: float = None, timeframe: str =
 
 
 def setup_valid_until_value(trade: dict) -> str | None:
+    """
+    Computes Setup Valid Until timestamp based on the Nth future NSE trading session:
+    - Momentum setups: 1 future NSE trading session (expires at 15:30 IST / 10:00 UTC of next trading day)
+    - Swing setups: 3 future NSE trading sessions (expires at 15:30 IST / 10:00 UTC of 3rd trading day)
+    - Skips weekends (Saturday/Sunday) and official NSE market holidays.
+    - Explicit overrides (setup_valid_until, expiry_timestamp, expires_at, valid_until) take precedence.
+    - Historical dataset mode returns None.
+    """
     if trade.get("historical_dataset_mode"):
         return None
     valid_until = (
@@ -940,7 +948,7 @@ def setup_valid_until_value(trade: dict) -> str | None:
     if setup_dt:
         signal_type = str(trade.get("source_signal_type") or trade.get("signal_type") or trade.get("strategy") or "").upper()
         days = 3 if "SWING" in signal_type else 1
-        return add_trading_days(setup_dt, days).isoformat()
+        return add_trading_days_to_market_close(setup_dt, days).isoformat()
     return None
 
 

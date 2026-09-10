@@ -19,7 +19,7 @@ The Trading Agent automates the end-to-end stock evaluation pipeline for 750+ NS
 1. **Market Data Scanning**: Fetches real-time and end-of-day market data from NSE India API, with `yfinance` fallback.
 2. **Strategy Scoring**: Ranks symbols out of 100 based on Swing (breakouts, moving averages, relative volume) and Momentum (30-day velocity, proximity to highs) algorithms.
 3. **TradingView Confirmation**: Automates Chrome via Chrome DevTools Protocol (CDP) to navigate TradingView charts, extract multi-timeframe candles (1W, 1D, 4H, 1H), and calculate technical trade plans (Entry, Stop Loss, Target Ladder).
-4. **Paper Trading Engine**: Simulates trade execution, position sizing, margin allocation (1.5% margin cap, ₹30,000 max capital per trade, 2.5x leverage), stop loss invalidation, and PnL tracking.
+4. **Paper Trading Engine**: Simulates trade execution, position sizing, margin allocation (1.5% margin cap, ₹15,000 max capital per trade, 2.5x leverage), stop loss invalidation, and PnL tracking.
 5. **AI / ML Pipeline**: Generates feature snapshots, aggregates candidate trade outcomes (CTO), exports historical datasets, and trains predictive models to evaluate trade setup quality.
 
 ---
@@ -178,7 +178,7 @@ The paper engine enforces strict institutional risk management rules:
 
 - **Starting Virtual Balance**: ₹25,00,000.00
 - **Leverage**: 2.5x
-- **Margin Cap Per Trade**: 1.5% of balance (Max ₹30,000.00 capital per trade)
+- **Margin Cap Per Trade**: 1.5% of balance (Max ₹15,000.00 capital per trade)
 - **Portfolio Margin Limit**: 90%
 - **Pre-Entry Stop Loss Status**: If price dips below stop loss before entry triggers, trade status becomes **`STOPPED`** (`STOP_LOSS_HIT_BEFORE_ENTRY`).
 - **Mode**: Strictly virtual paper execution (`LIVE_TRADING_ENABLED = False`). Real brokerage API keys are neither required nor enabled.
@@ -249,18 +249,63 @@ npm install
 
 ---
 
+## TradingView Debug Browser Setup — Windows
+
+Setting up TradingView (via **TradingView Desktop App** or **Google Chrome**) with Remote Debugging for chart extraction:
+
+1. **Install TradingView Desktop or Google Chrome**:
+   - **TradingView Desktop App** (Recommended): Download from [tradingview.com/desktop](https://www.tradingview.com/desktop/).
+   - **Google Chrome**: Download standard 64-bit Google Chrome.
+2. **Open PowerShell as Administrator**:
+   - Open Start Menu
+   - Search for **PowerShell**
+   - Right-click **Windows PowerShell** $\rightarrow$ Select **Run as Administrator**
+3. **Navigate to the Repository**:
+   ```powershell
+   cd C:\Users\Asus\OneDrive\Documents\Trading_Strategy\trading-agent-clean
+   ```
+4. **Start the TradingView Debug App / Browser**:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\scripts\start-tradingview-debug.ps1
+   ```
+   *Alternatively, launch TradingView Desktop directly from PowerShell:*
+   ```powershell
+   Start-Process "C:\Users\Asus\Downloads\TradingView (1)\TradingView.exe" -ArgumentList "--remote-debugging-port=9222"
+   ```
+   This automatically detects TradingView Desktop (or Chrome), enables remote debugging port `9222`, and prepares the CDP connection.
+5. **Log into TradingView Manually**:
+   In the TradingView app/browser window, log into your TradingView account manually.
+6. **Verify Port 9222 & CDP Endpoint**:
+   ```powershell
+   Invoke-RestMethod http://127.0.0.1:9222/json/version
+   ```
+7. **Start the Trading Agent**:
+   ```powershell
+   powershell -NoExit -ExecutionPolicy Bypass -File .\start-trading-agent.ps1
+   ```
+8. **Run the Status Check**:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\status-trading-agent.ps1
+   ```
+   Confirm that `TradingView CDP (9222)` shows **`REACHABLE`** and `Attached TV Chart Target` is **`FOUND`**.
+
+---
+
 ## Running the Application
 
 ### Option A: Using PowerShell Automation Scripts
 ```powershell
-# Start both backend and frontend background processes
-.\scripts\start-trading-agent.ps1
+# Start TradingView Chrome debug browser
+powershell -ExecutionPolicy Bypass -File .\scripts\start-tradingview-debug.ps1
 
-# Check status of running components
-.\scripts\status-trading-agent.ps1
+# Start both backend and frontend background processes
+powershell -ExecutionPolicy Bypass -File .\start-trading-agent.ps1
+
+# Check status of running components & CDP connection
+powershell -ExecutionPolicy Bypass -File .\status-trading-agent.ps1
 
 # Stop running processes
-.\scripts\stop-trading-agent.ps1
+powershell -ExecutionPolicy Bypass -File .\stop-trading-agent.ps1
 ```
 
 ### Option B: Manual Startup

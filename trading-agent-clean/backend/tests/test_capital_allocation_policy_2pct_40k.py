@@ -25,7 +25,7 @@ def test_case_1_portfolio_10_lakh_1_5pct_cap():
     assert res["required_margin"] == pytest.approx(15000.0)
 
 def test_case_2_portfolio_20_lakh_1_5pct_cap():
-    # Portfolio ₹20,00,000 -> 1.5% = ₹30,000
+    # Portfolio ₹20,00,000 -> 1.5% = ₹30,000, BUT ₹15,000 hard cap applies!
     res = calculate_proposed_sizing(
         entry_price=100.0,
         stop_loss=99.0, # SL dist = 1 -> risk qty = 7000 (grade A = 0.35% = 7000)
@@ -37,12 +37,12 @@ def test_case_2_portfolio_20_lakh_1_5pct_cap():
         paper_mode=True,
     )
     assert res["ok"] is True
-    # 1.5% cap = ₹30,000 margin -> gross exposure = ₹75,000 -> 750 shares
-    assert res["final_quantity"] == 750
-    assert res["required_margin"] == pytest.approx(30000.0)
+    # Capped at ₹15,000 margin -> gross exposure = ₹37,500 -> 375 shares
+    assert res["final_quantity"] == 375
+    assert res["required_margin"] == pytest.approx(15000.0)
 
 def test_case_3_portfolio_25_lakh_1_5pct_cap():
-    # Portfolio ₹25,00,000 -> 1.5% = ₹37,500, BUT ₹30,000 hard cap applies!
+    # Portfolio ₹25,00,000 -> 1.5% = ₹37,500, BUT ₹15,000 hard cap applies!
     res = calculate_proposed_sizing(
         entry_price=100.0,
         stop_loss=99.0, # SL dist = 1 -> risk qty = 8750
@@ -54,12 +54,12 @@ def test_case_3_portfolio_25_lakh_1_5pct_cap():
         paper_mode=True,
     )
     assert res["ok"] is True
-    # 1.5% = 37,500, capped at ₹30,000 margin -> gross exposure = ₹75,000 -> 750 shares
-    assert res["final_quantity"] == 750
-    assert res["required_margin"] == pytest.approx(30000.0)
+    # 1.5% = 37,500, capped at ₹15,000 margin -> gross exposure = ₹37,500 -> 375 shares
+    assert res["final_quantity"] == 375
+    assert res["required_margin"] == pytest.approx(15000.0)
 
 def test_case_4_portfolio_30_lakh_absolute_30k_cap_wins():
-    # Portfolio ₹30,00,000 -> 1.5% = ₹45,000, BUT ₹30,000 hard cap applies!
+    # Portfolio ₹30,00,000 -> 1.5% = ₹45,000, BUT ₹15,000 hard cap applies!
     res = calculate_proposed_sizing(
         entry_price=100.0,
         stop_loss=99.0, # SL dist = 1 -> risk qty = 10500
@@ -71,9 +71,9 @@ def test_case_4_portfolio_30_lakh_absolute_30k_cap_wins():
         paper_mode=True,
     )
     assert res["ok"] is True
-    # Hard cap ₹30,000 margin -> gross exposure = ₹75,000 -> 750 shares
-    assert res["final_quantity"] == 750
-    assert res["required_margin"] == pytest.approx(30000.0)
+    # Hard cap ₹15,000 margin -> gross exposure = ₹37,500 -> 375 shares
+    assert res["final_quantity"] == 375
+    assert res["required_margin"] == pytest.approx(15000.0)
 
 def test_case_5_utilization_below_90_pct_allowed():
     # Portfolio ₹25,00,000, 90.0% cap = ₹22,50,000. Open margin = ₹10,00,000 (40.0%).
@@ -107,7 +107,7 @@ def test_case_6_utilization_at_90_pct_capacity_exceeded():
 def test_config_settings_canonical_values():
     assert settings.STARTING_VIRTUAL_BALANCE == 2500000.0
     assert settings.PER_TRADE_CAPITAL_ALLOCATION_PERCENT == 1.5
-    assert settings.MAX_PER_TRADE_CAPITAL == 30000.0
+    assert settings.MAX_PER_TRADE_CAPITAL == 15000.0
     assert settings.PORTFOLIO_MARGIN_LIMIT_PERCENT == 90.0
     assert settings.PORTFOLIO_MARGIN_UTILIZATION_CAP_PERCENT == 90.0
     assert settings.LEVERAGE == 2.5

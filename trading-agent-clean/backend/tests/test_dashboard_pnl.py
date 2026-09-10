@@ -1,12 +1,11 @@
-from config import settings
 import asyncio
 import sys
 from pathlib import Path
 
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
+from config import settings
 from routes import dashboard
 
 
@@ -315,3 +314,85 @@ def test_dashboard_has_no_stale_virtual_balance_defaults() -> None:
     assert "STARTING_VIRTUAL_BALANCE = 250000" not in source
     assert "STARTING_VIRTUAL_BALANCE = 1500000" not in source
     assert "STARTING_VIRTUAL_BALANCE = 2500000" not in source
+
+
+def test_is_waiting_trade_classification_and_gap_missed_exclusion() -> None:
+    """
+    Verifies that _is_waiting_trade correctly identifies genuine waiting trades
+    and excludes terminal/gap-missed setups (even with entry_triggered=False).
+    """
+    # Test 1 — Genuine waiting
+    genuine_waiting = {
+        "status": "WAITING_FOR_ENTRY",
+        "entry_triggered": False,
+    }
+    assert dashboard._is_waiting_trade(genuine_waiting) is True
+
+    # Test 2 — Gap-up missed (must be excluded from waiting)
+    gap_missed = {
+        "status": "ENTRY_MISSED_GAP_UP",
+        "entry_triggered": False,
+    }
+    assert dashboard._is_waiting_trade(gap_missed) is False
+
+    # Test 3 — Active trade
+    active_trade = {
+        "status": "ACTIVE",
+        "entry_triggered": True,
+    }
+    assert dashboard._is_waiting_trade(active_trade) is False
+
+    # Test 4 — Expired trade
+    expired_trade = {
+        "status": "EXPIRED",
+        "entry_triggered": False,
+    }
+    assert dashboard._is_waiting_trade(expired_trade) is False
+
+    # Test 5 — Stopped trade
+    stopped_trade = {
+        "status": "SL_HIT",
+        "entry_triggered": True,
+    }
+    assert dashboard._is_waiting_trade(stopped_trade) is False
+
+    # Test 6 — Completed trade
+    completed_trade = {
+        "status": "COMPLETED",
+        "outcome_status": "T3_HIT",
+        "entry_triggered": True,
+    }
+    assert dashboard._is_waiting_trade(completed_trade) is False
+
+
+def test_dashboard_paper_equity_waiting_count_excludes_gap_missed(monkeypatch) -> None:
+    """
+    Verifies that get_paper_equity correctly computes waiting count as genuine waiting only.
+    """
+    genuine_wait = {
+        "symbol": "WAIT1",
+        "paper_only": True,
+        "status": "WAITING_FOR_ENTRY",
+        "outcome_status": "WAITING_FOR_ENTRY",
+        "entry_triggered": False,
+    }
+    gap_missed = {
+        "symbol": "GAP1",
+        "paper_only": True,
+        "status": "ENTRY_MISSED_GAP_UP",
+        "outcome_status": "ENTRY_MISSED_GAP_UP",
+        "entry_triggered": False,
+    }
+    fake_db = type(
+        "FakeDb",
+        (),
+        {
+            "paper_trades": FakeCollection([genuine_wait, gap_missed]),
+            "trade_journal": FakeCollection([]),
+        },
+    )()
+    monkeypatch.setattr(dashboard, "get_database", lambda: fake_db)
+
+    result = asyncio.run(dashboard.get_paper_equity())
+    assert result["status_counts"]["waiting"] == 1
+

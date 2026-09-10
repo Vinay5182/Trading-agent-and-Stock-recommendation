@@ -25,6 +25,7 @@ TERMINAL_STATUSES = {
     "AMBIGUOUS",
     "CLOSED",
     "COMPLETED",
+    "ENTRY_MISSED_GAP_UP",
     "EXPIRED",
     "LOST_SL",
     "SL_HIT",

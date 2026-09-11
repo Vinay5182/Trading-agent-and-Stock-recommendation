@@ -1,7 +1,13 @@
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta, timezone
 from typing import Any
+
+# Timezone and Market Hours for National Stock Exchange (NSE)
+IST_TIMEZONE = timezone(timedelta(hours=5, minutes=30), name="IST")
+NSE_MARKET_OPEN_TIME = time(9, 15)
+NSE_MARKET_CLOSE_TIME = time(15, 30)
+NSE_MARKET_CLOSE_UTC_TIME = time(10, 0)
 
 # Official National Stock Exchange (NSE) Market Holidays for 2024, 2025, and 2026
 _NSE_HOLIDAYS_SET: set[date] = {
@@ -118,6 +124,39 @@ def add_trading_days(
     return current
 
 
+def add_trading_days_to_market_close(
+    dt_value: datetime,
+    trading_days: int,
+    custom_holidays: set[date] | None = None,
+) -> datetime:
+    """
+    Advances dt_value by N active NSE trading sessions and sets the expiry
+    timestamp to the NSE market close (15:30 IST / 10:00:00 UTC) on that final session date.
+
+    Business Rules:
+    - Momentum setups: 1 future NSE trading session (expires at 15:30 IST / 10:00 UTC of next trading day)
+    - Swing setups: 3 future NSE trading sessions (expires at 15:30 IST / 10:00 UTC of 3rd trading day)
+    - Skips Saturdays and Sundays
+    - Skips official NSE market holidays
+    - Timezone safe: converts to IST to determine session date, sets 15:30:00 IST, and returns UTC datetime
+    """
+    if trading_days <= 0:
+        target_dt = dt_value
+    else:
+        target_dt = add_trading_days(dt_value, trading_days, custom_holidays=custom_holidays)
+
+    # Determine target session calendar date in IST exchange context
+    if target_dt.tzinfo is not None:
+        target_ist = target_dt.astimezone(IST_TIMEZONE)
+        target_date = target_ist.date()
+    else:
+        target_date = target_dt.date()
+
+    # Construct 15:30:00 IST on the target session date
+    expiry_ist = datetime.combine(target_date, NSE_MARKET_CLOSE_TIME, tzinfo=IST_TIMEZONE)
+    return expiry_ist.astimezone(timezone.utc)
+
+
 def trading_days_between(
     start: datetime | date,
     end: datetime | date,
@@ -140,3 +179,4 @@ def trading_days_between(
         current += timedelta(days=1)
 
     return count
+

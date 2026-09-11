@@ -929,7 +929,7 @@ def setup_valid_until_value(trade: dict) -> str | None:
     """
     Computes Setup Valid Until timestamp based on the Nth future NSE trading session:
     - Momentum setups: 1 future NSE trading session (expires at 15:30 IST / 10:00 UTC of next trading day)
-    - Swing setups: 3 future NSE trading sessions (expires at 15:30 IST / 10:00 UTC of 3rd trading day)
+    - Swing setups: 5 future NSE trading sessions (expires at 15:30 IST / 10:00 UTC of 5th trading day)
     - Skips weekends (Saturday/Sunday) and official NSE market holidays.
     - Explicit overrides (setup_valid_until, expiry_timestamp, expires_at, valid_until) take precedence.
     - Historical dataset mode returns None.
@@ -947,7 +947,7 @@ def setup_valid_until_value(trade: dict) -> str | None:
     setup_dt = setup_timestamp_for_trade(trade)
     if setup_dt:
         signal_type = str(trade.get("source_signal_type") or trade.get("signal_type") or trade.get("strategy") or "").upper()
-        days = 3 if "SWING" in signal_type else 1
+        days = 5 if "SWING" in signal_type else 1
         return add_trading_days_to_market_close(setup_dt, days).isoformat()
     return None
 
@@ -1877,14 +1877,25 @@ def snapshot_docs_from_market_row(trade: dict, row: dict | None) -> list[dict]:
             ("current_price", "ltp", "last_price", "price", "close", "open_price"),
         )
         if price is not None:
+            day_high = first_number_from_fields(row, ("day_high", "high"))
+            day_low = first_number_from_fields(row, ("day_low", "low"))
+            day_open = first_number_from_fields(row, ("day_open", "open", "open_price"))
+            volume = first_number_from_fields(row, ("volume", "day_volume", "total_traded_volume"))
+
+            high_val = max(day_high, price) if day_high is not None else price
+            low_val = min(day_low, price) if day_low is not None else price
+            open_val = day_open if day_open is not None else price
             docs.append(
                 {
                     **snapshot_base_doc(trade, row, observed_at, now),
-                    "open": price,
-                    "high": price,
-                    "low": price,
+                    "open": open_val,
+                    "high": high_val,
+                    "low": low_val,
                     "close": price,
                     "price": price,
+                    "day_high": day_high,
+                    "day_low": day_low,
+                    "volume": volume,
                     "source": "market_data_quote_snapshot",
                 }
             )
@@ -1937,7 +1948,7 @@ async def paper_market_latest_row(db, trade: dict) -> dict | None:
     snapshots = await load_paper_market_snapshots_after_setup(db, trade)
     if not snapshots:
         return None
-    highs = [number_or_none(row.get("high") or row.get("price") or row.get("close")) for row in snapshots]
+    highs = [number_or_none(row.get("day_high") or row.get("high") or row.get("price") or row.get("close")) for row in snapshots]
     closes = [number_or_none(row.get("close") or row.get("price")) for row in snapshots]
     highs = [value for value in highs if value is not None]
     closes = [value for value in closes if value is not None]
@@ -2075,8 +2086,8 @@ async def evaluate_paper_trade_chronologically(
     snapshots = await load_paper_market_snapshots_after_setup(db, plan)
     for s in snapshots:
         c_time = _parse_candle_ts(s.get("observed_at_iso") or s.get("observed_at") or s.get("created_at"))
-        high = number_or_none(s.get("high") or s.get("price") or s.get("close"))
-        low = number_or_none(s.get("low") or s.get("price") or s.get("close"))
+        high = number_or_none(s.get("day_high") or s.get("high") or s.get("price") or s.get("close"))
+        low = number_or_none(s.get("day_low") or s.get("low") or s.get("price") or s.get("close"))
         close = number_or_none(s.get("close") or s.get("price"))
         open_p = number_or_none(s.get("open") or s.get("open_price") or close)
         if c_time and high is not None and low is not None and close is not None:
@@ -2149,7 +2160,7 @@ async def evaluate_paper_trade_chronologically(
 
     candles = [unique_candles[k] for k in sorted(unique_candles.keys())]
 
-    if market_row and not candles:
+    if market_row:
         m_latest = market_data_latest_row(market_row, plan)
         if m_latest:
             m_high = number_or_none(m_latest.get("high"))
@@ -2159,14 +2170,19 @@ async def evaluate_paper_trade_chronologically(
             m_time = m_latest.get("time") or datetime.utcnow().isoformat()
             if m_high is not None and m_low is not None and m_close is not None:
                 m_time_iso = m_time.isoformat() if hasattr(m_time, "isoformat") else str(m_time)
-                candles.append({
-                    "time": m_time_iso,
-                    "open": m_open if m_open is not None else m_close,
-                    "high": m_high,
-                    "low": m_low,
-                    "close": m_close,
-                    "source": "market_data",
-                })
+                if m_time_iso in unique_candles:
+                    unique_candles[m_time_iso]["high"] = max(unique_candles[m_time_iso]["high"], m_high)
+                    unique_candles[m_time_iso]["low"] = min(unique_candles[m_time_iso]["low"], m_low)
+                    candles = [unique_candles[k] for k in sorted(unique_candles.keys())]
+                elif not candles:
+                    candles.append({
+                        "time": m_time_iso,
+                        "open": m_open if m_open is not None else m_close,
+                        "high": m_high,
+                        "low": m_low,
+                        "close": m_close,
+                        "source": "market_data",
+                    })
 
     if not candles:
         return {}
@@ -2747,6 +2763,9 @@ def _update_plan_status_raw(
     logic_status = normalized_trade_logic_status(status)
     stop_loss_update, effective_stop_loss = dynamic_stop_loss_update(plan, latest)
     now = datetime.utcnow().isoformat()
+    v_ist = None
+    c_ist = None
+    entry_triggered_in_candle = False
 
     # Gap Execution Policy evaluation BEFORE touched levels & ambiguity check
     if logic_status in (WAITING_FOR_ENTRY_STATUS, WAITING_FOR_CAPITAL_STATUS):
@@ -2828,21 +2847,46 @@ def _update_plan_status_raw(
             and number_or_none(plan.get("initial_margin_reserved")) in (None, 0.0)
         )
 
-        if is_pre_entry and v_stop is not None and ((latest_low is not None and latest_low <= v_stop) or (latest_close is not None and latest_close <= v_stop)):
+        # Check validity window for entry
+        valid_until_str = setup_valid_until_value(plan) if not plan.get("historical_dataset_mode") else None
+        v_dt = parse_datetime_value(valid_until_str) if valid_until_str else None
+        c_dt = _parse_candle_ts(latest.get("time") or latest.get("candle_open_at") or latest.get("market_data_updated_at") or now)
+
+        from services.trading_calendar import IST_TIMEZONE
+        v_ist = v_dt.astimezone(IST_TIMEZONE) if (v_dt and getattr(v_dt, "tzinfo", None)) else (v_dt.replace(tzinfo=timezone.utc).astimezone(IST_TIMEZONE) if v_dt else None)
+        c_ist = c_dt.astimezone(IST_TIMEZONE) if (c_dt and getattr(c_dt, "tzinfo", None)) else (c_dt.replace(tzinfo=timezone.utc).astimezone(IST_TIMEZONE) if c_dt else None)
+
+        is_within_valid_window = bool(
+            v_ist is None
+            or c_ist is None
+            or c_ist.date() <= v_ist.date()
+        )
+
+        entry_triggered_in_candle = bool(
+            is_within_valid_window
+            and (
+                forced_event == "entry"
+                or (forced_event is None and latest_high is not None and v_entry is not None and latest_high >= v_entry)
+            )
+        )
+
+        if not entry_triggered_in_candle and is_pre_entry and v_stop is not None and ((latest_low is not None and latest_low <= v_stop) or (latest_close is not None and latest_close <= v_stop)):
             v_invalid = True
             v_reason = "STOP_LOSS_HIT_BEFORE_ENTRY"
-        elif v_target is not None and latest_high is not None and latest_high >= v_target and (v_entry is None or latest_high < v_entry):
+        elif not entry_triggered_in_candle and v_target is not None and latest_high is not None and latest_high >= v_target and (v_entry is None or latest_high < v_entry):
             v_invalid = True
             v_reason = "TARGET_HIT_BEFORE_ENTRY"
-        else:
-            if not plan.get("historical_dataset_mode"):
-                valid_until_str = setup_valid_until_value(plan)
-                if valid_until_str:
-                    v_dt = parse_datetime_value(valid_until_str)
-                    c_dt = _parse_candle_ts(latest.get("time") or latest.get("candle_open_at") or now)
-                    if v_dt and c_dt and c_dt.replace(tzinfo=None) > v_dt.replace(tzinfo=None):
-                        v_invalid = True
-                        v_reason = "SETUP_EXPIRED_BEFORE_ENTRY"
+        elif not entry_triggered_in_candle:
+            if not plan.get("historical_dataset_mode") and v_ist and c_ist:
+                # Session boundary rule: Expire only after the valid trading session date has passed,
+                # or on the expiration date at or after 15:30 IST market close.
+                session_ended = (
+                    c_ist.date() > v_ist.date()
+                    or (c_ist.date() == v_ist.date() and c_ist.time() >= v_ist.time())
+                )
+                if session_ended:
+                    v_invalid = True
+                    v_reason = "SETUP_EXPIRED_BEFORE_ENTRY"
             triggered_at = plan.get("entry_triggered_at")
             if not v_invalid and triggered_at:
                 try:
@@ -2857,24 +2901,24 @@ def _update_plan_status_raw(
                     pass
 
         if v_invalid:
-                new_st = "STOPPED" if v_reason == "STOP_LOSS_HIT_BEFORE_ENTRY" else "EXPIRED"
-                return {
-                    "latest_close": latest_close,
-                    "latest_high": latest_high,
-                    "latest_low": latest_low,
-                    "last_checked_at": now,
-                    "updated_at": now,
-                    "status": new_st,
-                    "outcome_status": new_st,
-                    "state": new_st,
-                    "status_updated_at": now,
-                    "exit_reason": v_reason,
-                    "capital_rejection_reason": v_reason,
-                    "activation_blocked_reason": v_reason,
-                    "expiry_trigger": plan.get("expiry_trigger") or make_trigger_doc(latest),
-                }
+            new_st = "STOPPED" if v_reason == "STOP_LOSS_HIT_BEFORE_ENTRY" else "EXPIRED"
+            return {
+                "latest_close": latest_close,
+                "latest_high": latest_high,
+                "latest_low": latest_low,
+                "last_checked_at": now,
+                "updated_at": now,
+                "status": new_st,
+                "outcome_status": new_st,
+                "state": new_st,
+                "status_updated_at": now,
+                "exit_reason": v_reason,
+                "capital_rejection_reason": v_reason,
+                "activation_blocked_reason": v_reason,
+                "expiry_trigger": plan.get("expiry_trigger") or make_trigger_doc(latest),
+            }
 
-    if logic_status in (WAITING_FOR_ENTRY_STATUS, WAITING_FOR_CAPITAL_STATUS) and (forced_event == "entry" or (forced_event is None and latest_high is not None and plan.get("entry_price") is not None and latest_high >= plan["entry_price"])):
+    if logic_status in (WAITING_FOR_ENTRY_STATUS, WAITING_FOR_CAPITAL_STATUS) and entry_triggered_in_candle:
         from services.position_sizing import calculate_proposed_sizing
 
         grade = plan.get("trade_quality_grade") or plan.get("grade")
@@ -2949,6 +2993,8 @@ def _update_plan_status_raw(
                 "entry_triggered": True,
                 "entry_triggered_at": now,
                 "entry_trigger": plan.get("entry_trigger") or make_trigger_doc(latest, float(plan["entry_price"])),
+                "execution_context": "POST_SESSION_RECONCILIATION" if (c_ist and v_ist and (c_ist.date() > v_ist.date() or (c_ist.date() == v_ist.date() and c_ist.time() >= v_ist.time()))) else "LIVE",
+                "reconciliation_type": "POST_SESSION_RECONCILIATION" if (c_ist and v_ist and (c_ist.date() > v_ist.date() or (c_ist.date() == v_ist.date() and c_ist.time() >= v_ist.time()))) else None,
 
                 # Execution audit fields
                 "entry_time": plan.get("entry_time") or now,

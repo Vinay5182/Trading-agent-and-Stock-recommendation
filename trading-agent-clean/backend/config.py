@@ -101,7 +101,7 @@ class Settings:
     PAPER_UPDATE_SCHEDULER_DRY_RUN_ONLY: bool = field(default_factory=lambda: env_bool("PAPER_UPDATE_SCHEDULER_DRY_RUN_ONLY", True))
     PAPER_UPDATE_SCHEDULER_ALLOW_REAL_WRITES: bool = field(default_factory=lambda: env_bool("PAPER_UPDATE_SCHEDULER_ALLOW_REAL_WRITES", False))
     PAPER_UPDATE_SCHEDULER_INTERVAL_MINUTES: int = field(default_factory=lambda: env_int("PAPER_UPDATE_SCHEDULER_INTERVAL_MINUTES", 30, minimum=1, maximum=1440))
-    PAPER_UPDATE_SCHEDULER_AFTER_MARKET_CLOSE_ONLY: bool = field(default_factory=lambda: env_bool("PAPER_UPDATE_SCHEDULER_AFTER_MARKET_CLOSE_ONLY", True))
+    PAPER_UPDATE_SCHEDULER_AFTER_MARKET_CLOSE_ONLY: bool = field(default_factory=lambda: env_bool("PAPER_UPDATE_SCHEDULER_AFTER_MARKET_CLOSE_ONLY", False))
     PAPER_UPDATE_SCHEDULER_DRY_RUN_FIRST: bool = field(default_factory=lambda: env_bool("PAPER_UPDATE_SCHEDULER_DRY_RUN_FIRST", True))
     PAPER_UPDATE_SCHEDULER_MAX_TRADES: int = field(default_factory=lambda: env_int("PAPER_UPDATE_SCHEDULER_MAX_TRADES", 6, minimum=1, maximum=200))
     PAPER_UPDATE_SCHEDULER_MAX_WRITES: int = field(default_factory=lambda: env_int("PAPER_UPDATE_SCHEDULER_MAX_WRITES", 1, minimum=0, maximum=200))

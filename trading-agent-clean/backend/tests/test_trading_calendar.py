@@ -107,21 +107,23 @@ def test_scenario_5_normal_wednesday_momentum():
 
 def test_screenshot_after_market_thursday_swing_example():
     """
-    Verifies the exact scenario from user request:
+    Verifies the scenario from user request:
     Thursday August 27, 2026 at 14:39:00.78826Z (20:09 IST)
-    Swing (3 trading days):
+    Swing (5 trading days):
     Day 1: Friday Aug 28
     Weekend: Sat Aug 29, Sun Aug 30 skipped
     Day 2: Monday Aug 31
     Day 3: Tuesday Sep 01
-    Expected Expiry: 2026-09-01T10:00:00+00:00 (Tuesday 15:30 IST)
+    Day 4: Wednesday Sep 02
+    Day 5: Thursday Sep 03
+    Expected Expiry: 2026-09-03T10:00:00+00:00 (Thursday 15:30 IST)
     """
     trade = {
         "created_at": "2026-08-27T14:39:00.788260Z",
         "signal_type": "SWING_TV_CONFIRMED",
     }
     val = setup_valid_until_value(trade)
-    assert val == "2026-09-01T10:00:00+00:00"
+    assert val == "2026-09-03T10:00:00+00:00"
 
 
 def test_after_market_thursday_momentum_example():
@@ -148,7 +150,7 @@ def test_paper_route_integration():
         "signal_type": "SWING_TV_CONFIRMED",
     }
     val = setup_valid_until_value(trade_swing)
-    assert val == "2026-08-04T10:00:00+00:00"
+    assert val == "2026-08-06T10:00:00+00:00"
 
     trade_momentum = {
         "created_at": "2026-07-31T10:38:34.218568Z",
